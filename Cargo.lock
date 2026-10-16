@@ -12281,6 +12281,8 @@ dependencies = [
  "feldera-storage",
  "feldera-types",
  "inventory",
+ "serde_json",
+ "tempfile",
  "uuid",
 ]
 
