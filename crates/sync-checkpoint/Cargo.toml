@@ -1,0 +1,20 @@
+[package]
+name = "sync-checkpoint"
+description = "Self-hosted placeholder for the enterprise checkpoint synchronization crate"
+# Not published: internal self-hosted platform crate, never a crates.io dependency.
+publish = false
+
+edition = { workspace = true }
+version = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+feldera-storage = { workspace = true }
+feldera-types = { workspace = true }
+inventory = { workspace = true }
+uuid = { workspace = true }
