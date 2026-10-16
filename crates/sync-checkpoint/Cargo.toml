@@ -1,6 +1,6 @@
 [package]
 name = "sync-checkpoint"
-description = "Self-hosted placeholder for the enterprise checkpoint synchronization crate"
+description = "Self-hosted checkpoint synchronization crate"
 # Not published: internal self-hosted platform crate, never a crates.io dependency.
 publish = false
 
@@ -17,4 +17,8 @@ anyhow = { workspace = true }
 feldera-storage = { workspace = true }
 feldera-types = { workspace = true }
 inventory = { workspace = true }
+serde_json = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
