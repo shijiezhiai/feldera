@@ -144,6 +144,9 @@ The Kafka connectors link librdkafka dynamically, so it has to be installed befo
 
 The script builds librdkafka against AWS-LC, which is what keeps Kafka TLS on the same cryptographic implementation as the rest of the system. Distribution packages are built against OpenSSL and are usually older than the version the `rdkafka-sys` crate requires, so installing one of those is not equivalent. Run the script again after a `rdkafka` version bump; it reads the version it needs from `Cargo.lock`. Set `PREFIX` to install somewhere other than `/usr/local`, in which case `PKG_CONFIG_PATH` has to point at `$PREFIX/lib/pkgconfig`.
 
+A machine-verified walkthrough of these steps — the exact `PKG_CONFIG_PATH`, the toolchain
+versions, and the failure modes — is in [docs/self-hosted-dev-env.md](docs/self-hosted-dev-env.md).
+
 After that, the first step is to build the SQL compiler:
 
 ```
