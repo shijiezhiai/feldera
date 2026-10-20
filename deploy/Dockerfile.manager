@@ -72,18 +72,12 @@ ENV WEBCONSOLE_BASE_PATH=/__FELDERA_BASE_PATH__
 # npmmirror 全量可用（实测 playwright@1.58.2 存在，latest 1.64.1）。
 # $HOME/.bunfig.toml 是 bun 用户级配置，不动仓库文件；npm_config_registry 双保险。
 ENV npm_config_registry=https://registry.npmmirror.com
-RUN printf '[install]\nregistry = "https://registry.npmmirror.com"\n' > "$HOME/.bunfig.toml"
-# build:self = check-bun-version + svelte-kit sync + vite build；
-# 显式先跑根级 build:deps（build:self 的 prebuild 等价物），不依赖 pre/post 生命周期
-RUN cd js-packages/web-console && bun run clean-install \
-  && cd /src && bun run build:deps:web-console \
-  && bun --cwd=js-packages/web-console run build:self \
-  # 死锁修复(Docker Desktop buildkit 归档超大 diff 层时 CPU 0% 永久挂):
-  # RUN 层必然包含整个 /src 工作树, bun 构建后 node_modules 数百 MB;
-  # 清掉依赖树, 层 diff 只剩 /webconsole-build 产物(18M), 归档秒完成。
-  && rm -rf /src/node_modules /src/js-packages/*/node_modules \
-     /src/js-packages/*/dist /src/js-packages/*/.svelte-kit \
-  && du -sh /webconsole-build && du -sh /src 2>/dev/null | tail -1
+# ⚠️ webconsole 不在 buildkit 内构建 —— Docker Desktop 4.46 embedded buildkit 归档
+# 含 bun 构建产物的层时 CPU 0% 永久挂(实测 3 种导出方式全复现)。产物改由宿主机
+# 构建(bun run build:deps:web-console && build:self, BUILD_DIR=/tmp/webconsole-build)
+# 后放入仓库 webconsole-dist/, 这里直接 COPY 注入(18M 小层, 归档秒完成)。
+# 注意: 宿主机构建需 BUILD_DIR 可写绝对路径(容器内是 /webconsole-build, 宿主用 /tmp)。
+COPY webconsole-dist/ /webconsole-build/
 
 # ---------------------------------------------------------------------------
 # Stage 3: sql2dbsp jar（maven，纯 Java；generate-sources 阶段只涉及 FMPP/JavaCC，
