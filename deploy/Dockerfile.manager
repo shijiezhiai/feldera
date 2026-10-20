@@ -1,0 +1,303 @@
+# P1-004: self-hosted (bili) manager image, built entirely from source.
+#
+# 与上游 deploy/Dockerfile 的差别（上游镜像要求 CI 先在宿主 Linux 上编译出
+# build/pipeline-manager 与 build/sql2dbsp-jar-with-dependencies.jar 再 COPY 进来；
+# 本机宿主是 macOS，二进制不能跨平台复用，故全部在镜像内构建）：
+#   1. pipeline-manager 二进制在本镜像内编译，且带 --features feldera-enterprise
+#      （依赖仓库内自研 stub：crates/dbsp-enterprise、crates/sync-checkpoint；
+#      根 .dockerignore 不排除它们，勿在子目录新增 .dockerignore 排除）。
+#   2. sql2dbsp jar 由镜像内 maven 构建（纯 Java，无 cargo 依赖）。
+#   3. web console 由镜像内 bun 构建（build.rs 的 NpmBuild 需要 bun）。
+#   4. 不执行 --precompile：预编译产物不烤进镜像，控制体积（<15G 红线）；
+#      首条 pipeline 编译冷启动较慢，预编译层随 P1-018 编译服务一起做（母文档 §5.2）。
+#
+# 构建（build context 必须是仓库根目录）：
+#   docker build -f deploy/Dockerfile.manager -t feldera-manager:<ver>-bili.N .
+#
+# 版本标签约定见 docs/self-hosted-images.md。
+
+# ---------------------------------------------------------------------------
+# Stage 1: librdkafka, built against AWS-LC rather than the system OpenSSL.
+# 与上游 deploy/Dockerfile 的同名阶段保持一致：脚本从 Cargo.lock 读 librdkafka
+# 版本，保证库与 crate 不漂移；PKG_CONFIG 探测失败即中止构建。
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS librdkafka
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update --fix-missing && apt-get install -y \
+  git cmake build-essential pkg-config golang-go \
+  libsasl2-dev zlib1g-dev libzstd-dev
+COPY scripts/install-librdkafka.sh /tmp/install-librdkafka.sh
+COPY Cargo.lock /tmp/Cargo.lock
+RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
+
+# ---------------------------------------------------------------------------
+# Stage 2: web console (SvelteKit via bun).
+# 版本与 CI dev 镜像（deploy/build.Dockerfile）一致；web-console 的
+# check-bun-version 会校验版本。bun workspace 根在仓库根目录
+# （package.json: workspaces = ["js-packages/*"]，bun.lock 在根）。
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS webconsole
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update --fix-missing && apt-get install -y curl ca-certificates unzip \
+  && rm -rf /var/lib/apt/lists/*
+# bun 二进制走 npmmirror（GitHub release 资产本网 ~17s/MB，实测全量 23MB 需
+# 6-7min 且时常失败；npmmirror 全量 8.3s）。install 脚本尊重 $GITHUB 环境变量
+# 拼下载 URL（GITHUB=github.com → $GITHUB/oven-sh/bun/releases/download/...），
+# 这里直接镜像为 npmmirror 的 /-/binary/bun 资产（302 → cdn.npmmirror.com），
+# 产物同样是 bun-linux-<arch>.zip，脚本 unzip 解到 /usr/local/bin/bun。
+# apt 已装 unzip/curl（上一 RUN）。
+ARG BUN_VERSION="bun-v1.3.14"
+RUN arch=`uname -m | sed "s/x86_64/x64/g"` && \
+  curl -fL --retry 4 --retry-all-errors -o /tmp/bun.zip \
+    "https://registry.npmmirror.com/-/binary/bun/${BUN_VERSION}/bun-linux-${arch}.zip" \
+  && unzip -oq /tmp/bun.zip -d /usr/local \
+  && chmod +x "/usr/local/bun-linux-${arch}/bun" \
+  && ln -s "/usr/local/bun-linux-${arch}/bun" /usr/local/bin/bun \
+  && rm /tmp/bun.zip
+ENV PATH="/usr/local/bin:${PATH}"
+WORKDIR /src
+COPY package.json bun.lock ./
+# openapi.json（git 追踪，由 pipeline-manager --dump-openapi 生成）被
+# web-console/src/lib/functions/felderaApiJsonSchemas.ts 越级 import，构建必需
+COPY openapi.json ./
+COPY js-packages ./js-packages
+# 先装依赖再跑根级 build:deps（profiler-layout/profiler-app/monaco 插件），
+# 最后 web-console 自身构建。BUILD_DIR 是 svelte adapter-static 的输出目录；
+# WEBCONSOLE_BASE_PATH 必须与 crates/pipeline-manager/build.rs 的占位符一致，
+# manager 才能在 --http-base-path 下重写资源路径。
+ENV BUILD_DIR=/webconsole-build
+ENV WEBCONSOLE_BASE_PATH=/__FELDERA_BASE_PATH__
+# registry.npmjs.org 在本网络 SSL 掐断（实测 curl 28 超时；bun ci 苦撑 14 分钟后
+# 拿到残缺 metadata，报 "No version matching 1.58.2 ... (but package exists)"）。
+# npmmirror 全量可用（实测 playwright@1.58.2 存在，latest 1.64.1）。
+# $HOME/.bunfig.toml 是 bun 用户级配置，不动仓库文件；npm_config_registry 双保险。
+ENV npm_config_registry=https://registry.npmmirror.com
+RUN printf '[install]\nregistry = "https://registry.npmmirror.com"\n' > "$HOME/.bunfig.toml"
+# build:self = check-bun-version + svelte-kit sync + vite build；
+# 显式先跑根级 build:deps（build:self 的 prebuild 等价物），不依赖 pre/post 生命周期
+RUN cd js-packages/web-console && bun run clean-install \
+  && cd /src && bun run build:deps:web-console \
+  && bun --cwd=js-packages/web-console run build:self
+
+# ---------------------------------------------------------------------------
+# Stage 3: sql2dbsp jar（maven，纯 Java；generate-sources 阶段只涉及 FMPP/JavaCC，
+# 不触发 cargo）。
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS sql-compiler-jar
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update --fix-missing && apt-get install -y \
+  openjdk-21-jdk-headless maven git python3 curl \
+  && rm -rf /var/lib/apt/lists/*
+# 父 pom 的 reactor 需要读 slt/simulator 的 pom 文件，故整目录拷贝
+# （**/target 已被根 .dockerignore 排除）。
+COPY sql-to-dbsp-compiler/ /src/sql-to-dbsp-compiler/
+# 上游 pom 钉的 calcite 1.43.0 未发布到 Maven Central（Central 最高 1.42.0），
+# 必须按上游 CI（build-java.yml）用 build.sh 从 apache/calcite main@f840e7ab
+# 源码构建并 install 到本地仓库（Gradle 构建，JDK19-21；本阶段用 JDK21）。
+ENV CALCITE_BUILD_DIR=/tmp/calcite
+# 预置 Gradle 8.14.4 发行包到 wrapper 缓存：calcite 的 gradle-wrapper.properties
+# 只给 services.gradle.org 留 networkTimeout=10s，本网络必挂。GitHub releases
+# 实测 ~110KB/s 爬 20 分钟还可能断流，主源改腾讯云镜像（同为官方 zip，
+# content-length 137388246 一致，sha256 校验兜底），GitHub 作回退。
+# wrapper 缓存目录名 = base36(md5(distributionUrl))，
+# 布齐 zip + .ok 标记后 gradlew 直接离线取用。
+ENV GRADLE_USER_HOME=/tmp/gradle-home
+RUN mkdir -p ${GRADLE_USER_HOME}/wrapper/dists/gradle-8.14.4-bin/92wwslzcyst3phie3o264zltu \
+  && cd ${GRADLE_USER_HOME}/wrapper/dists/gradle-8.14.4-bin/92wwslzcyst3phie3o264zltu \
+  && (curl -fL --retry 4 --retry-all-errors -o gradle-8.14.4-bin.zip \
+        https://mirrors.cloud.tencent.com/gradle/gradle-8.14.4-bin.zip \
+      || curl -fL --retry 4 --retry-all-errors -C - -o gradle-8.14.4-bin.zip \
+        https://github.com/gradle/gradle-distributions/releases/download/v8.14.4/gradle-8.14.4-bin.zip) \
+  && echo "f1771298a70f6db5a29daf62378c4e18a17fc33c9ba6b14362e0cdf40610380d  gradle-8.14.4-bin.zip" | sha256sum -c - \
+  && python3 -m zipfile -e gradle-8.14.4-bin.zip . \
+  && touch gradle-8.14.4-bin.zip.ok
+# 本网络直连 Maven Central 常中途截断（实测 sqlite-jdbc-3.45.3.0.jar 13.5M
+# 只收到 11.7M 即 Premature end of Content-Length）。注入腾讯云 nexus 镜像作
+# central 的 mirror（元数据 pom/sha1 齐全，实测 200）。
+COPY maven-settings.xml /root/.m2/settings.xml
+# Kotlin daemon 曾在构建中"terminated on startup"（VM 12G 下 gradle daemon + kotlin
+# daemon + maven 并发挤爆内存）。禁用 gradle daemon、限制堆，并限制 kotlin daemon。
+RUN env GRADLE_OPTS="-Dorg.gradle.daemon=false -Xmx2g -Dorg.gradle.workers.max=4" \
+    KOTLIN_DAEMON_JVM_OPTS="-Xmx1g" \
+  bash -c 'cd /src/sql-to-dbsp-compiler \
+  && bash build.sh -pl SQL-compiler \
+  && cp SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar /sql2dbsp-jar-with-dependencies.jar'
+
+# ---------------------------------------------------------------------------
+# Stage 4: cargo builder —— 编译 linux/arm64 版 pipeline-manager。
+# 链接阶段内存峰值高（宿主实测 16-17GB）：镜像内用 mold + 压缩调试段压峰值，
+# VM 内存需 >= 12GB（Docker Desktop settings-store.json MemoryMiB）。
+# 若仍 OOM，构建脚本支持 BILI_CARGO_JOBS 降并行（见 deploy/build-images.sh）。
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS builder
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update --fix-missing && apt-get install -y \
+  pkg-config libsasl2-dev zlib1g-dev libzstd-dev build-essential \
+  curl git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+# librdkafka：构建期 rdkafka-sys 需要 pkg-config 探测
+COPY --from=librdkafka /usr/local/lib/librdkafka* /usr/local/lib/
+COPY --from=librdkafka /usr/local/include/librdkafka /usr/local/include/librdkafka
+COPY --from=librdkafka /usr/local/lib/pkgconfig/rdkafka*.pc /usr/local/lib/pkgconfig/
+RUN ldconfig && pkg-config --exists rdkafka
+
+# ubuntu:24.04 镜像自带 ubuntu 用户（uid 1000，与上游 deploy/Dockerfile 的
+# USER ubuntu 依赖一致），无需 useradd
+USER ubuntu
+WORKDIR /home/ubuntu
+# 本网络对 static.rust-lang.org 不稳（实测 21 分钟下载中途掐断），
+# rustup-init 与工具链改走 USTC rust-static 镜像
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup \
+    RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.1
+RUN arch=`dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86_64/g"`; \
+  curl -LO --retry 4 --retry-all-errors --connect-timeout 20 https://github.com/rui314/mold/releases/download/v2.40.4/mold-2.40.4-$arch-linux.tar.gz \
+  && tar -xzvf mold-2.40.4-$arch-linux.tar.gz \
+  && mv mold-2.40.4-$arch-linux $HOME/mold \
+  && rm mold-2.40.4-$arch-linux.tar.gz
+ENV PATH="$PATH:/home/ubuntu/.cargo/bin:/home/ubuntu/mold/bin"
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-Wl,--compress-debug-sections=zlib"
+# 磁盘红线：宿主数据卷可用仅 ~13Gi。dev 产物体积大头是 debug 信息与
+# incremental 缓存；自建镜像只做冒烟验收，两者全关可把 target 从 ~20G 压到 ~6G。
+ENV CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_INCREMENTAL=0
+
+# crates.io 走 rsproxy（字节）sparse 镜像：本网络对 crates.io 上游不稳。
+# source replacement 只换下载源，不改 Cargo.lock 的包内容与校验和，--locked 安全。
+RUN mkdir -p $HOME/.cargo && cat > $HOME/.cargo/config.toml <<'EOF'
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+retry = 5
+git-fetch-with-cli = true
+EOF
+
+# 源码（顺序照上游：Cargo 清单在前，利于层缓存）
+WORKDIR /home/ubuntu/feldera
+COPY --chown=ubuntu Cargo.lock Cargo.lock
+COPY --chown=ubuntu Cargo.toml Cargo.toml
+COPY --chown=ubuntu crates/ crates/
+COPY --chown=ubuntu sql-to-dbsp-compiler/lib sql-to-dbsp-compiler/lib
+# web console 预构建产物（stage 2），build.rs 走 WEBCONSOLE_BUILD_DIR 分支
+COPY --from=webconsole --chown=ubuntu /webconsole-build/ webconsole-build/
+ENV WEBCONSOLE_BUILD_DIR=/home/ubuntu/feldera/webconsole-build
+
+ARG BILI_CARGO_JOBS=""
+# CARGO_INCREMENTAL=0：release 构建本就不用增量，显式关掉防缓存目录膨胀。
+# --mount=type=cache 把 target 放 BuildKit 持久 cache：cargo RUN 一旦失败，
+# 该层不提交 → target 全丢（60-90min 全损）；cache mount 在 step 失败后内容
+# 保留，重跑从断点续编（对抗失败重跑全损的根本手段，warmup 之外的保险）。
+RUN --mount=type=cache,target=/home/ubuntu/.cargo-target \
+  CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=${BILI_CARGO_JOBS} \
+  CARGO_TARGET_DIR=/home/ubuntu/.cargo-target \
+  cargo build --release --locked -p pipeline-manager --features feldera-enterprise \
+  && cp /home/ubuntu/.cargo-target/release/pipeline-manager /home/ubuntu/pipeline-manager
+
+# ---------------------------------------------------------------------------
+# Stage 5: runtime —— 形态对齐上游 base/release：内含 rust 工具链 + 源码树，
+# manager 的 in-process compiler 在容器内编译 pipeline 程序时要用。
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS base
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt update --fix-missing && apt -y dist-upgrade && apt install \
+  pkg-config \
+  libsasl2-dev zlib1g-dev libzstd-dev build-essential \
+  curl \
+  openjdk-21-jre-headless -y \
+  locales \
+  ca-certificates gnupg \
+  tzdata \
+  git \
+  libcap2-bin
+
+# Set UTF-8 locale. Needed for the Rust compiler to handle Unicode column names.
+RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
+  locale-gen
+
+# librdkafka from the stage above. rdkafka-sys links it dynamically, so it has
+# to be here both to build pipelines and to run them.
+COPY --from=librdkafka /usr/local/lib/librdkafka* /usr/local/lib/
+COPY --from=librdkafka /usr/local/include/librdkafka /usr/local/include/librdkafka
+COPY --from=librdkafka /usr/local/lib/pkgconfig/rdkafka*.pc /usr/local/lib/pkgconfig/
+RUN ldconfig \
+  # A NEEDED entry for libssl or libcrypto means librdkafka found a system
+  # OpenSSL and preferred it over AWS-LC, which is the failure this whole
+  # arrangement exists to prevent and is invisible at run time.
+  && if readelf -d /usr/local/lib/librdkafka.so.1 | grep -qE 'Shared library: \[lib(ssl|crypto)\.so'; then \
+       echo "error: librdkafka links a shared OpenSSL" >&2; exit 1; \
+     fi \
+  # rdkafka-sys probes for librdkafka this way; failing here beats failing
+  # partway through a pipeline compilation.
+  && pkg-config --exists rdkafka
+
+USER ubuntu
+WORKDIR /home/ubuntu
+
+ENV LC_ALL=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+
+RUN mkdir -p feldera
+COPY --chown=ubuntu Cargo.lock feldera/Cargo.lock
+COPY --chown=ubuntu Cargo.toml feldera/Cargo.toml
+COPY --chown=ubuntu crates/ feldera/crates
+COPY --chown=ubuntu README.md feldera/README.md
+RUN mkdir -p feldera/sql-to-dbsp-compiler/lib
+# Copy over the rust code and sql-to-dbsp script
+COPY --chown=ubuntu sql-to-dbsp-compiler/lib feldera/sql-to-dbsp-compiler/lib
+COPY --chown=ubuntu sql-to-dbsp-compiler/temp feldera/sql-to-dbsp-compiler/temp
+COPY --chown=ubuntu sql-to-dbsp-compiler/SQL-compiler/sql-to-dbsp feldera/sql-to-dbsp-compiler/SQL-compiler/sql-to-dbsp
+# Copy over demos
+RUN mkdir -p feldera/demos/sql
+COPY --chown=ubuntu crates/pipeline-manager/demos/sql feldera/demos/sql
+
+# Install cargo and rust for this non-root user
+# 本网络对 static.rust-lang.org 不稳（实测 21 分钟下载中途掐断），
+# rustup-init 与工具链改走 USTC rust-static 镜像
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup \
+    RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.1
+# The download URL for mold uses x86_64/aarch64 whereas dpkg --print-architecture says amd64/arm64
+RUN arch=`dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86_64/g"`; \
+  curl -LO --retry 4 --retry-all-errors --connect-timeout 20 https://github.com/rui314/mold/releases/download/v2.40.4/mold-2.40.4-$arch-linux.tar.gz \
+  && tar -xzvf mold-2.40.4-$arch-linux.tar.gz \
+  && mv mold-2.40.4-$arch-linux $HOME/mold \
+  && rm mold-2.40.4-$arch-linux.tar.gz
+ENV PATH="$PATH:/home/ubuntu/.cargo/bin:/home/ubuntu/mold/bin"
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-Wl,--compress-debug-sections=zlib"
+# 运行时 in-process 编译同样关 debug 信息与 incremental（镜像更小、编译更快；
+# 只影响符号信息，不影响冒烟验收的功能正确性）。
+ENV CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_INCREMENTAL=0
+
+# crates 镜像持久化进运行时镜像：manager 的 in-process compiler 编译 pipeline
+# 时要 cargo fetch，内网/本机网络同样需要镜像源（与 builder 阶段同一份配置）。
+RUN mkdir -p $HOME/.cargo && cat > $HOME/.cargo/config.toml <<'EOF'
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+retry = 5
+git-fetch-with-cli = true
+EOF
+
+# --
+# bili 差别：二进制与 jar 来自镜像内构建阶段（上游来自 CI 宿主 build/ 目录）。
+# 落位路径与上游完全一致，ENTRYPOINT 逐字对齐上游 release 阶段。
+# --
+COPY --from=builder --chown=ubuntu /home/ubuntu/pipeline-manager feldera/build/pipeline-manager
+COPY --from=sql-compiler-jar --chown=ubuntu /sql2dbsp-jar-with-dependencies.jar feldera/build/sql2dbsp-jar-with-dependencies.jar
+
+# Install Samply for profiling（本网络对 github 间歇不稳，与 mold 同款重试参数）
+RUN curl --proto '=https' --tlsv1.2 --retry 4 --retry-all-errors --connect-timeout 20 -LsSf https://github.com/feldera/samply/releases/download/v0.13.2/samply-installer.sh | sh
+
+ENV BANNER_ADDR=localhost
+ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]
