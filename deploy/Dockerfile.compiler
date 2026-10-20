@@ -1,0 +1,67 @@
+# P1-004: self-hosted (bili) compiler toolchain image.
+#
+# JDK21 + Maven + cargo 工具链镜像（P1-018 远程编译服务的载体）。v1 只含工具链，
+# 不预置 sql2dbsp jar、不含 Feldera 源码树——远程编译的源码分发方式属于 P1-018。
+# librdkafka 按上游约定从源码构建（AWS-LC，不链系统 OpenSSL）：编译出的
+# pipeline 程序以 rdkafka-sys 动态链接，工具链里必须有同名库与 pkg-config。
+#
+# 构建（build context 必须是仓库根目录）：
+#   docker build -f deploy/Dockerfile.compiler -t feldera-compiler:<ver>-bili.N .
+#
+# 冒烟（compose 常驻后逐项验证）：
+#   java -version / mvn -version / cargo --version / mold --version
+#   pkg-config --modversion rdkafka
+# 版本标签约定见 docs/self-hosted-images.md。
+
+FROM ubuntu:24.04 AS librdkafka
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update --fix-missing && apt-get install -y \
+  git cmake build-essential pkg-config golang-go \
+  libsasl2-dev zlib1g-dev libzstd-dev
+COPY scripts/install-librdkafka.sh /tmp/install-librdkafka.sh
+COPY Cargo.lock /tmp/Cargo.lock
+RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
+
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update --fix-missing && apt-get install -y \
+  openjdk-21-jdk-headless \
+  maven \
+  pkg-config \
+  libsasl2-dev zlib1g-dev libzstd-dev \
+  build-essential \
+  curl git ca-certificates \
+  locales \
+  && sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+  && locale-gen \
+  && rm -rf /var/lib/apt/lists/*
+ENV LC_ALL=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+
+# librdkafka (AWS-LC)：rdkafka-sys 构建期要 pkg-config 探测到它
+COPY --from=librdkafka /usr/local/lib/librdkafka* /usr/local/lib/
+COPY --from=librdkafka /usr/local/include/librdkafka /usr/local/include/librdkafka
+COPY --from=librdkafka /usr/local/lib/pkgconfig/rdkafka*.pc /usr/local/lib/pkgconfig/
+RUN ldconfig && pkg-config --exists rdkafka
+
+# ubuntu:24.04 镜像自带 ubuntu 用户（uid 1000），无需 useradd
+USER ubuntu
+WORKDIR /home/ubuntu
+
+# 与 manager 镜像相同的 rust 工具链与 mold 版本（对齐上游 deploy/Dockerfile）
+# 本网络对 static.rust-lang.org 不稳，rustup-init 与工具链走 USTC 镜像
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup \
+    RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.1
+RUN arch=`dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86_64/g"`; \
+  curl -LO --retry 4 --retry-all-errors --connect-timeout 20 https://github.com/rui314/mold/releases/download/v2.40.4/mold-2.40.4-$arch-linux.tar.gz \
+  && tar -xzvf mold-2.40.4-$arch-linux.tar.gz \
+  && mv mold-2.40.4-$arch-linux $HOME/mold \
+  && rm mold-2.40.4-$arch-linux.tar.gz
+ENV PATH="$PATH:/home/ubuntu/.cargo/bin:/home/ubuntu/mold/bin"
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-Wl,--compress-debug-sections=zlib"
+
+WORKDIR /workspace
+# v1 冒烟形态：常驻等待，由 compose/exec 验证工具链（P1-018 将替换为编译服务）
+CMD ["sleep", "infinity"]
