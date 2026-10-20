@@ -193,7 +193,9 @@ ARG BILI_CARGO_JOBS="4"
 # --mount=type=cache 把 target 放 BuildKit 持久 cache：cargo RUN 一旦失败，
 # 该层不提交 → target 全丢（60-90min 全损）；cache mount 在 step 失败后内容
 # 保留，重跑从断点续编（对抗失败重跑全损的根本手段，warmup 之外的保险）。
-RUN --mount=type=cache,target=/home/ubuntu/.cargo-target \
+# mode=0777：cache mount 内层目录权限随第一次创建(root:root 700)固定，
+# 后续容器内写会 Permission denied(os error 13, full16 实测)。显式 0777。
+RUN --mount=type=cache,target=/home/ubuntu/.cargo-target,mode=0777 \
   CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=${BILI_CARGO_JOBS} \
   CARGO_TARGET_DIR=/home/ubuntu/.cargo-target \
   cargo build --release --locked -p pipeline-manager --features feldera-enterprise \
