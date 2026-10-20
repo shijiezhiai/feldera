@@ -141,3 +141,16 @@ compiler 镜像冒烟：`docker compose exec compiler` 验证
 - **真内网 registry 接线**：见上文占位说明。
 - **runner 镜像预置二进制协议**：编译产物如何进入 runner 镜像/容器，
   随 P1-018 runner 协议定义。
+
+### 实测记录（2026-10-20，arm64）
+
+- 首次冒烟全链路通过：SQL 编译 Success（2.5s）→ Rust 编译单 rustc 完成
+  （约 1.5h，`CARGO_BUILD_JOBS=1`）→ 产物 `feldera_pipe_pipeline_*_main`
+  279MB。
+- runner 动态链接闭环：二进制 `docker cp` 进 runner 容器，`ldd`
+  全解析（`librdkafka.so.1 → /usr/local/lib/`，runner 镜像自带），直接执行
+  报 `Error parsing command line arguments: dbsp_adapters 0.358.0`（无参数
+  的正常 usage 错误）即证明可执行。
+- 注意：runner 容器内 `chmod` `/tmp` 下文件会
+  `Operation not permitted`（只读挂载），`docker cp` 已保留宿主执行位，
+  无需再 chmod。
