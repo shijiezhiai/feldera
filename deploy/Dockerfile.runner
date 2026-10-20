@@ -1,0 +1,51 @@
+# P1-004: self-hosted (bili) runner image.
+#
+# 生成的 pipeline 程序的运行镜像（P1-018 起由编译服务产出二进制放入）。v1 范围：
+# ubuntu:24.04 + librdkafka(AWS-LC) + 运行时动态库，不含 rust 工具链与源码树。
+# 冒烟 = 把 manager 冒烟编译出的 pipeline 二进制拷进容器执行，验证动态链接闭环
+# （"镜像内二进制 --version/启动到等待指令" 的 v1 落法；预置二进制的 runner
+# 协议随 P1-018 落地）。
+#
+# 构建（build context 必须是仓库根目录）：
+#   docker build -f deploy/Dockerfile.runner -t feldera-runner:<ver>-bili.N .
+# 版本标签约定见 docs/self-hosted-images.md。
+
+FROM ubuntu:24.04 AS librdkafka
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update --fix-missing && apt-get install -y \
+  git cmake build-essential pkg-config golang-go \
+  libsasl2-dev zlib1g-dev libzstd-dev
+COPY scripts/install-librdkafka.sh /tmp/install-librdkafka.sh
+COPY Cargo.lock /tmp/Cargo.lock
+RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
+
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 运行时库集合：
+#   librdkafka 动态链接 libsasl2/libzstd/zlib；常见 TLS 栈需要 libssl3 与 CA 证书。
+#   libssl3t64 是 ubuntu:24.04 的包名（20.04 及以前为 libssl3）。
+# 注意：AWS-LC 版 librdkafka 自身不链系统 OpenSSL（构建阶段已 readelf 校验）。
+RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends \
+  ca-certificates \
+  libsasl2-2 \
+  libzstd1 \
+  zlib1g \
+  libssl3t64 \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=librdkafka /usr/local/lib/librdkafka* /usr/local/lib/
+# 校验同 manager 镜像：librdkafka 不得链系统 OpenSSL
+RUN ldconfig \
+  && if readelf -d /usr/local/lib/librdkafka.so.1 | grep -qE 'Shared library: \[lib(ssl|crypto)\.so'; then \
+       echo "error: librdkafka links a shared OpenSSL" >&2; exit 1; \
+     fi
+
+# ubuntu:24.04 镜像自带 ubuntu 用户（uid 1000），无需 useradd
+USER ubuntu
+WORKDIR /home/ubuntu
+# pipeline 程序落位约定（P1-018 编译服务写入）
+RUN mkdir -p /home/ubuntu/pipelines
+
+# v1 冒烟形态：常驻等待；冒烟时 docker cp 二进制进来执行
+CMD ["sleep", "infinity"]

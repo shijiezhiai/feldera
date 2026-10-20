@@ -1,0 +1,46 @@
+# P1-004 三镜像 compose 冒烟：manager(内嵌 PG) + compiler 常驻 + runner 常驻。
+#
+# 用法（版本标签随构建产出，先 export 再 up）：
+#   export MANAGER_IMAGE=feldera-manager:<ver>-bili.N
+#   export COMPILER_IMAGE=feldera-compiler:<ver>-bili.N
+#   export RUNNER_IMAGE=feldera-runner:<ver>-bili.N
+#   docker compose -f deploy/docker-compose.bili-smoke.yml up -d
+#   docker compose -f deploy/docker-compose.bili-smoke.yml ps   # manager 应 healthy
+#
+# 冒烟步骤（详见 docs/self-hosted-images.md）：
+#   1. curl http://localhost:8080/healthz -> 200
+#   2. POST /v0/pipelines 建最小 pipeline（CREATE TABLE + 1 SELECT），
+#      轮询 program status 至 Success（manager in-process 调 compiler 编译）
+#   3. runner：docker cp 编译产物二进制进 runner 容器执行 --version/启动等待，
+#      验证动态链接闭环
+# 注：manager 内嵌 PG 用 postgresql_embedded，首次启动需联网下载 PG 二进制。
+
+name: feldera-bili-smoke
+
+services:
+  manager:
+    image: ${MANAGER_IMAGE:?export MANAGER_IMAGE=feldera-manager:<ver>-bili.N}
+    ports:
+      - "8080:8080"
+    # 编译器子进程从 manager 继承 env：
+    #   CARGO_BUILD_JOBS=1 —— 限制 rustc 并行度，防 OOM 杀编译。实测链：
+    #     4 并行 × aws-sdk/arrow 等大 crate(3-4G/个) → 容器 12G 内 OOM(SIGKILL)；
+    #     2 并行后容器内 8.2G peak 不再超限，但 Docker VM 12G + 宿主 16G 物理
+    #     仍被压爆(宿主内核杀 VM 内进程)。1 并行峰值 ~4G，最稳；代价是慢。
+    environment:
+      - CARGO_BUILD_JOBS=1
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+
+  compiler:
+    image: ${COMPILER_IMAGE:?export COMPILER_IMAGE=feldera-compiler:<ver>-bili.N}
+    # v1 工具链镜像常驻待命；P1-018 替换为远程编译服务
+    command: ["sleep", "infinity"]
+
+  runner:
+    image: ${RUNNER_IMAGE:?export RUNNER_IMAGE=feldera-runner:<ver>-bili.N}
+    command: ["sleep", "infinity"]
