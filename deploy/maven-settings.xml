@@ -4,11 +4,12 @@
           xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
   <mirrors>
     <!-- 本网络直连 Maven Central 常中途截断(如 sqlite-jdbc 13.5M 只收到 11.7M)。
-         腾讯云 nexus 镜像可达且元数据齐全, 作为 central 的镜像。 -->
+         阿里云 central 镜像完整(calcite/jackson 全版本), 作为 central 的镜像。
+         (腾讯云 maven-public 部分版本未同步, 如 jackson-dataformat-csv 2.22.3 → 404) -->
     <mirror>
-      <id>tencent-central</id>
-      <name>Tencent Cloud Maven Central mirror</name>
-      <url>https://mirrors.cloud.tencent.com/nexus/repository/maven-public/</url>
+      <id>aliyun-central</id>
+      <name>Aliyun Maven Central mirror</name>
+      <url>https://maven.aliyun.com/repository/central/</url>
       <mirrorOf>central</mirrorOf>
     </mirror>
   </mirrors>
