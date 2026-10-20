@@ -77,7 +77,13 @@ RUN printf '[install]\nregistry = "https://registry.npmmirror.com"\n' > "$HOME/.
 # 显式先跑根级 build:deps（build:self 的 prebuild 等价物），不依赖 pre/post 生命周期
 RUN cd js-packages/web-console && bun run clean-install \
   && cd /src && bun run build:deps:web-console \
-  && bun --cwd=js-packages/web-console run build:self
+  && bun --cwd=js-packages/web-console run build:self \
+  # 死锁修复(Docker Desktop buildkit 归档超大 diff 层时 CPU 0% 永久挂):
+  # RUN 层必然包含整个 /src 工作树, bun 构建后 node_modules 数百 MB;
+  # 清掉依赖树, 层 diff 只剩 /webconsole-build 产物(18M), 归档秒完成。
+  && rm -rf /src/node_modules /src/js-packages/*/node_modules \
+     /src/js-packages/*/dist /src/js-packages/*/.svelte-kit \
+  && du -sh /webconsole-build && du -sh /src 2>/dev/null | tail -1
 
 # ---------------------------------------------------------------------------
 # Stage 3: sql2dbsp jar（maven，纯 Java；generate-sources 阶段只涉及 FMPP/JavaCC，
