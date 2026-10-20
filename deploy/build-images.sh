@@ -103,7 +103,7 @@ build_one() {
 # buildkit 对含 RUN bun 大层（webconsole）的 target 构建 export 会死锁（132s 后
 # CPU 0% 永久挂，见 MEMORY 教训）。buildkit 缓存本就按层留存：同一 Dockerfile
 # 的中间层随全量构建缓存，不必预烤。
-build_one feldera-manager Dockerfile.manager --build-arg BILI_CARGO_JOBS="${BILI_CARGO_JOBS:-}"
+build_one feldera-manager Dockerfile.manager --build-arg BILI_CARGO_JOBS="${BILI_CARGO_JOBS:-4}"
 build_one feldera-compiler Dockerfile.compiler
 build_one feldera-runner Dockerfile.runner
 
