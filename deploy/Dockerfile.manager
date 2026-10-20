@@ -167,6 +167,9 @@ ENV CARGO_PROFILE_DEV_DEBUG=0 \
 
 # crates.io 走 rsproxy（字节）sparse 镜像：本网络对 crates.io 上游不稳。
 # source replacement 只换下载源，不改 Cargo.lock 的包内容与校验和，--locked 安全。
+# [env] 段与仓库 .cargo/config.toml 同步：pg_setup.rs 用 env!("POSTGRESQL_VERSION")
+# 编译期宏取版本，缺了会编译失败（"environment variable `POSTGRESQL_VERSION`
+# not defined at compile time"）。
 RUN mkdir -p $HOME/.cargo && cat > $HOME/.cargo/config.toml <<'EOF'
 [source.crates-io]
 replace-with = "rsproxy-sparse"
@@ -177,6 +180,9 @@ registry = "sparse+https://rsproxy.cn/index/"
 [net]
 retry = 5
 git-fetch-with-cli = true
+
+[env]
+POSTGRESQL_VERSION = "=15.13.0"
 EOF
 
 # 源码（顺序照上游：Cargo 清单在前，利于层缓存）
@@ -282,6 +288,8 @@ ENV CARGO_PROFILE_DEV_DEBUG=0 \
 
 # crates 镜像持久化进运行时镜像：manager 的 in-process compiler 编译 pipeline
 # 时要 cargo fetch，内网/本机网络同样需要镜像源（与 builder 阶段同一份配置）。
+# [env] 段：若去掉 bundled（见 Cargo.toml 注释），编译期不再下载 PG 归档，
+# 但 pg_setup.rs 的 env!("POSTGRESQL_VERSION") 仍需该变量，缺了编译失败。
 RUN mkdir -p $HOME/.cargo && cat > $HOME/.cargo/config.toml <<'EOF'
 [source.crates-io]
 replace-with = "rsproxy-sparse"
@@ -292,6 +300,9 @@ registry = "sparse+https://rsproxy.cn/index/"
 [net]
 retry = 5
 git-fetch-with-cli = true
+
+[env]
+POSTGRESQL_VERSION = "=15.13.0"
 EOF
 
 # --
