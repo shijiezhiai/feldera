@@ -282,7 +282,11 @@ pg-client-config = "0.1.2"
 pin-project-lite = "0.2.16"
 postgres = "0.19.10"
 # rustls rather than the default native-tls, which pulls the OpenSSL crate.
-postgresql_embedded = { version = "0.20.0", default-features = false, features = ["bundled", "rustls", "theseus"] }
+# 注意: 去掉 "bundled" feature —— 它让 build.rs 在每次编译都列 GitHub releases API
+# (theseus-rs/postgresql-binaries), 匿名配额耗尽即 403 整个构建失败(官方 CI 靠
+# GITHUB_TOKEN 免疫)。bundled 只影响镜像内嵌 PG 归档, 源码无引用;
+# 运行时改走外部 PG(postgres:// 连接串), 冒烟时给 manager 配即可。
+postgresql_embedded = { version = "0.20.0", default-features = false, features = ["rustls", "theseus"] }
 pprof = "0.15.0"
 pretty_assertions = "1.4.0"
 prettyplease = "0.2.22"
