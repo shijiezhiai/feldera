@@ -114,7 +114,10 @@ RUN mkdir -p ${GRADLE_USER_HOME}/wrapper/dists/gradle-8.14.4-bin/92wwslzcyst3phi
 # 本网络直连 Maven Central 常中途截断（实测 sqlite-jdbc-3.45.3.0.jar 13.5M
 # 只收到 11.7M 即 Premature end of Content-Length）。注入腾讯云 nexus 镜像作
 # central 的 mirror（元数据 pom/sha1 齐全，实测 200）。
-COPY maven-settings.xml /root/.m2/settings.xml
+# 注意：COPY 源相对 build context 根（仓库根），Dockerfile 在 deploy/ 下，
+# 所以必须写 deploy/maven-settings.xml（写 maven-settings.xml 会报
+# "failed to calculate checksum of ref"，buildkit 找不到源直接失败）。
+COPY deploy/maven-settings.xml /root/.m2/settings.xml
 # Kotlin daemon 曾在构建中"terminated on startup"（VM 12G 下 gradle daemon + kotlin
 # daemon + maven 并发挤爆内存）。禁用 gradle daemon、限制堆，并限制 kotlin daemon。
 RUN env GRADLE_OPTS="-Dorg.gradle.daemon=false -Xmx2g -Dorg.gradle.workers.max=4" \
