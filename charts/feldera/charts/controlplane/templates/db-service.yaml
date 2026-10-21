@@ -1,0 +1,17 @@
+{{- if not .Values.postgresExternal }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-db
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: postgres
+      port: {{ .Values.postgresPort }}
+      targetPort: 5432
+{{- end }}

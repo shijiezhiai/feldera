@@ -1,0 +1,6 @@
+apiVersion: v2
+name: controlplane
+description: Feldera control plane — API server (pipeline-manager), internal PostgreSQL, and (placeholder) Kubernetes runner. Values align with the official enterprise helm-chart-reference.md.
+type: application
+version: 0.1.0
+appVersion: "v0.357.0-20-g7a5128651-bili.1"
