@@ -1,0 +1,57 @@
+# Helm umbrella chart. All values are folded into the subcharts; see
+# charts/controlplane/values.yaml and charts/compiler/values.yaml.
+
+controlplane:
+  enabled: true
+  image:
+    registry: localhost:5001
+    repository: feldera-manager
+    tag: "v0.357.0-20-g7a5128651-bili.1"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  postgresExternal: false
+  postgresVersion: "17-alpine"
+  postgresImageRepository: "postgres"
+  postgresImagePullPolicy: "IfNotPresent"
+  postgresPort: 5431
+  postgresUser: "feldera"
+  postgresPassword: ""
+  felderaDatabaseSecretRef: ""
+  httpsSecretRef: null
+  logJson: false
+  controlPlane:
+    env: []
+    deploymentTimeAnnotation: true
+  resources:
+    postgres:
+      requests:
+        cpu: "1"
+        memory: "512Mi"
+    apiServer:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+    compilerServer:
+      requests:
+        cpu: "1"
+        memory: "4Gi"
+    kubernetesRunner:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+
+compiler:
+  enabled: true
+  image:
+    registry: localhost:5001
+    repository: feldera-compiler
+    tag: "v0.357.0-20-g7a5128651-bili.1"
+    pullPolicy: IfNotPresent
+  compilerPvcStorageSize: 20Gi
+  compilationProfile: optimized
+  parallelCompilation:
+    replicas: 1
+  resources:
+    requests:
+      cpu: "1"
+      memory: "4Gi"

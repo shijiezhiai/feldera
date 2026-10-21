@@ -1,0 +1,22 @@
+image:
+  registry: localhost:5001
+  repository: feldera-compiler
+  tag: "v0.357.0-20-g7a5128651-bili.1"
+  pullPolicy: IfNotPresent
+
+compilerPvcStorageSize: 20Gi
+compilationProfile: optimized
+
+compilerServer:
+  cargo:
+    config: null
+  serviceAccountAnnotations: []
+
+parallelCompilation:
+  enabled: false
+  replicas: 1
+
+resources:
+  requests:
+    cpu: "1"
+    memory: "4Gi"

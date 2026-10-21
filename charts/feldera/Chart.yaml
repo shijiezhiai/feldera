@@ -1,0 +1,13 @@
+apiVersion: v2
+name: feldera
+description: Feldera enterprise platform — control plane (API server + internal PostgreSQL), compiler service, and (unnamed) Kubernetes runner. Values mirror the official helm-chart-reference.md key names.
+type: application
+version: 0.1.0
+appVersion: "v0.357.0-20-g7a5128651-bili.1"
+dependencies:
+  - name: controlplane
+    version: 0.1.0
+    condition: controlplane.enabled
+  - name: compiler
+    version: 0.1.0
+    condition: compiler.enabled

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: compiler
+description: Feldera remote compiler service (in-process for P1-005; standalone HTTP compile path lands P1-018).
+type: application
+version: 0.1.0
+appVersion: "v0.357.0-20-g7a5128651-bili.1"

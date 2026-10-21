@@ -1,0 +1,136 @@
+# Control plane values. Key names follow the official enterprise chart
+# reference (helm-chart-reference.md) so migration stays mechanical.
+# Each component's resources default to the official requests; the kind smoke
+# overlays small sizes via --set.
+
+image:
+  registry: localhost:5001
+  repository: feldera-manager
+  tag: "v0.357.0-20-g7a5128651-bili.1"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# Interface-compatible no-op fields (OSS manager has no license gate).
+felderaAccountId: ""
+felderaLicenseKey: ""
+cloudSecretRef: ""
+
+# HTTP
+service:
+  type: ClusterIP
+  port: 8080
+
+# --- Database ---------------------------------------------------------------
+postgresExternal: false
+postgresVersion: "17-alpine"
+postgresImageRepository: "postgres"
+postgresImagePullPolicy: "IfNotPresent"
+postgresPort: 5431
+postgresUser: "feldera"
+postgresPassword: ""
+felderaDatabaseSecretRef: ""
+
+# --- TLS / logging ----------------------------------------------------------
+httpsSecretRef: null
+logJson: false
+
+# --- Control plane env --------------------------------------------------------
+controlPlane:
+  env: []
+  deploymentTimeAnnotation: true
+
+kubernetesRunner:
+  # P1-005: not exercised yet (K8sRunner object lands P1-009+).
+  image:
+    registry: localhost:5001
+    repository: feldera-runner
+    tag: "v0.357.0-20-g7a5128651-bili.1"
+  enablePerPipelineNamespace: false
+  allowCustomPipelineTemplate: false
+  lowerLimitMemoryMegabyte: 100
+  upperLimitMemoryMegabyte: 32000
+  defaultStorageMegabyte: 30000
+  upperLimitStorageMegabyte: 128000
+  lowerLimitEphemeralStorageMegabyte: 500
+  upperLimitEphemeralStorageMegabyte: 2000
+  storageClassName: null
+  connectorKubernetesSecrets:
+    enableAllowlist: false
+    allowlist: []
+
+compilerPvcStorageSize: 20Gi
+compilationProfile: optimized
+compilerServer:
+  cargo:
+    config: null
+  serviceAccountAnnotations: []
+
+parallelCompilation:
+  enabled: false
+  replicas: 1
+
+auth:
+  enabled: false
+  provider: aws-cognito
+  clientId: ""
+  issuer: ""
+  cognitoLoginUrl: ""
+  cognitoLogoutUrl: ""
+authorization:
+  individualTenant: null
+  issuerTenant: null
+  authorizedGroups: null
+  authAudience: null
+
+allowedOrigins: null
+posthogTelemetryKey: null
+demos:
+  showDefault: true
+  configMapRef: null
+
+pipeline:
+  serviceAccountName: null
+  env: null
+  allowInitContainers: true
+  allowProfiling: false
+
+# Resources. Defaults = official; kind smoke overlays smaller via --set.
+resources:
+  postgres:
+    requests:
+      cpu: "1"
+      memory: "512Mi"
+  apiServer:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+  compilerServer:
+    requests:
+      cpu: "1"
+      memory: "4Gi"
+  kubernetesRunner:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+
+nodeSelectors:
+  controlPlane: []
+  pipeline: []
+tolerations:
+  controlPlane: []
+  pipeline: []
+labels:
+  controlPlane: []
+  pipeline: []
+annotations:
+  controlPlane: []
+  pipeline: []
+
+ipFamilyPolicy: null
+enableIPv6: false
+enableStatefulSetServiceName: true
+unstableFeatures: []
+felderaSentryEnabled: false
+cloudApiEndpoint: "https://cloud1.feldera.com"
+disableClusterMonitorResources: false
