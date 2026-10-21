@@ -113,15 +113,27 @@ stateDiagram-v2
 
 OSS 无 `KubernetesRunnerConfig`；官方 enterprise chart 的 `kubernetesRunner.*` 键（`enablePerPipelineNamespace`、
 `allowCustomPipelineTemplate`、`lowerLimitMemoryMegabyte`…，见 `charts/feldera` 当前 values 骨架）在 OSS
-manager 里**无对应读取代码**是本 ADR 确认的差距。P1-007 增加：
+manager 里**无对应读取代码**是本 ADR 确认的差距。P1-007 已落地（代码位置见各条）：
 
-- `FELDERA_RUNNER=kubernetes`（`crates/pipeline-manager/src/pipeline_env.rs:69` 的 `rejects_kubernetes_env_vars` 测试所在模块）+ `KubernetesRunnerConfig`：
-  - `pipeline_executor_image: String`、`image_pull_policy`
-  - `enable_per_pipeline_namespace: bool`（默认 false）
-  - `limits_*`（对齐 chart 的 lower/upper MB 阈值，用于校验 ResourceConfig 越界报错）
-  - `template_configmap: Option<PipelineTemplateConfig>`（对应 `runtime_config.pipeline_template_configmap`，
-    结构已在 `config.rs:790`）
-- 既有测试 `rejects_kubernetes_env_vars`（见 P1-007 工单）改为受控开关，local_runner 行为零回归。
+- 执行器选择：`FELDERA_RUNNER`（`local` 默认 / `kubernetes`，别名 `k8s`；大小写与空白不敏感），解析在
+  `crates/pipeline-manager/src/runner/selection.rs`，分发在 `crates/pipeline-manager/src/bin/pipeline-manager.rs`。
+- `KubernetesRunnerConfig`（`crates/pipeline-manager/src/config.rs`）：
+  - `--kubernetes-runner-kubeconfig`（`FELDERA_KUBERNETES_RUNNER_KUBECONFIG`）：kubeconfig 路径；不设则走
+    in-cluster service account。
+  - `--kubernetes-runner-namespace`（`FELDERA_KUBERNETES_RUNNER_NAMESPACE`，默认 `feldera`）。
+  - `--kubernetes-runner-pipeline-executor-image`（`FELDERA_KUBERNETES_RUNNER_PIPELINE_EXECUTOR_IMAGE`）：
+    pipeline pod 镜像；`can_provision` 缺失时报 `RunnerConfigError`。
+  - `--kubernetes-runner-per-pipeline-namespace`（默认 false）：对应 chart 的 `enablePerPipelineNamespace`。
+  - `--kubernetes-runner-allow-kubernetes-env-prefix`（默认 false）：受控开关，见下条。
+- `pipeline_env` 受控开关（`crates/pipeline-manager/src/pipeline_env.rs`）：`validate_pipeline_env` 保持原语义
+  （默认拒绝 `KUBERNETES_` 前缀，local_runner 行为零回归），新增 `validate_pipeline_env_with(env, allow_kubernetes_prefix)`
+  与进程级开关 `set_allow_kubernetes_env_prefix`，manager 以 Kubernetes runner 启动时按配置设置，使 API 侧校验一致。
+- `KubernetesRunner` 骨架（`crates/pipeline-manager/src/runner/kubernetes_runner.rs`）：
+  `DEFAULT_PROVISIONING_TIMEOUT = 180s`（决策 1）；`can_provision` 校验镜像配置；`provision`/`is_provisioned`/
+  `check`/`stop`/`clear` 显式返回"未实现"错误（各用对应 `RunnerError` 变体），避免 manager 看似健康而 pipeline 永不启动。
+
+后续切片的配置键（`image_pull_policy`、`limits_*` 越界阈值、`template_configmap`）在 P1-009/P1-011 随实现一起加入，
+P1-007 不预置未使用的配置项。
 
 ## 6. 决策与开放问题
 
@@ -139,4 +151,6 @@ manager 里**无对应读取代码**是本 ADR 确认的差距。P1-007 增加�
 - [x] `ProvisionStatus` 轮询语义（Ongoing/Provisioned/不可恢复 Err）与超时路径（§2/§3）
 - [x] StatefulSet/PVC/Service/NetworkPolicy 模板 + 全部 9 个占位符（§4 表，来源 `config.rs:794-812` 契约）
 - [x] 配置差距确认（`KubernetesRunnerConfig` 缺失）与 P1-007 实现清单（§5）
+- [x] P1-007 接线落地：`FELDERA_RUNNER` 选择、`KubernetesRunnerConfig`、`KUBERNETES_` 前缀受控开关、
+  `KubernetesRunner` 骨架（§5）
 - [ ] **评审通过**：待用户/评审者确认后置为 Accepted

@@ -5,7 +5,8 @@ use crate::compiler::main::{compiler_main, compiler_precompile};
 #[cfg(feature = "postgresql_embedded")]
 use crate::config::PgEmbedConfig;
 use crate::config::{
-    ApiServerConfig, CommonConfig, CompilerConfig, DatabaseConfig, LocalRunnerConfig,
+    ApiServerConfig, CommonConfig, CompilerConfig, DatabaseConfig, KubernetesRunnerConfig,
+    LocalRunnerConfig,
 };
 use crate::db::storage_postgres::StoragePostgres;
 use crate::events_cleaner::events_cleaner;
@@ -27,7 +28,8 @@ pub fn augment_args(cli: Command) -> Command {
     let cli = DatabaseConfig::augment_args(cli);
     let cli = ApiServerConfig::augment_args(cli);
     let cli = CompilerConfig::augment_args(cli);
-    LocalRunnerConfig::augment_args(cli)
+    let cli = LocalRunnerConfig::augment_args(cli);
+    KubernetesRunnerConfig::augment_args(cli)
 }
 
 /// Runs the services until the api-server stops, or performs `--dump-openapi` or `--precompile`.
@@ -142,4 +144,32 @@ where
         .await
         .expect("API server main failed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::augment_args;
+    use crate::config::KubernetesRunnerConfig;
+    use clap::{Command, FromArgMatches};
+
+    /// The local runner and Kubernetes runner configurations are both
+    /// registered on the same command tree, so their arguments must not
+    /// collide (a collision panics at runtime, not at compile time).
+    #[test]
+    fn runner_arguments_do_not_conflict() {
+        augment_args(Command::new("test")).debug_assert();
+    }
+
+    /// An invocation without runner-specific flags parses into both runner
+    /// configurations: the local runner keeps its defaults and the Kubernetes
+    /// runner is inert until it is selected.
+    #[test]
+    fn default_invocation_parses_both_runner_configs() {
+        let matches = augment_args(Command::new("test")).get_matches_from(["test"]);
+        let local = crate::config::LocalRunnerConfig::from_arg_matches(&matches).unwrap();
+        assert_eq!(local.coordinator_binary, None);
+        let kubernetes = KubernetesRunnerConfig::from_arg_matches(&matches).unwrap();
+        assert_eq!(kubernetes.kubernetes_runner_namespace, "feldera");
+        assert_eq!(kubernetes.kubernetes_runner_pipeline_executor_image, None);
+    }
 }

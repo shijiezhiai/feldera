@@ -1618,6 +1618,85 @@ impl LocalRunnerConfig {
     }
 }
 
+/// Default Kubernetes namespace in which the Kubernetes runner creates
+/// pipeline resources.
+pub fn default_kubernetes_runner_namespace() -> String {
+    "feldera".to_string()
+}
+
+/// Configuration of the Kubernetes pipeline runner.
+///
+/// This configuration is only used when the runner is selected with
+/// `FELDERA_RUNNER=kubernetes`; the local runner ignores it.
+#[derive(Parser, Deserialize, Debug, Clone)]
+#[command(next_help_heading = "Kubernetes Runner")]
+pub struct KubernetesRunnerConfig {
+    /// Path to the kubeconfig file used to reach the Kubernetes cluster.
+    ///
+    /// When unset, the runner uses the in-cluster service account credentials
+    /// that Kubernetes mounts into the manager pod.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_KUBECONFIG")]
+    pub kubernetes_runner_kubeconfig: Option<String>,
+
+    /// Kubernetes namespace in which the runner creates pipeline resources.
+    ///
+    /// Only used when one namespace is shared by all pipelines; when
+    /// per-pipeline namespaces are enabled this is the namespace in which
+    /// they are created.
+    #[serde(default = "default_kubernetes_runner_namespace")]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_NAMESPACE",
+        default_value_t = default_kubernetes_runner_namespace()
+    )]
+    pub kubernetes_runner_namespace: String,
+
+    /// Container image used to run a pipeline pod.
+    ///
+    /// Must be an image that contains the `pipeline-runner` binary and the
+    /// platform dependencies it links against (e.g. the Feldera runner image).
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_PIPELINE_EXECUTOR_IMAGE")]
+    pub kubernetes_runner_pipeline_executor_image: Option<String>,
+
+    /// Create one Kubernetes namespace per pipeline instead of sharing
+    /// `--kubernetes-runner-namespace` between all pipelines.
+    ///
+    /// Per-pipeline namespaces isolate pipeline resources (pods, services,
+    /// secrets and storage) from each other, at the cost of requiring
+    /// permissions to create and delete namespaces.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_PER_PIPELINE_NAMESPACE"
+    )]
+    pub kubernetes_runner_per_pipeline_namespace: bool,
+
+    /// Allow user-provided pipeline environment variables whose name starts
+    /// with `KUBERNETES_`.
+    ///
+    /// Disabled by default, which is also the behavior of the local runner.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_ALLOW_KUBERNETES_ENV_PREFIX"
+    )]
+    pub kubernetes_runner_allow_kubernetes_env_prefix: bool,
+}
+
+impl KubernetesRunnerConfig {
+    /// Converts all paths in `self` to absolute paths.
+    pub fn canonicalize(mut self) -> AnyResult<Self> {
+        if let Some(kubeconfig) = self.kubernetes_runner_kubeconfig.as_deref()
+            && !kubeconfig.is_empty()
+        {
+            self.kubernetes_runner_kubeconfig = Some(help_canonicalize_path(kubeconfig)?);
+        }
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1825,5 +1904,45 @@ mod tests {
             ),
             edition => panic!("unexpected edition {edition}"),
         }
+    }
+
+    /// The Kubernetes runner configuration defaults to the same reserved-name
+    /// behavior as the local runner and to a shared `feldera` namespace.
+    #[test]
+    fn kubernetes_runner_config_defaults() {
+        let config = KubernetesRunnerConfig::try_parse_from(["test"]).unwrap();
+        assert_eq!(config.kubernetes_runner_namespace, "feldera");
+        assert_eq!(config.kubernetes_runner_kubeconfig, None);
+        assert_eq!(config.kubernetes_runner_pipeline_executor_image, None);
+        assert!(!config.kubernetes_runner_per_pipeline_namespace);
+        assert!(!config.kubernetes_runner_allow_kubernetes_env_prefix);
+    }
+
+    /// Every Kubernetes runner option can be set from the command line.
+    #[test]
+    fn kubernetes_runner_config_parses_flags() {
+        let config = KubernetesRunnerConfig::try_parse_from([
+            "test",
+            "--kubernetes-runner-kubeconfig",
+            "/var/run/kubeconfig",
+            "--kubernetes-runner-namespace",
+            "pipelines",
+            "--kubernetes-runner-pipeline-executor-image",
+            "ghcr.io/example/runner:1",
+            "--kubernetes-runner-per-pipeline-namespace",
+            "--kubernetes-runner-allow-kubernetes-env-prefix",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.kubernetes_runner_kubeconfig.as_deref(),
+            Some("/var/run/kubeconfig")
+        );
+        assert_eq!(config.kubernetes_runner_namespace, "pipelines");
+        assert_eq!(
+            config.kubernetes_runner_pipeline_executor_image.as_deref(),
+            Some("ghcr.io/example/runner:1")
+        );
+        assert!(config.kubernetes_runner_per_pipeline_namespace);
+        assert!(config.kubernetes_runner_allow_kubernetes_env_prefix);
     }
 }
