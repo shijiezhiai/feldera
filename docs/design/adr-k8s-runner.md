@@ -1,6 +1,6 @@
 # ADR: Kubernetes Pipeline Runner（P1-006）
 
-- 状态：**提议（待评审）**，评审通过后进入 P1-007 实现
+- 状态：**已接受（2026-10-21 评审通过）**；P1-007 已按本 ADR 完成执行器分发接线，P1-009 按本 ADR 实现垂直切片
 - 日期：2026-10-21
 - 上下文：`self-hosted-enterprise-platform-plan.md` §5.1——在自有 K8s 上以 per-pipeline 资源隔离运行
   DBSP pipeline；无 Feldera license。
