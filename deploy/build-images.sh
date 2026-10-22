@@ -24,6 +24,14 @@ cd "${REPO_ROOT}"
 # *:5000，docker -p 5000:5000 必然 bind 失败。若宿主已关闭 AirPlay 接收器，
 # 可 REGISTRY=localhost:5000 切回工单原始端口。
 REGISTRY="${REGISTRY:-localhost:5001}"
+# DOCKER_BUILD_NETWORK=host lets build steps use the host network namespace.
+# Needed on hosts whose container bridge cannot reach GitHub reliably (the
+# librdkafka stage clones aws-lc from GitHub).
+BUILD_NETWORK_ARGS=()
+if [ -n "${DOCKER_BUILD_NETWORK:-}" ]; then
+  BUILD_NETWORK_ARGS=(--network "${DOCKER_BUILD_NETWORK}")
+fi
+
 PUSH="${PUSH:-1}"
 PRUNE="${PRUNE:-1}"
 REGISTRY_CONTAINER="${REGISTRY_CONTAINER:-feldera-local-registry}"
@@ -37,7 +45,9 @@ if [[ "${DOCKER_TLS_VERIFY:-}" == "0" || "${DOCKER_TLS_VERIFY:-}" == "false" ]];
   unset DOCKER_TLS_VERIFY
 fi
 
-VER="$(git describe --tags --always)"
+# VER can be pinned explicitly, which is what a build host without the git
+# history (a remote builder fed by rsync) has to do.
+VER="${VER:-$(git describe --tags --always)}"
 echo "=== feldera bili images: ver=${VER} registry=${REGISTRY} push=${PUSH} prune=${PRUNE}"
 
 ensure_registry() {
@@ -101,7 +111,9 @@ build_one() {
   n="$(next_n "${name}")"
   tag="${name}:${VER}-bili.${n}"
   echo "=== [$(date '+%H:%M:%S')] building ${tag} (dockerfile=deploy/${dockerfile})"
-  docker build -f "deploy/${dockerfile}" -t "${tag}" "$@" .
+  docker build -f "deploy/${dockerfile}" -t "${tag}" "${BUILD_NETWORK_ARGS[@]+"${BUILD_NETWORK_ARGS[@]}"}" \
+    --build-arg GITHUB_MIRROR="${GITHUB_MIRROR:-}" \
+    --build-arg APT_MIRROR="${APT_MIRROR:-}" "$@" .
   finish_image "${tag}"
 }
 
@@ -118,7 +130,9 @@ build_one() {
 build_manager() {
   if [[ -z "${BILI_MANAGER_BINARY:-}" ]]; then
     build_one feldera-manager Dockerfile.manager \
-      --build-arg BILI_CARGO_JOBS="${BILI_CARGO_JOBS:-4}"
+      --build-arg BILI_CARGO_JOBS="${BILI_CARGO_JOBS:-4}" \
+      --build-arg GITHUB_MIRROR="${GITHUB_MIRROR:-}" \
+      --build-arg APT_MIRROR="${APT_MIRROR:-}" "${BUILD_NETWORK_ARGS[@]+"${BUILD_NETWORK_ARGS[@]}"}"
     return
   fi
 

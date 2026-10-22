@@ -67,3 +67,101 @@
   单架构镜像没问题；`postgres:17-alpine` 这种带 manifest list 的会报
   `content digest ... not found`，要
   `docker save | ctr --namespace=k8s.io images import`。
+- **`COPY` 继承宿主机的文件权限**，所以 `COPY deploy/pipeline-entrypoint.sh
+  /usr/local/bin/pipeline-entrypoint` 会把检出目录里 `rw-------` 的权限原样带进
+  镜像，pod 报 `cannot open /usr/local/bin/pipeline-entrypoint: Permission
+  denied`（连 `#!/bin/sh` 都读不到）。`Dockerfile.runner` 改成普通 `COPY` 紧跟
+  一条 `RUN chmod 0755`，既不看检出目录的权限位，也不要求 BuildKit
+  （classic builder 不支持 `COPY --chmod`）。
+- **容器的内存上限必须高于 pipeline 自己的 `max_rss_mb` 预算**。第一次
+  e2e 用 `memory_mb_max=1024` 直接当容器 limit，pipeline 进程按 1 GiB 预算
+  增长，加上二进制页、线程栈和分配器开销就把 cgroup 撑爆：
+  `OOMKilled`（exit 137），automaton 看到 `CrashLoopBackOff` 后把 pipeline
+  置为 Failed。现在 limit = 预算 + max(25%, 256MiB)，request 仍是预算。
+- **编译产物按 pipeline id 归档**（`pipeline_<id>_v<n>_sc_<source>_ic_<integrity>`），
+  所以即使 SQL 完全相同，新建 pipeline 仍要重编生成 crate 并重链接一次：
+  在 warm 缓存上约 3–4 分钟，冷启动则按 profile 计（`optimized` 实测
+  2 小时 15 分，`dev` 光最后链接就 13 分钟）。要把"改了 runner 之后跑一遍
+  e2e"的代价压到可接受，编译缓存卷（`controlplane.compilationCache`）是必需的，
+  它同时让 manager pod 重建后不必从零编译。
+
+## 在 Linux 构建机上跑整条链（2026-10-22，flink-test-02）
+
+镜像构建和 e2e 都可以整体搬离开发机。`flink-test-02` 是 48 核 / 124 GiB 的
+Debian 10 机器，这里单独起了一个 Docker 24.0.9 守护进程（socket 与 data-root
+都在 `/mnt/storage01/mayy/feldera` 下，不碰机器上原有的 19.03）。
+
+一次性准备：
+
+- `/mnt/storage01/mayy/feldera/env.sh` 导出 `DOCKER_HOST`、`PATH`
+  （`bin/docker`、`bin/kind`、`bin/kubectl`、`bin/helm`）、`KUBECONFIG` 和
+  `DOCKER_BUILDKIT=0`。这台机器没有 buildx 插件，classic builder 足够。
+- kind 集群 `bili-p1005`（`kind create cluster`）。kind 自带 `standard`
+  StorageClass，`controlplane.compilationCache` 能直接绑定。
+- `webconsole-dist/` 仍是宿主机产物：在一次性容器里跑
+  `bun install && bun run build:deps:web-console &&
+  bun --cwd=js-packages/web-console run build:self`，再 `docker cp` 出来。
+  `build:self` 打印 `✔ done` 之后 vite 会被 sass-embedded 子进程吊住不退出，
+  要 `docker cp` 产物而不是等退出码。
+
+构建参数（这条线路必需）：
+
+- `APT_MIRROR=http://mirrors.ustc.edu.cn` —— `archive.ubuntu.com` 间歇性失败，
+  `apt-get update` 掉包后 `apt-get install` 会报 `Unable to locate package`。
+- `GITHUB_MIRROR=https://gh-proxy.com/https://github.com` —— GitHub 的 git
+  协议在这条线路上不可用（`gnutls_handshake() failed` 或传输中途停滞）。
+  `scripts/install-librdkafka.sh` 改下载
+  `<mirror>/<owner>/<repo>/archive/<sha>.tar.gz`（GitHub archive 按 commit
+  寻址，顶层目录名里带 OID，脚本校验它）；Dockerfile 里 calcite 与 cargo
+  的 git 依赖走 `url.<mirror>/.insteadOf https://github.com/`。
+- `DOCKER_BUILD_NETWORK=host` 只在桥接网络异常时打开；默认不要开。
+
+踩到的坑：把 `br-mayy` 的 MTU 调成 1400 后，apt 与镜像层下载全部卡死
+（`apt-get update` 反复 `Ign`/`Err`），恢复 1500 后 apt 立刻 12 MB/s。
+低 MTU 不是"更保险"，在这个链路上只会把路径 MTU 发现搞坏。
+
+### 第二轮：镜像链跑通后剩下的坑（2026-10-22 晚）
+
+上面那条"从零建镜像"的线路里，镜像本身能构建出来，但**跑通 e2e** 还要再过
+五关。这些都是构建机上实测的、和上游代码无关的环境问题：
+
+- **cargo 的 libgit2 会永久卡住**：`Updating git repository` 之后 0% CPU 三十分钟
+  不动（容器里 cargo 进程 0.2% CPU、无子进程）。改成
+  `ENV CARGO_NET_GIT_FETCH_WITH_CLI=true`，让 git CLI 做 fetch（它认
+  `url.insteadOf`，也会重试）。
+- **`POSTGRESQL_VERSION` 必须在 cargo 那行显式给**：stage 里写的
+  `~/.cargo/config.toml` 的 `[env]` 段在这个 stage 没生效，`pg_setup.rs` 的
+  `env!("POSTGRESQL_VERSION")` 直接编译失败。可靠写法是
+  `RUN POSTGRESQL_VERSION="=15.13.0" cargo build ...`。（构建上下文没有
+  `.cargo/`，仓库自己的 `.cargo/config.toml` 也进不了镜像。）
+- **samply 的安装只告警**：`samply-installer.sh` 内部还要直连 github 下载二进制，
+  这条线路上必失败。它只用于性能剖析，改成 `... | sh || echo "warning: ..."`
+  可让整张镜像不至于报废。
+- **runner 的 Dockerfile 也得有镜像参数**：`install-librdkafka.sh` 的
+  `SOURCE_MIRROR` 分支要 `curl`，而 runner 的 apt 行原本没装 `curl`，报
+  `/tmp/install-librdkafka.sh: line 129: curl: command not found`。补 `curl` 并透传
+  `ARG GITHUB_MIRROR` 后 180 MB 的 runner 秒级可建。
+- **macOS 打出来的 tar 会毁掉 helm**：AppleDouble 文件 `._api-server-service.yaml`
+  被 helm 当成模板，报
+  `YAML parse error ... control characters are not allowed`。同步代码后先
+  `find charts -name '._*' -delete`。
+
+e2e 侧的三条：
+
+- **kind 要 load 四张镜像**，不止 manager/runner：漏了 compiler 是
+  `ImagePullBackOff`（pod 起不来），漏了 `postgres:17-alpine` 是整条链起不来。
+  postgres 从 `docker.m.daocloud.io` 拉再 `docker tag` 回原名。
+- **删 pipeline 要走完整状态机**：`stop?force=true` → 等
+  `deployment_status=Stopped` → `clear` → 等存储释放 → `DELETE`。漏一步就是
+  `DeleteRestrictedToClearedStorage` 或 `Cannot transition storage status from
+  'in_use'`，而且脚本会静默"删失败"，下一轮跑出来 `c=6`、`c=9`（旧数据还在）。
+- **`/ingress/<table>` 的默认 update format 是 raw**（每行一个裸 JSON 字符串），
+  传 `[{"i":1},...]` 报 `invalid type: map, expected a string`。要显式
+  `?format=json&update_format=insert_delete`，body 用换行分隔的
+  `{"insert":{"i":1}}`。
+- **`pkill -f "kubectl port-forward"` 会杀掉自己的 ssh 会话**（模式串命中了自己
+  的命令行），用 `pgrep -f` 拿 PID 再 kill。
+
+性能数字：这台上第一次编译（依赖已在镜像里、target 目录空）331 s，第二次编译
+（PVC 里 target 已热）17 s，pod 起来 7 s。
+

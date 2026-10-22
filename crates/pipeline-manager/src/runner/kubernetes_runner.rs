@@ -99,6 +99,10 @@ const PIPELINE_ENTRYPOINT: &str = "/usr/local/bin/pipeline-entrypoint";
 /// documented default of 30 GiB.
 const DEFAULT_STORAGE_MB: u64 = 30 * 1024;
 
+/// Name of the dry-run Secret that `can_provision` sends to check that the
+/// runner may deploy into the namespace. It is never persisted.
+const CONNECTIVITY_PROBE_NAME: &str = "feldera-runner-connectivity-probe";
+
 /// UID/GID the pipeline runs as.
 ///
 /// The pipeline executor image's `ubuntu` user owns uid 1000; running with an
@@ -204,27 +208,46 @@ fn storage_mb(config: &PipelineConfig) -> u64 {
 }
 
 /// Maps the runtime configuration's resource requests onto pod resources.
+///
+/// Zero quantities are dropped: a `cpu: "0"` request is legal but meaningless,
+/// and it hides the fact that the user never asked for a reservation.
 fn pod_resources(config: &PipelineConfig) -> ResourceRequirements {
     let resources = &config.global.resources;
     let mut requests = BTreeMap::new();
     let mut limits = BTreeMap::new();
-    if let Some(cores) = resources.cpu_cores_min {
+    if let Some(cores) = resources.cpu_cores_min.filter(|cores| *cores > 0.0) {
         requests.insert("cpu".to_string(), cpu_quantity(cores));
     }
-    if let Some(mb) = resources.memory_mb_min {
+    if let Some(mb) = resources.memory_mb_min.filter(|mb| *mb > 0) {
         requests.insert("memory".to_string(), mebibyte_quantity(mb));
     }
-    if let Some(cores) = resources.cpu_cores_max {
+    if let Some(cores) = resources.cpu_cores_max.filter(|cores| *cores > 0.0) {
         limits.insert("cpu".to_string(), cpu_quantity(cores));
     }
-    if let Some(mb) = resources.memory_mb_max {
-        limits.insert("memory".to_string(), mebibyte_quantity(mb));
+    if let Some(mb) = resources.memory_mb_max.filter(|mb| *mb > 0) {
+        limits.insert("memory".to_string(), mebibyte_quantity(memory_limit_mb(mb)));
     }
     ResourceRequirements {
         requests: (!requests.is_empty()).then_some(requests),
         limits: (!limits.is_empty()).then_some(limits),
         ..Default::default()
     }
+}
+
+/// Headroom the container limit leaves above the pipeline's own budget.
+const MIN_MEMORY_HEADROOM_MB: u64 = 256;
+
+/// The container memory limit for a pipeline whose runtime memory budget is
+/// `max_rss_mb`.
+///
+/// The pipeline enforces `max_rss_mb` on the memory it accounts for itself, so a
+/// container limit equal to the budget kills it: the generated binary's pages,
+/// the worker thread stacks and allocator overhead all live in the same cgroup.
+/// A quarter more, and at least [`MIN_MEMORY_HEADROOM_MB`], keeps the process
+/// inside its limit while the runtime still stops growing at its own budget.
+fn memory_limit_mb(max_rss_mb: u64) -> u64 {
+    let headroom = ((max_rss_mb as f64) * 0.25).ceil() as u64;
+    max_rss_mb + headroom.max(MIN_MEMORY_HEADROOM_MB)
 }
 
 /// A storage request for one pipeline.
@@ -908,8 +931,25 @@ impl PipelineExecutor for KubernetesRunner {
             None => build_kubernetes_client(&self.config).await?,
         };
         let namespace = self.namespace(runtime_config);
-        let namespaces: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(client);
-        match namespaces.get(&namespace).await {
+        // Probe the namespace with a dry-run create rather than reading the
+        // Namespace object: the runner's Role is namespaced, so it cannot read
+        // cluster-scoped resources, but it can always create a Secret in the
+        // namespace it deploys into. A missing namespace answers 404 here
+        // instead of surfacing fifteen minutes later as a provisioning timeout.
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
+        let probe = Secret {
+            metadata: ObjectMeta {
+                name: Some(CONNECTIVITY_PROBE_NAME.to_string()),
+                namespace: Some(namespace.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let params = PostParams {
+            dry_run: true,
+            ..Default::default()
+        };
+        match secrets.create(&params, &probe).await {
             Ok(_) => Ok(()),
             Err(error) if is_not_found(&error) => Err(RunnerError::RunnerConfigError {
                 error: format!(
@@ -919,7 +959,10 @@ impl PipelineExecutor for KubernetesRunner {
             }
             .into()),
             Err(error) => Err(RunnerError::RunnerConfigError {
-                error: format!("unable to read the Kubernetes namespace '{namespace}': {error}"),
+                error: format!(
+                    "unable to talk to the Kubernetes API server for namespace '{namespace}': \
+                     {error} (check the runner's kubeconfig, in-cluster credentials and RBAC)"
+                ),
             }
             .into()),
         }
@@ -1365,6 +1408,37 @@ mod tests {
     }
 
     #[test]
+    fn the_memory_limit_leaves_headroom_above_the_pipeline_budget() {
+        // Below 1 GiB the fixed headroom dominates; above it, a quarter.
+        assert_eq!(memory_limit_mb(256), 512);
+        assert_eq!(memory_limit_mb(1024), 1280);
+        assert_eq!(memory_limit_mb(4096), 5120);
+        // A pipeline configured with no memory budget gets no limit at all.
+        let resources = ResourceConfig {
+            memory_mb_max: None,
+            ..ResourceConfig::default()
+        };
+        let requirements = pod_resources(&pipeline_config(resources, &[]));
+        assert!(requirements.limits.is_none());
+    }
+
+    #[test]
+    fn zero_quantities_are_dropped_instead_of_becoming_zero_requests() {
+        let resources = ResourceConfig {
+            cpu_cores_min: Some(0.0),
+            memory_mb_min: Some(0),
+            cpu_cores_max: Some(1.0),
+            memory_mb_max: Some(1024),
+            ..ResourceConfig::default()
+        };
+        let requirements = pod_resources(&pipeline_config(resources, &[]));
+        let requests = requirements.requests.unwrap_or_default();
+        assert!(!requests.contains_key("cpu"), "a zero CPU request is noise");
+        assert!(!requests.contains_key("memory"));
+        assert_eq!(requirements.limits.unwrap()["memory"].0, "1280Mi");
+    }
+
+    #[test]
     fn resources_are_mapped_from_the_runtime_configuration() {
         let resources = ResourceConfig {
             cpu_cores_min: Some(0.5),
@@ -1385,7 +1459,7 @@ mod tests {
         assert_eq!(requirements.requests.as_ref().unwrap()["cpu"].0, "500m");
         assert_eq!(requirements.limits.as_ref().unwrap()["cpu"].0, "2");
         assert_eq!(requirements.requests.as_ref().unwrap()["memory"].0, "512Mi");
-        assert_eq!(requirements.limits.as_ref().unwrap()["memory"].0, "2048Mi");
+        assert_eq!(requirements.limits.as_ref().unwrap()["memory"].0, "2560Mi");
 
         let claim = input.render().storage_claim.unwrap();
         let claim_spec = claim.spec.unwrap();
@@ -1603,6 +1677,11 @@ mod tests {
 
         fn respond(cluster: &FakeCluster, method: &Method, path: &str) -> Response<Full<Bytes>> {
             let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            if !*cluster.namespace_exists.lock().unwrap()
+                && parts.starts_with(&["api", "v1", "namespaces", "feldera"])
+            {
+                return status(StatusCode::NOT_FOUND, "namespaces", "feldera");
+            }
             if parts == ["api", "v1", "namespaces", "feldera"] {
                 return if *cluster.namespace_exists.lock().unwrap() {
                     json(object("namespaces", "feldera"))

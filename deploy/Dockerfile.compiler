@@ -15,6 +15,14 @@
 
 FROM ubuntu:24.04 AS librdkafka
 ENV DEBIAN_FRONTEND=noninteractive
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 RUN apt-get update --fix-missing && apt-get install -y \
   git cmake build-essential pkg-config golang-go \
   libsasl2-dev zlib1g-dev libzstd-dev
@@ -25,6 +33,14 @@ RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 RUN apt-get update --fix-missing && apt-get install -y \
   openjdk-21-jdk-headless \
   maven \

@@ -12,12 +12,25 @@
 
 FROM ubuntu:24.04 AS librdkafka
 ENV DEBIAN_FRONTEND=noninteractive
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
+# curl: install-librdkafka.sh 的 SOURCE_MIRROR 分支用 curl 拉 tarball
 RUN apt-get update --fix-missing && apt-get install -y \
-  git cmake build-essential pkg-config golang-go \
+  git cmake build-essential pkg-config golang-go curl \
   libsasl2-dev zlib1g-dev libzstd-dev
 COPY scripts/install-librdkafka.sh /tmp/install-librdkafka.sh
 COPY Cargo.lock /tmp/Cargo.lock
-RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
+# 本网络 git 协议访问 github 不可用（GnuTLS 握手/传输中断），SOURCE_MIRROR 让
+# 安装脚本改走 release tarball 镜像；为空时仍按 git 克隆上游（默认行为不变）。
+ARG GITHUB_MIRROR=
+RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local \
+    SOURCE_MIRROR="${GITHUB_MIRROR}" bash /tmp/install-librdkafka.sh
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -26,6 +39,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   librdkafka 动态链接 libsasl2/libzstd/zlib；常见 TLS 栈需要 libssl3 与 CA 证书。
 #   libssl3t64 是 ubuntu:24.04 的包名（20.04 及以前为 libssl3）。
 # 注意：AWS-LC 版 librdkafka 自身不链系统 OpenSSL（构建阶段已 readelf 校验）。
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
@@ -44,8 +65,12 @@ RUN ldconfig \
 
 # 入口脚本：从编译服务下载 pipeline 二进制后 exec（Kubernetes runner 用；
 # 本地 runner 直接把二进制落盘执行，不走这里）
+# The checkout's own mode is not part of the build contract (a fresh clone can
+# carry 600), so the copy is followed by an explicit chmod. A plain COPY plus
+# RUN also keeps the image buildable with the classic builder, which does not
+# support COPY --chmod.
 COPY deploy/pipeline-entrypoint.sh /usr/local/bin/pipeline-entrypoint
-RUN chmod +x /usr/local/bin/pipeline-entrypoint
+RUN chmod 0755 /usr/local/bin/pipeline-entrypoint
 
 # ubuntu:24.04 镜像自带 ubuntu 用户（uid 1000），无需 useradd
 USER ubuntu
