@@ -112,3 +112,6 @@ js-packages/support-bundle-triage/
 .envrc
 .direnv
 .env
+
+# P1-009 迭代快速路径：本地编译出的 manager 二进制（overlay 构建用）
+deploy/.build/

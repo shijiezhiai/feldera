@@ -45,6 +45,10 @@ futures-util = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true, features = ["v7", "std", "serde"] }
 chrono = { workspace = true, features = ["clock", "serde"] }
+
+# Kubernetes (used by the KubernetesRunner pipeline executor)
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = { workspace = true }
@@ -161,6 +165,11 @@ feldera-types = { workspace = true, features = ["testing"] }
 itertools = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 libc = { workspace = true }  # For: asserting errno-to-ErrorKind mapping
+# A fake Kubernetes API server for the Kubernetes runner tests.
+tower = { workspace = true, features = ["util"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 
 [package.metadata.cargo-machete]
 ignored = ["static-files", "compare", "tikv-jemallocator"]

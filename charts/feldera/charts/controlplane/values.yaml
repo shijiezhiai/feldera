@@ -40,8 +40,19 @@ controlPlane:
   env: []
   deploymentTimeAnnotation: true
 
+# Persistent cargo target directory of the in-pod compiler. Enable it in
+# environments with a default StorageClass to keep pipeline compilation warm
+# across pod recreations; `scripts/e2e-k8s-runner.sh` leaves it off because the
+# claim outlives throwaway clusters otherwise.
+compilationCache:
+  enabled: false
+  size: 50Gi
+  storageClassName: ""
+
 kubernetesRunner:
-  # P1-005: not exercised yet (K8sRunner object lands P1-009+).
+  # P1-009: runs each pipeline as its own StatefulSet-managed pod. Disabling it
+  # falls back to the local (in-pod) runner, which is only useful for debugging.
+  enabled: true
   image:
     registry: localhost:5001
     repository: feldera-runner

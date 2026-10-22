@@ -655,6 +655,27 @@ impl CommonConfig {
         }
     }
 
+    /// Returns whether [`Self::compiler_host`] refers to the local machine.
+    ///
+    /// A pipeline pod in Kubernetes cannot reach the manager's loopback
+    /// interface, so the Kubernetes runner refuses to provision while the
+    /// compiler is only reachable locally. Both the textual forms
+    /// (`localhost`) and loopback IP literals are recognized.
+    pub fn compiler_host_is_loopback(&self) -> bool {
+        let host = self
+            .compiler_host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        match host.parse::<std::net::IpAddr>() {
+            Ok(address) => address.is_loopback(),
+            Err(_) => {
+                let host = host.to_ascii_lowercase();
+                host == "localhost" || host.ends_with(".localhost")
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_config() -> Self {
         Self {
@@ -1667,10 +1688,7 @@ pub struct KubernetesRunnerConfig {
     /// secrets and storage) from each other, at the cost of requiring
     /// permissions to create and delete namespaces.
     #[serde(default)]
-    #[arg(
-        long,
-        env = "FELDERA_KUBERNETES_RUNNER_PER_PIPELINE_NAMESPACE"
-    )]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_PER_PIPELINE_NAMESPACE")]
     pub kubernetes_runner_per_pipeline_namespace: bool,
 
     /// Allow user-provided pipeline environment variables whose name starts
@@ -1678,10 +1696,7 @@ pub struct KubernetesRunnerConfig {
     ///
     /// Disabled by default, which is also the behavior of the local runner.
     #[serde(default)]
-    #[arg(
-        long,
-        env = "FELDERA_KUBERNETES_RUNNER_ALLOW_KUBERNETES_ENV_PREFIX"
-    )]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_ALLOW_KUBERNETES_ENV_PREFIX")]
     pub kubernetes_runner_allow_kubernetes_env_prefix: bool,
 }
 

@@ -58,7 +58,8 @@ pub fn validate_pipeline_env_with(
         .filter(|key| {
             ENV_VAR_BLOCKLIST.contains(&key.as_str())
                 || ENV_VAR_PREFIX_BLOCKLIST.iter().any(|prefix| {
-                    key.starts_with(prefix) && !(allow_kubernetes_prefix && *prefix == "KUBERNETES_")
+                    key.starts_with(prefix)
+                        && !(allow_kubernetes_prefix && *prefix == "KUBERNETES_")
                 })
         })
         .cloned()

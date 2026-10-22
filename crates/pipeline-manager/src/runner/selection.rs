@@ -96,10 +96,7 @@ mod tests {
             resolve_runner_kind(Some(" Kubernetes ")),
             Ok(RunnerKind::Kubernetes)
         );
-        assert_eq!(
-            resolve_runner_kind(Some("k8s")),
-            Ok(RunnerKind::Kubernetes)
-        );
+        assert_eq!(resolve_runner_kind(Some("k8s")), Ok(RunnerKind::Kubernetes));
     }
 
     #[test]
