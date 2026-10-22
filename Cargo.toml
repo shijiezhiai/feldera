@@ -230,6 +230,8 @@ iceberg-storage-opendal = { git = "https://github.com/feldera/iceberg-rust", rev
 # not apply it. TODO: drop it when `iceberg` and `iceberg-datafusion` 0.12 both
 # come from crates.io (crates.io `datafusion-iceberg` is an unrelated project).
 datafusion-iceberg = { git = "https://github.com/feldera/datafusion-iceberg.git", rev = "577ba62a99ab8522e29a955d20929ab29585c70d" }
+http-body-util = "0.1.3"
+tower = "0.5.2"
 impl-trait-for-tuples = "0.2"
 indexmap = "2.7.1"
 indicatif = "0.17.0-rc.11"
@@ -239,6 +241,8 @@ itertools = "0.14.0"
 jemalloc_pprof = "0.7.0"
 json_to_table = "0.14.0"
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
+k8s-openapi = { version = "0.28.0", features = ["v1_33"] }
+kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls"] }
 lexical-core = "1.0.5"
 libc = "0.2.153"
 libtest-mimic = "0.8.2"

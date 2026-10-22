@@ -28,6 +28,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # 注意：AWS-LC 版 librdkafka 自身不链系统 OpenSSL（构建阶段已 readelf 校验）。
 RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends \
   ca-certificates \
+  curl \
   libsasl2-2 \
   libzstd1 \
   zlib1g \
@@ -41,11 +42,17 @@ RUN ldconfig \
        echo "error: librdkafka links a shared OpenSSL" >&2; exit 1; \
      fi
 
+# 入口脚本：从编译服务下载 pipeline 二进制后 exec（Kubernetes runner 用；
+# 本地 runner 直接把二进制落盘执行，不走这里）
+COPY deploy/pipeline-entrypoint.sh /usr/local/bin/pipeline-entrypoint
+RUN chmod +x /usr/local/bin/pipeline-entrypoint
+
 # ubuntu:24.04 镜像自带 ubuntu 用户（uid 1000），无需 useradd
 USER ubuntu
 WORKDIR /home/ubuntu
 # pipeline 程序落位约定（P1-018 编译服务写入）
 RUN mkdir -p /home/ubuntu/pipelines
 
-# v1 冒烟形态：常驻等待；冒烟时 docker cp 二进制进来执行
+# 默认常驻等待（本地冒烟 / docker cp 调试用）；Kubernetes runner 会显式指定
+# command=/usr/local/bin/pipeline-entrypoint 覆盖它。
 CMD ["sleep", "infinity"]

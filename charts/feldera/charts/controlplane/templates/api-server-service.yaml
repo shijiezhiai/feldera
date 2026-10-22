@@ -15,3 +15,10 @@ spec:
     - name: http
       port: {{ .Values.service.port }}
       targetPort: 8080
+    {{- if .Values.kubernetesRunner.enabled }}
+    # Pipeline pods download their program binary from the compiler service that
+    # runs inside the manager pod; without this port the pipeline cannot start.
+    - name: compiler
+      port: 8085
+      targetPort: 8085
+    {{- end }}

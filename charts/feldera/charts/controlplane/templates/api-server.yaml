@@ -30,6 +30,16 @@ spec:
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+            {{- if .Values.kubernetesRunner.enabled }}
+            # The Kubernetes runner provisions each pipeline as its own pod
+            # (see docs/design/adr-k8s-runner.md). Pipelines fetch their program
+            # binary from the compiler service in this same pod, so the compiler
+            # host must be the in-cluster address, never 127.0.0.1.
+            - name: FELDERA_RUNNER
+              value: "kubernetes"
+            - name: COMPILER_HOST
+              value: {{ include "controlplane.fullname" . }}-api-server.{{ .Release.Namespace }}.svc.cluster.local
+            {{- end }}
             {{- if not .Values.postgresExternal }}
             - name: DB_USER
               valueFrom:
@@ -59,9 +69,28 @@ spec:
             {{- else }}
             - "--db-connection-string=postgres://$(DB_USER):$(DB_PASSWORD)@{{ .Release.Name }}-db:{{ .Values.postgresPort }}/feldera"
             {{- end }}
+            {{- if .Values.kubernetesRunner.enabled }}
+            - "--compiler-host=$(COMPILER_HOST)"
+            - "--kubernetes-runner-namespace={{ .Release.Namespace }}"
+            - "--kubernetes-runner-pipeline-executor-image={{ .Values.kubernetesRunner.image.registry }}/{{ .Values.kubernetesRunner.image.repository }}:{{ .Values.kubernetesRunner.image.tag }}"
+            {{- if .Values.kubernetesRunner.enablePerPipelineNamespace }}
+            - "--kubernetes-runner-per-pipeline-namespace=true"
+            {{- end }}
+            {{- if .Values.kubernetesRunner.allowCustomPipelineTemplate }}
+            - "--kubernetes-runner-allow-kubernetes-env-prefix=true"
+            {{- end }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080
+          {{- if .Values.compilationCache.enabled }}
+          volumeMounts:
+            # Cargo target directory of the programs compiled inside this pod.
+            # A cold compile takes hours, so the claim keeps it across pod
+            # recreations.
+            - name: compilation-cache
+              mountPath: /home/ubuntu/.feldera
+          {{- end }}
           resources:
             {{- toYaml .Values.resources.apiServer | nindent 12 }}
           readinessProbe:
@@ -76,6 +105,18 @@ spec:
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 15
+      {{- if .Values.compilationCache.enabled }}
+      # The compilation cache claim is handed to the pod as root:root, but the
+      # image runs as `ubuntu` (uid 1000). fsGroup makes the kubelet give the
+      # group write access, which is what cargo needs to create its target
+      # directory inside the claim.
+      securityContext:
+        fsGroup: 1000
+      volumes:
+        - name: compilation-cache
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-compilation-cache
+      {{- end }}
       {{- with .Values.controlPlane.env }}
       # NOTE: controlPlane.env (pod-level env) is intentionally not injected
       # here yet; the official chart injects it via a pod template patch that

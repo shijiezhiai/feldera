@@ -42,3 +42,28 @@
 
 - 新 bun 下载是否保持 ~8s（容器内已端到端验证 7.9s 下载+解压+bun --version）。
 - cargo cache-mount 命中后二次构建时长。
+
+## P1-009：kind 上迭代 runner 的固定套路
+
+- **只换二进制，不重建镜像**：先在带工具链的容器里
+  `cargo build --release -p pipeline-manager`（target 挂在命名卷上，改一行
+  增量 1.5 分钟），再用 `deploy/Dockerfile.manager.overlay` 叠一层
+  `COPY`（秒级），`BASE_IMAGE` 指向上一个能跑的 manager 镜像。
+  `deploy/build-images.sh` 见到 `BILI_MANAGER_BINARY` 就走这条路。全量
+  `Dockerfile.manager` 构建依旧是 60–90 分钟，只在发版时用。
+- **容器的可写层在容器重启时会被丢弃**（containerd 每次以镜像重新建容器
+  快照）：`docker cp`／`kubectl cp` 塞进去的二进制、"用 mv 顶替"的路径，
+  只要容器一重启就回到镜像里的版本。只有挂载卷（emptyDir/PVC）的内容会
+  留下。所以 pod 内编译缓存（`/home/ubuntu/.feldera`，emptyDir）能跨重启，
+  而临时替换的 manager 二进制不能——需要修二进制时只能出新镜像。
+- **Helm 覆盖键要带子 chart 前缀**：umbrella 的 values 不会自动下传到子
+  chart，`image.tag=...` 无效，必须写 `controlplane.image.tag` 与
+  `controlplane.kubernetesRunner.image.tag`。写错的表现是
+  `helm upgrade --wait` 五分钟超时，而 pod 仍是旧镜像。
+- **`randAlphaNum` 不能出现在会被 upgrade 重新渲染的 Secret 里**：它每次
+  渲染都换值，Postgres 数据目录里的旧密码不会跟着变，升级后 manager 直接
+  `password authentication failed`。改成 `lookup` 复用集群里已有的值。
+- **`kind load docker-image` 只吃得下单架构镜像**：本地 `docker build` 的
+  单架构镜像没问题；`postgres:17-alpine` 这种带 manifest list 的会报
+  `content digest ... not found`，要
+  `docker save | ctr --namespace=k8s.io images import`。

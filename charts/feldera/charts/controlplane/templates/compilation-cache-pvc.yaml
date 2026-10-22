@@ -1,0 +1,20 @@
+{{- if .Values.compilationCache.enabled }}
+# Cargo target directory of the programs that the control plane compiles inside
+# its own pod. A cold compile of the generated Rust program takes hours, so the
+# claim is worth keeping when the cluster has a default StorageClass.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-compilation-cache
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.compilationCache.size }}
+  {{- with .Values.compilationCache.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+{{- end }}

@@ -76,14 +76,9 @@ next_n() {
   echo "${n}"
 }
 
-build_one() {
-  local name="$1" dockerfile="$2"
-  shift 2
-  local n tag
-  n="$(next_n "${name}")"
-  tag="${name}:${VER}-bili.${n}"
-  echo "=== [$(date '+%H:%M:%S')] building ${tag} (dockerfile=deploy/${dockerfile})"
-  docker build -f "deploy/${dockerfile}" -t "${tag}" "$@" .
+# 构建成功后的收尾：报告体积、可选推送、可选清 build cache。
+finish_image() {
+  local tag="$1"
   echo "=== [$(date '+%H:%M:%S')] built ${tag} $(docker image inspect "${tag}" --format '{{.Size}}' | awk '{printf "%.1fMB", $1/1024/1024}')"
 
   if [[ "${PUSH}" == "1" ]]; then
@@ -99,11 +94,61 @@ build_one() {
   fi
 }
 
+build_one() {
+  local name="$1" dockerfile="$2"
+  shift 2
+  local n tag
+  n="$(next_n "${name}")"
+  tag="${name}:${VER}-bili.${n}"
+  echo "=== [$(date '+%H:%M:%S')] building ${tag} (dockerfile=deploy/${dockerfile})"
+  docker build -f "deploy/${dockerfile}" -t "${tag}" "$@" .
+  finish_image "${tag}"
+}
+
+# manager 迭代快速路径。
+#
+# 全量构建 manager 要在 build 阶段重新编译整个 workspace（60-90 分钟），因为
+# crates/ 一变，cargo target 所在的层就失效。迭代期间用已经构建好的 manager
+# 镜像当底座、只替换二进制（deploy/Dockerfile.manager.overlay），秒级出镜像：
+#
+#   docker cp bili-cargo-builder:/target/release/pipeline-manager /tmp/pm
+#   BILI_MANAGER_BINARY=/tmp/pm deploy/build-images.sh
+#
+# 发布镜像必须走 Dockerfile.manager 全量构建；本路径只用于本地验证循环。
+build_manager() {
+  if [[ -z "${BILI_MANAGER_BINARY:-}" ]]; then
+    build_one feldera-manager Dockerfile.manager \
+      --build-arg BILI_CARGO_JOBS="${BILI_CARGO_JOBS:-4}"
+    return
+  fi
+
+  local base_n base_image n tag
+  # 取本地最新的 feldera-manager:<ver>-bili.N 作为 overlay 底座
+  base_n="$(for i in $(seq 1 99); do
+    docker image inspect "feldera-manager:${VER}-bili.${i}" >/dev/null 2>&1 && echo "${i}"
+  done | tail -1)"
+  if [[ -z "${base_n}" ]]; then
+    echo "ERROR: BILI_MANAGER_BINARY 需要已存在的 feldera-manager:${VER}-bili.N 作为底座；先跑一次全量构建" >&2
+    return 1
+  fi
+  base_image="feldera-manager:${VER}-bili.${base_n}"
+
+  mkdir -p deploy/.build
+  install -m 0755 "${BILI_MANAGER_BINARY}" deploy/.build/pipeline-manager
+
+  n="$(next_n feldera-manager)"
+  tag="feldera-manager:${VER}-bili.${n}"
+  echo "=== [$(date '+%H:%M:%S')] building ${tag} (overlay on ${base_image})"
+  docker build -f deploy/Dockerfile.manager.overlay \
+    --build-arg BASE_IMAGE="${base_image}" -t "${tag}" .
+  finish_image "${tag}"
+}
+
 # 注意：不得用 `docker build --target=<stage>` 做 "warmup 预烤"——本机 Docker 4.x
 # buildkit 对含 RUN bun 大层（webconsole）的 target 构建 export 会死锁（132s 后
 # CPU 0% 永久挂，见 MEMORY 教训）。buildkit 缓存本就按层留存：同一 Dockerfile
 # 的中间层随全量构建缓存，不必预烤。
-build_one feldera-manager Dockerfile.manager --build-arg BILI_CARGO_JOBS="${BILI_CARGO_JOBS:-4}"
+build_manager
 build_one feldera-compiler Dockerfile.compiler
 build_one feldera-runner Dockerfile.runner
 

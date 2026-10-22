@@ -1,0 +1,30 @@
+# Fast iteration overlay for the manager image.
+#
+# `deploy/Dockerfile.manager` compiles the manager from source, which takes
+# 60-90 minutes on an arm64 laptop because the cargo target directory lives in
+# the build stage and is lost whenever `crates/` changes. While iterating on
+# manager code (P1-009 onwards) that cost dominates the edit/verify loop.
+#
+# This overlay rebuilds the image in seconds: it starts from an already-built
+# manager image and replaces only the binary. The binary must be produced for
+# linux/<arch> with the same feature set as the release build:
+#
+#   cargo build --release --locked -p pipeline-manager --features feldera-enterprise
+#
+# Usage (from the repository root, after copying the binary to deploy/.build/):
+#
+#   docker build -f deploy/Dockerfile.manager.overlay \
+#     --build-arg BASE_IMAGE=localhost:5001/feldera-manager:<ver> \
+#     -t localhost:5001/feldera-manager:<ver>-bili.N .
+#
+# Release images are always built from `deploy/Dockerfile.manager`; this file
+# only exists to keep local verification loops short.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY --chown=ubuntu deploy/.build/pipeline-manager /home/ubuntu/feldera/build/pipeline-manager
+
+# The image's ENTRYPOINT launches the binary from this path; keep the release
+# stage's executable bit explicit because COPY preserves the source mode, and a
+# binary copied from a non-executable location would break the container.
+RUN chmod +x /home/ubuntu/feldera/build/pipeline-manager

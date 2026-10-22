@@ -1,0 +1,52 @@
+{{- if .Values.kubernetesRunner.enabled }}
+{{- /*
+  Least-privilege RBAC for the Kubernetes pipeline runner.
+
+  The manager does not need a cluster-wide role: every pipeline object lives in
+  the release namespace, so a namespaced Role grants exactly the verbs the
+  runner uses:
+
+    * pods            — read the pipeline pod's phase/conditions/container states
+    * statefulsets    — create the pipeline, scale it to zero, delete it
+    * services        — create the headless Service and delete it
+    * secrets         — create the pipeline's config.yaml secret and delete it
+    * persistentvolumeclaims — create/read the storage claim and delete it
+
+  `namespaces get` is needed by `can_provision`, which reports a missing
+  namespace as a configuration error instead of a provisioning timeout.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "controlplane.fullname" . }}-runner
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "controlplane.fullname" . }}-runner
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "controlplane.fullname" . }}-runner
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "controlplane.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
