@@ -20,9 +20,17 @@
 #   TAG        image tag to deploy; both manager and runner use it (required)
 #   TIMEOUT    seconds to wait for the pipeline to reach Running (default: 2400)
 #
-# The first pipeline of a fresh manager pod compiles the generated Rust program
-# inside that pod, so a cold cargo target directory needs tens of minutes. Later
-# pipelines reuse the directory below and reach Running in a couple of minutes.
+# The pipeline compiles its program inside the manager pod. `dev` is the
+# manager's default profile, but cargo's `dev` profile carries full debug info,
+# which turns the final mold link of a 1 GB binary into a 25 minute, 8.8 GB
+# resident step. `unoptimized` (defined by the generated workspace as release
+# with `opt-level = 0` and no debug info) keeps the product on the manager's
+# default while making this test cheap: the link stays a few minutes at most.
+#
+# With REUSE=1 (the default) the pipeline is created once and started again on
+# every later run. A stopped pipeline keeps its program, so the next run skips
+# compilation entirely and reaches Running in seconds. Set REUSE=0 to exercise
+# the create-then-delete path and assert that no Kubernetes resources leak.
 set -euo pipefail
 
 CLUSTER="${CLUSTER:-bili-p1005}"
@@ -32,11 +40,15 @@ TAG="${TAG:?TAG must be set, for example v0.357.0-20-g7a5128651-bili.2}"
 TIMEOUT="${TIMEOUT:-2400}"
 # The compile profile decides how long the pipeline takes to build inside the
 # manager pod. A cold `optimized` build of dbsp plus the generated program takes
-# roughly two hours on a 10-core machine, whereas `dev` takes well under an hour.
-# The end-to-end test verifies the Kubernetes runner, not the optimizer, so it
-# defaults to the cheap profile; set PROFILE=optimized to exercise the default.
-PROFILE="${PROFILE:-dev}"
-PIPELINE="e2e-k8s-$$"
+# roughly two hours on a 10-core machine, and `dev` spends most of its time
+# linking a binary with full debug info. The end-to-end test verifies the
+# Kubernetes runner, not the optimizer, so it defaults to `unoptimized`; set
+# PROFILE=optimized to exercise the default product profile.
+PROFILE="${PROFILE:-unoptimized}"
+# Reusing the pipeline makes repeat runs cheap: no compilation at all, and the
+# pod only has to be scaled up from zero.
+REUSE="${REUSE:-1}"
+PIPELINE="${PIPELINE:-e2e-k8s-${PROFILE}}"
 PORT="${PORT:-18080}"
 # A cold compile of the generated Rust program takes hours inside the control
 # plane pod, so the claim is on by default here: a re-run then compiles in
@@ -62,8 +74,14 @@ kind get clusters | grep -qx "${CLUSTER}" || {
 }
 
 say "loading images ${TAG} into ${CLUSTER}"
-for image in feldera-manager feldera-runner; do
-  ref="localhost:5001/${image}:${TAG}"
+# 三张 feldera 镜像 + postgres：kind 没有 registry，节点只能看见 `kind load`
+# 送进去的镜像；漏一张就是 ImagePullBackOff（编译器漏了 pod 起不来，db 漏了
+# 整条链起不来）。
+for ref in \
+  "localhost:5001/feldera-manager:${TAG}" \
+  "localhost:5001/feldera-runner:${TAG}" \
+  "localhost:5001/feldera-compiler:${TAG}" \
+  "postgres:17-alpine"; do
   docker image inspect "${ref}" >/dev/null 2>&1 || {
     echo "error: ${ref} is not available locally" >&2
     exit 1
@@ -76,6 +94,7 @@ helm upgrade --install "${RELEASE}" charts/feldera \
   --namespace "${NAMESPACE}" --create-namespace \
   --set "controlplane.image.tag=${TAG}" \
   --set "controlplane.kubernetesRunner.image.tag=${TAG}" \
+  --set "compiler.image.tag=${TAG}" \
   --set controlplane.controlPlane.deploymentTimeAnnotation=false \
   --set controlplane.compilationCache.enabled=true \
   --set "controlplane.compilationCache.size=${COMPILATION_CACHE_SIZE:-80Gi}" \
@@ -131,21 +150,79 @@ api_call() {
   curl --silent --fail --max-time 10 -X "${method}" "${api}${path}" "$@"
 }
 
-say "creating and starting pipeline ${PIPELINE}"
-api_call DELETE "/v0/pipelines/${PIPELINE}" >/dev/null 2>&1 || true
-api_call POST "/v0/pipelines" \
-  -H 'content-type: application/json' \
-  --data @- <<JSON >/dev/null
+t0=$(date +%s)
+elapsed() { echo "$(( $(date +%s) - t0 ))s"; }
+
+# `delete_pipeline` walks the states the API requires, and each step only
+# accepts one state: stop until the deployment reports Stopped, clear until the
+# storage is released, then delete. Every step is asynchronous, so the loop
+# retries instead of sleeping a fixed amount and hoping.
+deployment_status() {
+  api_call GET "/v0/pipelines/${PIPELINE}" 2>/dev/null \
+    | sed -n 's/.*"deployment_status":"\([^"]*\)".*/\1/p' || true
+}
+
+delete_pipeline() {
+  api_call POST "/v0/pipelines/${PIPELINE}/stop?force=true" >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    status="$(deployment_status)"
+    [ -z "${status}" ] && return 0
+    [ "${status}" = "Stopped" ] && break
+    sleep 2
+  done
+  for _ in $(seq 1 30); do
+    api_call POST "/v0/pipelines/${PIPELINE}/clear" >/dev/null 2>&1 || true
+    sleep 3
+    if api_call DELETE "/v0/pipelines/${PIPELINE}" >/dev/null 2>&1; then
+      return 0
+    fi
+    [ -z "$(deployment_status)" ] && return 0
+  done
+  echo "error: could not delete pipeline ${PIPELINE} (status $(deployment_status))" >&2
+  return 1
+}
+
+say "pipeline ${PIPELINE} (profile=${PROFILE} reuse=${REUSE})"
+existing="$(api_call GET "/v0/pipelines/${PIPELINE}" 2>/dev/null || true)"
+if [ -n "${existing}" ] && [ "${REUSE}" = "1" ]; then
+  status="$(printf '%s' "${existing}" \
+    | sed -n 's/.*"deployment_status":"\([^"]*\)".*/\1/p')"
+  echo "--- reusing the existing pipeline (deployment_status=${status:-unknown})"
+  case "${status}" in
+    Running) ;;
+    Shutdown|Stopped|Cleared) api_call POST "/v0/pipelines/${PIPELINE}/start" >/dev/null ;;
+    *)
+      delete_pipeline
+      echo "--- the old pipeline was ${status:-unknown}; created a new one below"
+      ;;
+  esac
+fi
+
+if [ -n "${existing}" ]; then
+  # REUSE=0 的语义是「跑一遍干净的」：上一轮留下的 pipeline 必须删掉，否则脚本
+  # 会走 /start 复用它的状态（数据、程序、存储目录），断言值就不再是 3。
+  echo "--- deleting the previous pipeline ${PIPELINE} (reuse=0)"
+  delete_pipeline
+  sleep 2
+fi
+
+if [ -z "$(api_call GET "/v0/pipelines/${PIPELINE}" 2>/dev/null || true)" ]; then
+  echo "--- creating pipeline ${PIPELINE}"
+  api_call POST "/v0/pipelines" \
+    -H 'content-type: application/json' \
+    --data @- <<JSON >/dev/null
 {
   "name": "${PIPELINE}",
-  "program_code": "CREATE TABLE t (i INT);\nCREATE VIEW v AS SELECT COUNT(*) AS c FROM t;",
+  "program_code": "CREATE TABLE t (i INT);\nCREATE MATERIALIZED VIEW v AS SELECT COUNT(*) AS c FROM t;",
   "program_config": {"profile": "${PROFILE}"},
   "runtime_config": {
     "resources": {"cpu_cores_min": 0, "memory_mb_min": 256, "memory_mb_max": 1024}
   }
 }
 JSON
-api_call POST "/v0/pipelines/${PIPELINE}/start" >/dev/null
+  api_call POST "/v0/pipelines/${PIPELINE}/start" >/dev/null
+  echo "--- created and started in $(elapsed)"
+fi
 
 say "waiting up to ${TIMEOUT}s for the pipeline to report Running"
 deadline=$(( $(date +%s) + TIMEOUT ))
@@ -153,10 +230,12 @@ status=""
 while :; do
   status="$(api_call GET "/v0/pipelines/${PIPELINE}" 2>/dev/null \
     | sed -n 's/.*"deployment_status":"\([^"]*\)".*/\1/p' || true)"
-  printf '  deployment_status=%s\n' "${status:-unknown}"
+  printf '  [%s] deployment_status=%s\n' "$(elapsed)" "${status:-unknown}"
   case "${status}" in
     Running) break ;;
-    Failed|Shutdown|Cleared|Stopping)
+    Failed)
+      # Shutdown and Stopping are transient right after /start, so only a
+      # failure ends the wait; everything else falls through to the timeout.
       echo "error: the deployment reached ${status}" >&2
       kubectl get pods --namespace "${NAMESPACE}" -l "app.kubernetes.io/name=feldera-pipeline" -o wide >&2 || true
       exit 1
@@ -184,15 +263,32 @@ kubectl logs --namespace "${NAMESPACE}" "pipeline-${pipeline_id}-0" --tail 10 ||
 
 say "ingesting into and querying the running pipeline"
 PF_PORT="${PF_PORT:-18082}"
+if lsof -nP -iTCP:"${PF_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "port ${PF_PORT} is busy; refusing to tunnel through an unknown forwarder" >&2
+  lsof -nP -iTCP:"${PF_PORT}" -sTCP:LISTEN >&2 || true
+  exit 1
+fi
 kubectl port-forward --namespace "${NAMESPACE}" "pod/pipeline-${pipeline_id}-0" \
   "${PF_PORT}:8080" >/dev/null 2>&1 &
 pf_pid=$!
 trap 'kill "${pf_pid}" 2>/dev/null || true' EXIT
 sleep 3
-curl --silent --fail -X POST "http://127.0.0.1:${PF_PORT}/ingress/t" \
-  -H 'content-type: application/json' --data '[{"i":1},{"i":2},{"i":2}]' >/dev/null
-rows="$(curl --silent --fail "http://127.0.0.1:${PF_PORT}/query" \
-  --get --data-urlencode 'sql=SELECT c FROM v')"
+# The ingress endpoint defaults to CSV, and with format=json the default update
+# format is "raw", which wants a bare JSON *string* per line. The insert/delete
+# envelope is what the docs use, so ask for it explicitly.
+ingest_status="$(curl --silent --output /tmp/e2e-ingest-body -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PF_PORT}/ingress/t?format=json&update_format=insert_delete" \
+  -H 'content-type: application/json' \
+  --data '{"insert":{"i":1}}
+{"insert":{"i":2}}
+{"insert":{"i":2}}')"
+[ "${ingest_status}" = "200" ] || {
+  echo "error: ingest returned ${ingest_status}: $(cat /tmp/e2e-ingest-body)" >&2
+  exit 1
+}
+query_url="http://127.0.0.1:${PF_PORT}/query"
+rows="$(curl --silent --fail --get "${query_url}" --data-urlencode 'sql=SELECT c FROM v' \
+  --data-urlencode 'format=json')"
 printf '  query result: %s\n' "${rows}"
 kill "${pf_pid}" 2>/dev/null || true
 trap - EXIT
@@ -201,10 +297,17 @@ echo "${rows}" | grep -q '"c":3' || {
   exit 1
 }
 
+if [ "${REUSE}" = "1" ]; then
+  say "keeping pipeline ${PIPELINE} for the next run (REUSE=1; set REUSE=0 to delete it)"
+  # Stop it so the pod goes away, but keep the program so the next run skips
+  # compilation and only has to scale the StatefulSet back up.
+  api_call POST "/v0/pipelines/${PIPELINE}/shutdown" >/dev/null 2>&1 || true
+  say "PASS: pipeline ${PIPELINE} reached Running and served a query in $(elapsed)"
+  exit 0
+fi
+
 say "cleaning up pipeline ${PIPELINE}"
-api_call POST "/v0/pipelines/${PIPELINE}/shutdown" >/dev/null 2>&1 || true
-sleep 3
-api_call DELETE "/v0/pipelines/${PIPELINE}" >/dev/null 2>&1 || true
+delete_pipeline
 
 sleep 5
 orphans="$(kubectl get statefulset,service,persistentvolumeclaim --namespace "${NAMESPACE}" \
@@ -214,4 +317,4 @@ orphans="$(kubectl get statefulset,service,persistentvolumeclaim --namespace "${
   exit 1
 }
 
-say "PASS: pipeline ${PIPELINE} reached Running, served a query and was cleaned up"
+say "PASS: pipeline ${PIPELINE} reached Running, served a query and was cleaned up in $(elapsed)"

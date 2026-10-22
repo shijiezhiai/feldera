@@ -98,10 +98,50 @@ trap 'rm -rf "$work"' EXIT
 
 # Fetches `commit` from `url` into `dest` and fails closed on any mismatch,
 # so nothing from an upstream tree runs unless it is exactly the pinned OID.
+#
+# SOURCE_MIRROR is for build hosts where GitHub's git protocol stalls mid
+# transfer (common behind restrictive networks): it turns
+#   https://github.com/<owner>/<repo>.git
+# into
+#   <SOURCE_MIRROR>/<owner>/<repo>/archive/<commit>.tar.gz
+# and extracts that archive instead. The archive is content addressed by the
+# requested commit, so the tree is still the pinned one; the OID check on
+# FETCH_HEAD is replaced by a check that the archive's top directory names the
+# same commit.
 fetch_pinned() {
     url="$1"
     commit="$2"
     dest="$3"
+    if [ -n "${SOURCE_MIRROR:-}" ]; then
+        case "$url" in
+            https://github.com/*)
+                repo="${url#https://github.com/}"
+                repo="${repo%.git}"
+                ;;
+            *)
+                echo "error: SOURCE_MIRROR supports github.com URLs only, got $url." >&2
+                exit 1
+                ;;
+        esac
+        archive_url="${SOURCE_MIRROR%/}/${repo}/archive/${commit}.tar.gz"
+        tarball="$work/fetch.tar.gz"
+        echo "fetching $archive_url"
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 20 --max-time 900 "$archive_url" -o "$tarball"
+        # `tar | head` would SIGPIPE the tar (the script runs with pipefail).
+        tar -tzf "$tarball" >"$work/tarball.list"
+        topdir=$(sed -n '1p' "$work/tarball.list")
+        case "$topdir" in
+            *"${commit}"/*) ;;
+            *)
+                echo "error: $archive_url holds $topdir, expected a tree at $commit." >&2
+                exit 1
+                ;;
+        esac
+        mkdir -p "$dest"
+        tar -xzf "$tarball" -C "$dest" --strip-components=1
+        return 0
+    fi
     git init -q "$dest"
     git -C "$dest" fetch -q --depth 1 "$url" "$commit"
     git -C "$dest" checkout -q --detach FETCH_HEAD

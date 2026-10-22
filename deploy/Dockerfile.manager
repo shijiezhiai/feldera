@@ -23,12 +23,25 @@
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS librdkafka
 ENV DEBIAN_FRONTEND=noninteractive
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 RUN apt-get update --fix-missing && apt-get install -y \
-  git cmake build-essential pkg-config golang-go \
+  git cmake build-essential pkg-config golang-go curl \
   libsasl2-dev zlib1g-dev libzstd-dev
 COPY scripts/install-librdkafka.sh /tmp/install-librdkafka.sh
 COPY Cargo.lock /tmp/Cargo.lock
-RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
+# GITHUB_MIRROR 非空时，脚本改用 <mirror>/<owner>/<repo>/archive/<sha>.tar.gz
+# 取源码（见 install-librdkafka.sh 的 SOURCE_MIRROR）：部分网络下 GitHub 的
+# git 协议会在几 MB 处停滞，而普通 HTTPS 下载正常。默认空=不影响上游构建。
+ARG GITHUB_MIRROR=
+RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local SOURCE_MIRROR="${GITHUB_MIRROR}" \
+    bash /tmp/install-librdkafka.sh
 
 # ---------------------------------------------------------------------------
 # Stage 2: web console (SvelteKit via bun).
@@ -38,6 +51,14 @@ RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS webconsole
 ENV DEBIAN_FRONTEND=noninteractive
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 RUN apt-get update --fix-missing && apt-get install -y curl ca-certificates unzip \
   && rm -rf /var/lib/apt/lists/*
 # bun 二进制走 npmmirror（GitHub release 资产本网 ~17s/MB，实测全量 23MB 需
@@ -85,9 +106,24 @@ COPY webconsole-dist/ /webconsole-build/
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS sql-compiler-jar
 ENV DEBIAN_FRONTEND=noninteractive
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 RUN apt-get update --fix-missing && apt-get install -y \
   openjdk-21-jdk-headless maven git python3 curl \
   && rm -rf /var/lib/apt/lists/*
+# GITHUB_MIRROR 非空时把 https://github.com/ 的 clone 改写到镜像前缀（build.sh
+# 会 clone apache/calcite）。部分网络上 GitHub 的 git 协议不可用。
+ARG GITHUB_MIRROR=
+RUN if [ -n "${GITHUB_MIRROR}" ]; then \
+      git config --system url."${GITHUB_MIRROR}/".insteadOf https://github.com/; \
+    fi
+
 # 父 pom 的 reactor 需要读 slt/simulator 的 pom 文件，故整目录拷贝
 # （**/target 已被根 .dockerignore 排除）。
 COPY sql-to-dbsp-compiler/ /src/sql-to-dbsp-compiler/
@@ -134,10 +170,22 @@ RUN env GRADLE_OPTS="-Dorg.gradle.daemon=false -Xmx2g -Dorg.gradle.workers.max=4
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 RUN apt-get update --fix-missing && apt-get install -y \
   pkg-config libsasl2-dev zlib1g-dev libzstd-dev build-essential \
   curl git ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+ARG GITHUB_MIRROR=
+RUN if [ -n "${GITHUB_MIRROR}" ]; then \
+      git config --system url."${GITHUB_MIRROR}/".insteadOf https://github.com/; \
+    fi
 # librdkafka：构建期 rdkafka-sys 需要 pkg-config 探测
 COPY --from=librdkafka /usr/local/lib/librdkafka* /usr/local/lib/
 COPY --from=librdkafka /usr/local/include/librdkafka /usr/local/include/librdkafka
@@ -195,6 +243,13 @@ COPY --chown=ubuntu sql-to-dbsp-compiler/lib sql-to-dbsp-compiler/lib
 COPY --from=webconsole --chown=ubuntu /webconsole-build/ webconsole-build/
 ENV WEBCONSOLE_BUILD_DIR=/home/ubuntu/feldera/webconsole-build
 
+# cargo 的 libgit2 走代理时会长时间卡在 "Updating git repository"（实测
+# 30 分钟无进展、0% CPU）。改由 git CLI 执行 fetch：CLI 认 url.insteadOf，
+# 且失败能重试。
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_NET_RETRY=10
+ENV CARGO_HTTP_TIMEOUT=120
+
 ARG BILI_CARGO_JOBS="4"
 RUN mkdir -p /home/ubuntu/.cargo-target && chown -R ubuntu:ubuntu /home/ubuntu/.cargo-target
 
@@ -203,7 +258,7 @@ RUN mkdir -p /home/ubuntu/.cargo-target && chown -R ubuntu:ubuntu /home/ubuntu/.
 # cache 无效），USER ubuntu 写不进 → Permission denied(os error 13, full16/17 实测)。
 # 弃用 cache mount：target 落镜像层（每轮全损, 但依赖已在 rsproxy cache 下载过,
 # 编译 60-90min 可接受）。RUN 前一步以 root 预建目录 + chown ubuntu。
-RUN CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=${BILI_CARGO_JOBS} \
+RUN POSTGRESQL_VERSION="=15.13.0" CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=${BILI_CARGO_JOBS} \
   CARGO_TARGET_DIR=/home/ubuntu/.cargo-target \
   cargo build --release --locked -p pipeline-manager --features feldera-enterprise \
   && cp /home/ubuntu/.cargo-target/release/pipeline-manager /home/ubuntu/pipeline-manager
@@ -215,6 +270,14 @@ RUN CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=${BILI_CARGO_JOBS} \
 FROM ubuntu:24.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive
 
+# APT_MIRROR 非空时把 ubuntu 官方源换成本地镜像（部分网络访问 archive.ubuntu.com
+# 极慢或间歇失败）。默认空=保持官方源，不影响上游构建。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}/ubuntu|g" \
+             /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 RUN apt update --fix-missing && apt -y dist-upgrade && apt install \
   pkg-config \
   libsasl2-dev zlib1g-dev libzstd-dev build-essential \
@@ -300,10 +363,33 @@ registry = "sparse+https://rsproxy.cn/index/"
 [net]
 retry = 5
 git-fetch-with-cli = true
+# in-process 编译在 Pod 里跑，Pod 出网只有镜像仓库/apt 这类白名单通道，github 的
+# git 协议在这里会 SSL 失败（"SSL error: class=Ssl (16)"）。镜像里已经带着下面
+# 从 builder 阶段拷来的完整 registry + git 缓存，因此直接离线：
+# 缺少任何 crate 都会立刻报错，而不是在 30s 超时后重试到编译失败。
+offline = true
 
 [env]
 POSTGRESQL_VERSION = "=15.13.0"
 EOF
+
+# 把 builder 阶段 warm 出来的依赖缓存搬进运行时镜像（约 1.5GB）：
+#   registry/  已下载的 .crate 与解包源码（sparse index 缓存）
+#   git/       lock 里 5 个 git 依赖的 bare 仓库（delta-rs/etl/iceberg-rust/…）
+# 这样 Pod 里的 pipeline 编译与 Docker 构建用同一份依赖，不需要出网。
+COPY --from=builder --chown=ubuntu /home/ubuntu/.cargo/registry /home/ubuntu/.cargo/registry
+COPY --from=builder --chown=ubuntu /home/ubuntu/.cargo/git /home/ubuntu/.cargo/git
+
+# in-process 编译 pipeline 时 cargo 还要 fetch lock 里的 git 依赖
+# （feldera/delta-rs、feldera/etl、feldera/iceberg-rust、ryzhyk/serde_arrow、
+# supabase/rust-postgres）。本网络直连 github 会 "SSL error"/"transfer too slow"
+# 直到编译失败，因此在镜像里把 github 整体改写到 release 代理；与 builder 阶段
+# 同一套 insteadOf 语义（base 必须以 / 结尾，否则 URL 被二次改写）。
+# GITHUB_MIRROR 为空或等于 https://github.com 时不写任何配置。
+ARG GITHUB_MIRROR=https://github.com
+RUN if [ -n "${GITHUB_MIRROR}" ] && [ "${GITHUB_MIRROR}" != "https://github.com" ]; then \
+      git config --global url."${GITHUB_MIRROR}/".insteadOf https://github.com/; \
+    fi
 
 # --
 # bili 差别：二进制与 jar 来自镜像内构建阶段（上游来自 CI 宿主 build/ 目录）。
@@ -312,8 +398,13 @@ EOF
 COPY --from=builder --chown=ubuntu /home/ubuntu/pipeline-manager feldera/build/pipeline-manager
 COPY --from=sql-compiler-jar --chown=ubuntu /sql2dbsp-jar-with-dependencies.jar feldera/build/sql2dbsp-jar-with-dependencies.jar
 
-# Install Samply for profiling（本网络对 github 间歇不稳，与 mold 同款重试参数）
-RUN curl --proto '=https' --tlsv1.2 --retry 4 --retry-all-errors --connect-timeout 20 -LsSf https://github.com/feldera/samply/releases/download/v0.13.2/samply-installer.sh | sh
+# Install Samply for profiling（本网络对 github 间歇不稳，与 mold 同款重试参数）。
+# samply 只用于性能剖析，缺了不影响 manager 与 pipeline 运行，因此安装失败只告警，
+# 不让整张镜像报废（安装脚本内部还会直连 github 下载二进制）。
+ARG GITHUB_MIRROR=https://github.com
+RUN curl --proto '=https' --tlsv1.2 --retry 4 --retry-all-errors --connect-timeout 20 -LsSf \
+      ${GITHUB_MIRROR}/feldera/samply/releases/download/v0.13.2/samply-installer.sh | sh \
+ || echo "warning: samply not installed (network); profiling support is optional"
 
 ENV BANNER_ADDR=localhost
 ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]

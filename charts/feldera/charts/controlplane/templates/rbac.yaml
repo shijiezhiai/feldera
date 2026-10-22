@@ -12,8 +12,10 @@
     * secrets         — create the pipeline's config.yaml secret and delete it
     * persistentvolumeclaims — create/read the storage claim and delete it
 
-  `namespaces get` is needed by `can_provision`, which reports a missing
-  namespace as a configuration error instead of a provisioning timeout.
+  No cluster-scoped access is granted. `can_provision` checks the namespace by
+  sending a dry-run Secret create into it, which the API server answers with
+  404 when the namespace is missing — reading the Namespace object itself would
+  need a ClusterRole.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -22,9 +24,6 @@ metadata:
   labels:
     {{- include "controlplane.labels" . | nindent 4 }}
 rules:
-  - apiGroups: [""]
-    resources: ["namespaces"]
-    verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]

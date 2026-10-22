@@ -85,12 +85,20 @@ a pod that gave up) to an error, and otherwise reports the pod phase.
 
 `charts/feldera/charts/controlplane/templates/rbac.yaml` creates a namespaced
 `Role` plus a `RoleBinding` to the control plane's service account. It grants
-only what the runner calls: `namespaces get` (for `can_provision`), `pods
-get/list/watch`, and `statefulsets`, `services`, `secrets`,
-`persistentvolumeclaims` `create/get/list/watch/patch/delete`. There is no
-cluster-scoped role; `--kubernetes-runner-per-pipeline-namespace` needs
-namespace creation, which the ADR lists as out of scope for P1-009 and which is
-why the flag is off by default.
+only what the runner calls: `pods get/list/watch`, and `statefulsets`,
+`services`, `secrets`, `persistentvolumeclaims`
+`create/get/list/watch/patch/delete`. There is no cluster-scoped role, so the
+`Role` cannot read `Namespace` objects at all;
+`--kubernetes-runner-per-pipeline-namespace` would need namespace creation,
+which the ADR lists as out of scope for P1-009 and which is why the flag is off
+by default.
+
+`can_provision` therefore probes the namespace with a server-side dry run:
+`POST /api/v1/namespaces/<ns>/secrets?dryRun=All` for a marker secret named
+`feldera-runner-connectivity-probe`. A `403` proves the credential works but the
+`Role` is missing an expected verb, and a `404` proves the namespace is absent;
+both are reported as configuration errors before any object is created, and a
+successful dry run creates nothing.
 
 ## Testing
 
@@ -107,11 +115,49 @@ back from the ad-hoc query endpoint. It needs a local registry on
 `localhost:5001` (`deploy/build-images.sh` fills it) and a kind cluster named by
 `CLUSTER` (default `bili-p1005`).
 
-Timing, measured on the development machine (10 vCPU, kind 1.33.1): the first
-pipeline of a fresh manager pod spends tens of minutes compiling the generated
-Rust program inside that pod, because the pod starts with an empty cargo target
-directory. Enable `controlplane.compilationCache` on a cluster with a default
-StorageClass to keep that directory across pod recreations.
+Timing, measured on two machines. Both runs use `PROFILE=unoptimized`; the
+`optimized` profile is 3-5x the compile time and is not needed for smoke tests.
+
+Development machine (10 vCPU, kind 1.33.1):
+
+- The generated Rust program is compiled **inside the manager pod**. With an
+  empty cargo target directory this is the dominant cost: 2h15m for the
+  `optimized` profile, and the `dev` profile spent 13 minutes in the final
+  `mold` link alone.
+- Enable `controlplane.compilationCache` on a cluster with a default
+  StorageClass; the cache directory then lives on a PVC instead of the pod's
+  writable layer. Recreating the pod with that cache turned a resumed compile
+  into 1004.89 s (16.7 min) and reusing the artifacts for a *new* pipeline id
+  into a single relink of the generated crate.
+- Artifacts are keyed by pipeline id, so every new pipeline pays that relink
+  even when the SQL is identical.
+
+Build host (48 vCPU, single-node kind 1.33.1, images built on the same host):
+
+- First start, empty compilation cache: SQL 2.52 s, Rust **331.23 s** (5.5 min)
+  for a two-line program. The dependency sources are already in the image (see
+  below), so this is compile time, not download time.
+- Second start of the same program (warm PVC): Rust **17.13 s** — cargo only
+  re-links the generated crate.
+- Provisioning: the four objects are applied in under a second, the pod reports
+  `Running` 7 s later (1 GB binary download included).
+- `scripts/e2e-k8s-runner.sh` end to end (`REUSE=0`, warm cache): **58 s** for
+  load images, install, create, start, wait for `Running`, ingest, query,
+  shutdown, clear, delete and the orphan check.
+
+Two consequences for a self-hosted deployment:
+
+- The manager image carries the cargo registry and git checkouts that the
+  generated program needs (`COPY --from=builder .../.cargo/registry` and
+  `.../.cargo/git`) and its cargo config sets `offline = true`. A pod cannot
+  reach github.com in most clusters, and without the baked cache every
+  compilation ends in `SSL error: class=Ssl (16)` or `transfer too slow`. This
+  costs about 1.9 GB of image size; drop it once P1-018 moves compilation to a
+  compiler service that has its own cache volume.
+- `scripts/e2e-k8s-runner.sh` takes `PROFILE` (`unoptimized` by default) and
+  `REUSE` (`1` keeps the pipeline between runs, `0` deletes it and asserts the
+  objects are gone). It also walks the API state machine that deletion needs:
+  `stop?force=true`, wait for `Stopped`, `clear`, wait, then `DELETE`.
 
 ## Building and iterating on images
 
@@ -144,6 +190,12 @@ Note that a manager pod's writable layer is discarded when its container
 restarts: anything written outside a mounted volume (including a swapped
 binary) is gone. Only `emptyDir` and PVC contents survive, which is why the
 compilation cache is the one thing worth mounting.
+
+A file copied into an image keeps the mode it had in the build context, so
+`COPY deploy/pipeline-entrypoint.sh` faithfully reproduced a `rw-------` file and
+the pod failed with `cannot open /usr/local/bin/pipeline-entrypoint: Permission
+denied`. The `Dockerfile.runner` copy now pins `--chmod=0755` so the image no
+longer depends on the checkout's permissions.
 
 ## Operational notes
 
