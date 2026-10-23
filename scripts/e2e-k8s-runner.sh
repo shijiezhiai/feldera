@@ -89,6 +89,11 @@ for ref in \
   kind load docker-image --name "${CLUSTER}" "${ref}"
 done
 
+# macOS appends an AppleDouble `._name` beside every file it copies, and Helm
+# parses those as YAML: `error converting YAML to JSON: control characters are
+# not allowed`. They are only ever noise here, so drop them before rendering.
+find charts -name '._*' -delete 2>/dev/null || true
+
 say "installing release ${RELEASE} in namespace ${NAMESPACE}"
 helm upgrade --install "${RELEASE}" charts/feldera \
   --namespace "${NAMESPACE}" --create-namespace \

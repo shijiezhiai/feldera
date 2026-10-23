@@ -1639,9 +1639,16 @@ impl LocalRunnerConfig {
     }
 }
 
+/// Default key of the StatefulSet template inside the template ConfigMap.
+///
+/// Matches the key the pipeline template documentation uses.
+fn default_kubernetes_runner_template_key() -> String {
+    "pipelineTemplate".to_string()
+}
+
 /// Default Kubernetes namespace in which the Kubernetes runner creates
 /// pipeline resources.
-pub fn default_kubernetes_runner_namespace() -> String {
+fn default_kubernetes_runner_namespace() -> String {
     "feldera".to_string()
 }
 
@@ -1701,6 +1708,34 @@ pub struct KubernetesRunnerConfig {
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_MANAGER_NAMESPACE")]
     pub kubernetes_runner_manager_namespace: Option<String>,
 
+    /// ConfigMap that holds a custom StatefulSet template for pipeline pods.
+    ///
+    /// When unset, the runner renders the built-in StatefulSet. When set, the
+    /// runner reads `--kubernetes-runner-template-key` from the ConfigMap,
+    /// substitutes the placeholders documented for pipeline templates, parses
+    /// the result as a StatefulSet and creates that instead. The default
+    /// template in the chart's ConfigMap is the reference to start from.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_TEMPLATE_CONFIGMAP")]
+    pub kubernetes_runner_template_configmap: Option<String>,
+
+    /// Key of the StatefulSet template inside the template ConfigMap.
+    #[serde(default = "default_kubernetes_runner_template_key")]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_TEMPLATE_KEY",
+        default_value_t = default_kubernetes_runner_template_key()
+    )]
+    pub kubernetes_runner_template_key: String,
+
+    /// Namespace of the template ConfigMap.
+    ///
+    /// Defaults to the namespace of the pipeline being provisioned, which is
+    /// where the chart places the template.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_TEMPLATE_NAMESPACE")]
+    pub kubernetes_runner_template_namespace: Option<String>,
+
     /// Allow user-provided pipeline environment variables whose name starts
     /// with `KUBERNETES_`.
     ///
@@ -1708,6 +1743,73 @@ pub struct KubernetesRunnerConfig {
     #[serde(default)]
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_ALLOW_KUBERNETES_ENV_PREFIX")]
     pub kubernetes_runner_allow_kubernetes_env_prefix: bool,
+
+    /// Smallest pipeline memory the platform provisions, in MB.
+    ///
+    /// A pipeline that asks for less is given this much; it mirrors
+    /// `kubernetesRunner.lowerLimitMemoryMegabyte` in the chart.
+    #[serde(default = "default_kubernetes_runner_lower_memory_mb")]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_LOWER_MEMORY_MB",
+        default_value_t = default_kubernetes_runner_lower_memory_mb()
+    )]
+    pub kubernetes_runner_lower_memory_mb: u64,
+
+    /// Largest pipeline memory the platform provisions, in MB.
+    ///
+    /// A pipeline that asks for more is clamped to this; it mirrors
+    /// `kubernetesRunner.upperLimitMemoryMegabyte` in the chart.
+    #[serde(default = "default_kubernetes_runner_upper_memory_mb")]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_UPPER_MEMORY_MB",
+        default_value_t = default_kubernetes_runner_upper_memory_mb()
+    )]
+    pub kubernetes_runner_upper_memory_mb: u64,
+
+    /// Storage a pipeline gets when it asks for none, in MB.
+    ///
+    /// Mirrors `kubernetesRunner.defaultStorageMegabyte` in the chart.
+    #[serde(default = "default_kubernetes_runner_storage_mb")]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_DEFAULT_STORAGE_MB",
+        default_value_t = default_kubernetes_runner_storage_mb()
+    )]
+    pub kubernetes_runner_default_storage_mb: u64,
+
+    /// Largest storage claim the platform provisions, in MB.
+    ///
+    /// A pipeline that asks for more is clamped to this; it mirrors
+    /// `kubernetesRunner.upperLimitStorageMegabyte` in the chart.
+    #[serde(default = "default_kubernetes_runner_upper_storage_mb")]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_UPPER_STORAGE_MB",
+        default_value_t = default_kubernetes_runner_upper_storage_mb()
+    )]
+    pub kubernetes_runner_upper_storage_mb: u64,
+}
+
+/// Default for `--kubernetes-runner-lower-memory-mb`.
+fn default_kubernetes_runner_lower_memory_mb() -> u64 {
+    100
+}
+
+/// Default for `--kubernetes-runner-upper-memory-mb`.
+fn default_kubernetes_runner_upper_memory_mb() -> u64 {
+    32_000
+}
+
+/// Default for `--kubernetes-runner-default-storage-mb`.
+fn default_kubernetes_runner_storage_mb() -> u64 {
+    30_000
+}
+
+/// Default for `--kubernetes-runner-upper-storage-mb`.
+fn default_kubernetes_runner_upper_storage_mb() -> u64 {
+    128_000
 }
 
 impl KubernetesRunnerConfig {
@@ -1717,6 +1819,20 @@ impl KubernetesRunnerConfig {
             && !kubeconfig.is_empty()
         {
             self.kubernetes_runner_kubeconfig = Some(help_canonicalize_path(kubeconfig)?);
+        }
+        if self.kubernetes_runner_lower_memory_mb > self.kubernetes_runner_upper_memory_mb {
+            anyhow::bail!(
+                "the platform memory range is inverted: --kubernetes-runner-lower-memory-mb={} is above --kubernetes-runner-upper-memory-mb={}",
+                self.kubernetes_runner_lower_memory_mb,
+                self.kubernetes_runner_upper_memory_mb
+            );
+        }
+        if self.kubernetes_runner_default_storage_mb > self.kubernetes_runner_upper_storage_mb {
+            anyhow::bail!(
+                "the default storage is above the platform limit: --kubernetes-runner-default-storage-mb={} is above --kubernetes-runner-upper-storage-mb={}",
+                self.kubernetes_runner_default_storage_mb,
+                self.kubernetes_runner_upper_storage_mb
+            );
         }
         Ok(self)
     }

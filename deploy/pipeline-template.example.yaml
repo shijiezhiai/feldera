@@ -1,0 +1,99 @@
+# Example StatefulSet template for pipeline pods (P1-011).
+#
+# Point the chart at it after creating the ConfigMap:
+#
+#   kubectl -n feldera apply -f deploy/pipeline-template.example.yaml
+#   helm upgrade feldera charts/feldera -n feldera \
+#     --set controlplane.kubernetesRunner.template.configMap=feldera-pipeline-template
+#
+# The manager still owns the object's name, its `serviceName` and the selector
+# labels, because it finds the StatefulSet and the headless Service by them. A
+# template that spells its own is corrected, not rejected.
+#
+# What a template must supply, because the runner cannot inject it into a
+# rendered pod spec:
+#   * the full argument list of the pipeline binary — `--deployment-id` is
+#     required by the CLI, so omitting it makes every pod exit at startup;
+#   * a writable mount at `{pipeline_storage_path}` (the storage claim the
+#     runner creates) when the pipeline has storage enabled;
+#   * the config Secret mounted at /var/feldera/config.
+#
+# The surest starting point is the pod spec of a working pipeline:
+#   kubectl -n feldera get sts pipeline-<uuid> -o yaml
+# and replacing the concrete values with the placeholders below.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feldera-pipeline-template
+  namespace: feldera
+data:
+  pipelineTemplate: |
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: "{id}"
+      namespace: "{namespace}"
+      labels:
+        app.kubernetes.io/name: feldera-pipeline
+        app.kubernetes.io/managed-by: feldera-pipeline-manager
+      annotations:
+        feldera.com/rendered-by: "template"
+        feldera.com/deployment: "{deployment_id}"
+        feldera.com/bootstrap-policy: "{bootstrap_policy}"
+    spec:
+      serviceName: "{id}"
+      replicas: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: feldera-pipeline
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: feldera-pipeline
+            app.kubernetes.io/managed-by: feldera-pipeline-manager
+        spec:
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+          terminationGracePeriodSeconds: 60
+          containers:
+            - name: pipeline
+              image: "{pipeline_executor_image}"
+              command: ["/usr/local/bin/pipeline-entrypoint"]
+              args:
+                - --config-file
+                - /var/feldera/config/config.yaml
+                - --bind-address
+                - 0.0.0.0
+                - --default-port
+                - "8080"
+                - --initial
+                - "{deployment_initial}"
+                - --deployment-id
+                - "{deployment_id}"
+              env:
+                - name: FELDERA_PROGRAM_BINARY_URL
+                  value: "{binary_ref}"
+                - name: FELDERA_WORK_DIR
+                  value: /var/feldera/work
+              ports:
+                - name: http
+                  containerPort: 8080
+              volumeMounts:
+                - name: config
+                  mountPath: /var/feldera/config
+                  readOnly: true
+                - name: work
+                  mountPath: /var/feldera/work
+                - name: storage
+                  mountPath: "{pipeline_storage_path}"
+          volumes:
+            - name: config
+              secret:
+                secretName: "{id}-config"
+            - name: work
+              emptyDir: {}
+            - name: storage
+              persistentVolumeClaim:
+                claimName: "{id}-storage"
