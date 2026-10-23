@@ -18,8 +18,9 @@
 //! signing algorithm verification, expiry (exp) validation, client_id and issuer
 //! (iss) validation, signature verification, and tamper detection. For signature
 //! verification, we fetch the provider's JWK keys from their well-known URL
-//! and cache them locally. We don't yet refresh JWK keys automatically, but
-//! a restart of the pipeline manager will refresh the cache.
+//! and cache them locally. A background task refreshes that cache on an
+//! interval, and a token whose `kid` the cache does not hold triggers a fetch,
+//! so a rotation is picked up without a restart.
 //!
 //! To support bearer token workflows, we require environment variables specific
 //! to each provider. All providers require FELDERA_AUTH_CLIENT_ID and FELDERA_AUTH_ISSUER.
@@ -46,7 +47,7 @@
 //! pipeline manager side, we store a hash of the API key in the database along
 //! with the permissions.
 
-use std::{collections::HashMap, env, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc, time::Duration};
 
 use actix_web::HttpMessage;
 use actix_web::body::MessageBody;
@@ -69,7 +70,7 @@ use rand::{Rng, distributions::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use static_assertions::assert_impl_any;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use url::Url;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -1590,8 +1591,26 @@ async fn decode_token_with_validation(
     Ok(token_data)
 }
 
+/// The decoding keys of the login provider, keyed by `kid`, and the source
+/// they were fetched from so the background refresh can fetch them again.
+///
+/// A key that is missing is fetched on demand, so a rotation is picked up even
+/// if the refresh loop is not running (tests, a manager started with refresh
+/// disabled). The loop exists because a rotation *away* from a key would
+/// otherwise leave the old key accepted, and because a fetch on the request
+/// path holds up the request while the issuer answers.
 pub struct JwkCache {
     cache: TimedCache<String, DecodingKey>,
+    /// Where the cached keys came from; `None` until the first fetch.
+    source: Option<JwkSource>,
+}
+
+/// What a JWKS fetch needs, without the clients: the URL and the destination
+/// policy the URL was validated against.
+#[derive(Clone, Debug)]
+pub(crate) struct JwkSource {
+    pub url: String,
+    pub destination: OidcDestination,
 }
 
 /// JWKS cache keyed by (issuer, kid) for federated tokens whose issuer is
@@ -1684,7 +1703,27 @@ impl JwkCache {
                 DEFAULT_JWK_CACHE_LIFETIME_SECONDS,
                 DEFAULT_JWK_CACHE_CAPACITY,
             ),
+            source: None,
         }
+    }
+
+    /// Where the cached keys came from, if anything has been fetched yet.
+    pub(crate) fn source(&self) -> Option<&JwkSource> {
+        self.source.as_ref()
+    }
+
+    /// Replace the cached key set with `keys`, fetched from `source`.
+    ///
+    /// Every entry is dropped first: a fetch returns the issuer's whole set, so
+    /// a `kid` missing from it has been retired and must stop verifying. Merging
+    /// would keep the retired key alive, which is the one thing a rotation is
+    /// supposed to prevent.
+    pub(crate) fn replace(&mut self, source: JwkSource, keys: HashMap<String, DecodingKey>) {
+        self.cache.cache_clear();
+        for (kid, decoding_key) in keys {
+            self.cache.cache_set(kid, decoding_key);
+        }
+        self.source = Some(source);
     }
 
     async fn get(
@@ -1693,45 +1732,37 @@ impl JwkCache {
         provider: &AuthProvider,
         clients: &OidcClients,
     ) -> Result<DecodingKey, AuthError> {
-        let cache = &mut self.cache;
-        let val = &cache.cache_get(key);
-        match val {
-            Some(dk) => Ok((*dk).clone()),
-            None => {
-                // TODO: Introduce a minimum delay between refreshes
-                let fetched = fetch_jwk_keys(provider, clients).await;
-                match fetched {
-                    Ok(map) => {
-                        for (key_id, decoding_key) in map {
-                            cache.cache_set(key_id, decoding_key);
-                        }
-                        let val_retry = cache.cache_get(key);
-                        match val_retry {
-                            Some(val_retry) => Ok(val_retry.clone()),
-                            None => Err(AuthError::JwkShape("Invalid kid".to_owned())),
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
-            }
+        if let Some(decoding_key) = self.cache.cache_get(key) {
+            return Ok(decoding_key.clone());
         }
+
+        // A miss means the provider rotated to a key this process has not seen,
+        // or the cache expired. Either way this request needs the current set;
+        // the caller retries on the cooldown schedule while the issuer is down.
+        let source = source_for(provider);
+        let fetched = fetch_jwk_oidc_keys(&source.url, source.destination, clients).await?;
+        self.replace(source, fetched);
+        self.cache
+            .cache_get(key)
+            .cloned()
+            .ok_or_else(|| AuthError::JwkShape("Invalid kid".to_owned()))
     }
 }
 
-async fn fetch_jwk_keys(
-    provider: &AuthProvider,
-    clients: &OidcClients,
-) -> Result<HashMap<String, DecodingKey>, AuthError> {
-    match &provider {
-        AuthProvider::AwsCognito(provider) => fetch_jwk_oidc_keys(&provider.jwk_uri, clients).await,
-        AuthProvider::GenericOidc(provider) => {
-            fetch_jwk_oidc_keys(&provider.jwk_uri, clients).await
-        }
+/// Where to fetch the login provider's keys from. Both provider kinds name an
+/// operator-configured URL, so both carry the operator-configured destination.
+fn source_for(provider: &AuthProvider) -> JwkSource {
+    JwkSource {
+        url: match provider {
+            AuthProvider::AwsCognito(provider) => provider.jwk_uri.clone(),
+            AuthProvider::GenericOidc(provider) => provider.jwk_uri.clone(),
+        },
+        destination: OidcDestination::OperatorConfigured,
     }
 }
 
 // We don't want to fetch keys on every authentication attempt, so cache the
-// results. TODO: implement periodic refresh
+// results and refresh them in the background (see `spawn_jwk_refresh`).
 //
 // This shares the federated path's client so both reach an issuer the same way.
 // A default `awc` client cannot: it picks one root source at compile time, and
@@ -1741,9 +1772,10 @@ async fn fetch_jwk_keys(
 // outside the public web PKI, including this deployment's own CA.
 async fn fetch_jwk_oidc_keys(
     url: &str,
+    destination: OidcDestination,
     clients: &OidcClients,
 ) -> Result<HashMap<String, DecodingKey>, AuthError> {
-    let client = clients.for_destination(OidcDestination::OperatorConfigured);
+    let client = clients.for_destination(destination);
 
     let response = client.get(url).send().await.map_err(|e| {
         debug!("JWK fetch request failed: {:?}", e);
@@ -1756,6 +1788,75 @@ async fn fetch_jwk_oidc_keys(
     })?;
 
     parse_rsa_jwks(&keys_as_json)
+}
+
+/// Minimum gap between background JWKS refreshes for the login provider.
+///
+/// The access tokens this manager validates are short-lived (an hour at every
+/// provider we tested), so a rotated key only has to be visible before the
+/// tokens it signed start arriving. A minute is well inside that and keeps the
+/// steady-state load on the issuer to one request per minute.
+pub(crate) const JWK_REFRESH_INTERVAL_SECONDS: u64 = 60;
+
+/// One refresh: fetch `source` and swap the cached set for it.
+///
+/// The cache is only touched on success. A fetch that fails leaves the previous
+/// keys in place, which is what keeps a briefly unreachable issuer from taking
+/// authentication down; the miss path still retries on demand.
+///
+/// Returns the number of keys now cached, for the caller's log line.
+pub(crate) async fn refresh_login_keys(
+    cache: &tokio::sync::Mutex<JwkCache>,
+    source: &JwkSource,
+    clients: &OidcClients,
+) -> Result<usize, AuthError> {
+    let keys = fetch_jwk_oidc_keys(&source.url, source.destination, clients).await?;
+    let count = keys.len();
+    cache.lock().await.replace(source.clone(), keys);
+    Ok(count)
+}
+
+/// Refresh the login provider's signing keys in the background until `shutdown`
+/// is signalled.
+///
+/// Without this, a key rotates away and the old key keeps verifying tokens for
+/// the cache's lifetime plus however long the process runs, because a cache hit
+/// never consults the issuer. The fetch on a cache miss covers a rotation
+/// *towards* an unknown `kid`; this loop covers the opposite direction.
+///
+/// A failed refresh keeps the previous keys and logs at warn: an issuer that is
+/// briefly unreachable must not take authentication down, and the miss path
+/// still retries on demand.
+pub(crate) fn spawn_jwk_refresh(
+    state: actix_web::web::Data<crate::api::main::ServerState>,
+    provider: AuthProvider,
+    interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let source = source_for(&provider);
+    let source_cache = state.jwk_cache.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick completes immediately; the miss path has already
+        // fetched by then, or the first request will, so skip it.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => {
+                    debug!("JWK refresh stopping: the manager is shutting down");
+                    return;
+                }
+            }
+            match refresh_login_keys(&source_cache, &source, &state.oidc_clients).await {
+                Ok(count) => debug!("Refreshed {count} signing key(s) from '{}'", source.url),
+                Err(e) => warn!(
+                    "Could not refresh signing keys from '{}', keeping the cached set: {e}",
+                    source.url
+                ),
+            }
+        }
+    })
 }
 
 /// Parse a JWK set into RSA decoding keys, keyed by `kid`. Keeps only keys
@@ -1856,13 +1957,15 @@ mod test {
     use base64::Engine;
     use cached::Cached;
     use chrono::Utc;
-    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, encode};
+    use jsonwebtoken::{
+        Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+    };
     use tokio::sync::{Mutex, RwLock};
     use uuid::Uuid;
 
     use super::{AuthError, AuthenticatedPrincipal};
     use crate::db::types::role::{MintableKeyRole, Role};
-    use crate::oidc::fetch::OidcClients;
+    use crate::oidc::fetch::{OidcClients, OidcDestination};
     use crate::{
         api::main::ServerState,
         auth::{self, AuthConfiguration, AuthProvider, OidcClaim},
@@ -1874,6 +1977,7 @@ mod test {
     use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
     use rsa::pkcs8::EncodePublicKey;
     use rsa::{RsaPrivateKey, RsaPublicKey};
+    use wiremock::MockServer;
 
     /// The session endpoint is the one route a login with no resolvable acting
     /// tenant may reach, so the console can drive its tenant picker. The
@@ -1929,6 +2033,290 @@ mod test {
         .unwrap();
         let token = token_encoded.as_str();
         (token.to_owned(), decoding_key)
+    }
+
+    /// Serve `jwks` from a mock issuer and return the URL to fetch it from.
+    async fn serve_jwks(rsa: &RsaPrivateKey, kid: &str) -> MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = jwks_json(rsa, &[kid]);
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The JWK set an issuer publishes for `rsa`, with one entry per `kid`.
+    ///
+    /// It has to be built from the key's own modulus and exponent: a key that
+    /// does not match the token's signature would make a passing test prove
+    /// nothing about which key was selected.
+    fn jwks_json(rsa: &RsaPrivateKey, kids: &[&str]) -> serde_json::Value {
+        use base64::Engine;
+        use rsa::traits::PublicKeyParts;
+
+        let public = RsaPublicKey::from(rsa);
+        let n = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+        let keys: Vec<serde_json::Value> = kids
+            .iter()
+            .map(|kid| {
+                serde_json::json!({
+                    "kid": kid,
+                    "kty": "RSA",
+                    "alg": "RS256",
+                    "use": "sig",
+                    "n": n,
+                    "e": e,
+                })
+            })
+            .collect();
+        serde_json::json!({ "keys": keys })
+    }
+
+    /// A JWKS URL on a port nothing listens on.
+    ///
+    /// Binding a port and immediately dropping the listener hands the port back
+    /// to the OS; connecting to it is refused outright.
+    fn released_port_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://localhost:{port}/.well-known/jwks.json")
+    }
+
+    /// A token signed by `rsa` with the given `kid`.
+    fn sign_with(rsa: &RsaPrivateKey, kid: &str) -> String {
+        use jsonwebtoken::{EncodingKey, Header, encode};
+        use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_owned());
+        encode(
+            &header,
+            &default_claim(),
+            &EncodingKey::from_rsa_pem(rsa.to_pkcs1_pem(LineEnding::LF).unwrap().as_bytes())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A rotation *away* from a key is the case the cache-miss path cannot see:
+    /// the token still carries a `kid` we already hold, so nothing ever asks the
+    /// issuer again. Replacing the set has to drop the retired `kid`, or the
+    /// compromised key keeps verifying for the life of the process.
+    #[actix_web::test]
+    async fn replace_drops_a_retired_key() {
+        ensure_default_crypto_provider();
+        let old = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let new = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+
+        let mut cache = super::JwkCache::new();
+        cache.replace(
+            super::JwkSource {
+                url: "http://issuer/.well-known/jwks.json".to_owned(),
+                destination: OidcDestination::OperatorConfigured,
+            },
+            super::parse_rsa_jwks(&jwks_json(&old, &["old"])).unwrap(),
+        );
+        assert!(
+            cache.cache.cache_get(&"old".to_owned()).is_some(),
+            "the first fetch must populate the old key"
+        );
+
+        cache.replace(
+            super::JwkSource {
+                url: "http://issuer/.well-known/jwks.json".to_owned(),
+                destination: OidcDestination::OperatorConfigured,
+            },
+            super::parse_rsa_jwks(&jwks_json(&new, &["new"])).unwrap(),
+        );
+        assert!(
+            cache.cache.cache_get(&"old".to_owned()).is_none(),
+            "a key the issuer no longer publishes must stop verifying"
+        );
+        assert!(
+            cache.cache.cache_get(&"new".to_owned()).is_some(),
+            "the replacement key must be usable"
+        );
+    }
+
+    /// A cache miss on an unknown `kid` fetches the current set, so a rotation
+    /// *towards* a new key needs no restart. This walks the real HTTP path
+    /// against a mock issuer rather than calling `replace` directly.
+    #[actix_web::test]
+    async fn unknown_kid_fetches_the_current_key_set() {
+        ensure_default_crypto_provider();
+        let rsa = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let server = serve_jwks(&rsa, "rotated").await;
+        let url = format!(
+            "http://localhost:{}/.well-known/jwks.json",
+            server.address().port()
+        );
+
+        let mut cache = super::JwkCache::new();
+        let provider = AuthProvider::GenericOidc(super::ProviderGenericOidc {
+            issuer: "http://issuer".to_owned(),
+            client_id: "client".to_owned(),
+            extra_oidc_scopes: vec![],
+            jwk_uri: url.clone(),
+        });
+
+        // Unwrapping the fetched key proves the fetch path went through the
+        // destination policy and parsed the response into a usable key.
+        cache
+            .get(
+                &"rotated".to_owned(),
+                &provider,
+                &OidcClients::new(&[]).unwrap(),
+            )
+            .await
+            .expect("the issuer's key must resolve on a miss");
+
+        // The token signed by that key verifies against what the cache now
+        // holds; a token carrying an unknown kid is still rejected.
+        let issuer = "some-iss";
+        let token = sign_with(&rsa, "rotated");
+        let header = decode_header(&token).unwrap();
+        let key = cache
+            .cache
+            .cache_get(&header.kid.unwrap())
+            .expect("the fetched key must be in the cache")
+            .clone();
+        assert!(
+            decode::<OidcClaim>(&token, &key, &validation("feldera-api", &issuer)).is_ok(),
+            "a token signed by the fetched key must verify"
+        );
+        assert!(
+            cache
+                .cache
+                .cache_get(&"never-published".to_owned())
+                .is_none(),
+            "a kid the issuer never published must not resolve"
+        );
+    }
+
+    /// A successful refresh drops the key the issuer retired. This drives the
+    /// same function the loop calls, with the issuer changing what it publishes
+    /// between the two calls -- the retired key is still valid on its own, so
+    /// only the replacement explains its removal.
+    #[actix_web::test]
+    async fn a_refresh_drops_a_key_the_issuer_retired() {
+        ensure_default_crypto_provider();
+        let rsa = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let server = serve_jwks(&rsa, "first").await;
+        let source = super::JwkSource {
+            url: format!("{}/.well-known/jwks.json", server.uri()),
+            destination: OidcDestination::OperatorConfigured,
+        };
+        let clients = OidcClients::new(&[]).unwrap();
+        let cache = tokio::sync::Mutex::new(super::JwkCache::new());
+
+        let count = super::refresh_login_keys(&cache, &source, &clients)
+            .await
+            .expect("the mock issuer answers");
+        assert_eq!(count, 1);
+        assert!(
+            cache
+                .lock()
+                .await
+                .cache
+                .cache_get(&"first".to_owned())
+                .is_some()
+        );
+
+        // Republish the same URL with a different key: the issuer rotated.
+        server.reset().await;
+        {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("GET"))
+                .and(path("/.well-known/jwks.json"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(jwks_json(&rsa, &["second"])),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let count = super::refresh_login_keys(&cache, &source, &clients)
+            .await
+            .expect("the mock issuer answers");
+        assert_eq!(count, 1);
+        assert!(
+            cache
+                .lock()
+                .await
+                .cache
+                .cache_get(&"first".to_owned())
+                .is_none(),
+            "the retired key must stop verifying after a refresh"
+        );
+        assert!(
+            cache
+                .lock()
+                .await
+                .cache
+                .cache_get(&"second".to_owned())
+                .is_some(),
+            "the new key must be usable after a refresh"
+        );
+    }
+
+    /// The refresh loop replaces the set on its own schedule, and it must not
+    /// take authentication down when the issuer is unreachable: the previous
+    /// keys stay, and the failure is logged rather than propagated.
+    #[actix_web::test]
+    async fn a_failed_refresh_keeps_the_previous_keys() {
+        ensure_default_crypto_provider();
+        let rsa = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let server = serve_jwks(&rsa, "current").await;
+        let url = format!(
+            "http://localhost:{}/.well-known/jwks.json",
+            server.address().port()
+        );
+
+        let mut cache = super::JwkCache::new();
+        cache.replace(
+            super::JwkSource {
+                url: url.clone(),
+                destination: OidcDestination::OperatorConfigured,
+            },
+            super::parse_rsa_jwks(&jwks_json(&rsa, &["current"])).unwrap(),
+        );
+
+        // Now run what the loop runs on each tick, against an issuer that is
+        // gone for certain. Dropping the mock is not enough: its shutdown is
+        // asynchronous and in this test it kept answering. A released port is
+        // deterministic -- nothing listens on it and nothing is about to.
+        drop(server);
+        let gone = released_port_url();
+        let fetched = super::fetch_jwk_oidc_keys(
+            &gone,
+            OidcDestination::OperatorConfigured,
+            &OidcClients::new(&[]).unwrap(),
+        )
+        .await;
+        assert!(
+            fetched.is_err(),
+            "an unreachable issuer must fail the fetch"
+        );
+
+        // The loop only calls `replace` on success, which is what keeps the old
+        // key alive; assert the state it leaves behind.
+        assert!(
+            cache.cache.cache_get(&"current".to_owned()).is_some(),
+            "a failed refresh must keep the cached keys"
+        );
+        assert_eq!(
+            cache.source().map(|source| source.url.as_str()),
+            Some(url.as_str()),
+            "a failed refresh must keep the source for the next attempt"
+        );
     }
 
     fn validation(aud: &str, iss: &str) -> Validation {
@@ -2132,7 +2520,12 @@ mod test {
         ensure_default_crypto_provider();
         // Fail URL parsing without depending on whether localhost serves HTTP.
         let url = "http://[invalid".to_owned();
-        let res = fetch_jwk_oidc_keys(&url, &OidcClients::new(&[]).unwrap()).await;
+        let res = fetch_jwk_oidc_keys(
+            &url,
+            OidcDestination::OperatorConfigured,
+            &OidcClients::new(&[]).unwrap(),
+        )
+        .await;
         assert!(matches!(res.err().unwrap(), AuthError::JwkFetch(_)));
     }
 

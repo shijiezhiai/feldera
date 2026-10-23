@@ -296,3 +296,16 @@ FT 就没有 checkpoint 快照，PVC 上只有 spill / checkpoint 文件，启�
 
 修的两处真问题：`pipeline.id` 是方法不是 property；`unique_pipeline_name()`
 在本地无 `GITHUB_SHA` 时前缀恒为 `local`，50 轮会撞名，套件自带随机后缀。
+
+## P1-014 — OIDC JWK 自动刷新（2026-10-23）
+
+| 项 | 数值 |
+|---|---|
+| 新增/改动文件 | 2（`auth.rs`、`api/main.rs`）+ 设计文档 |
+| 单测 | 模块内 **24 passed**（新增 5 项），全量 lib 353 passed / 9 failed（既有，见下） |
+| 刷新间隔 | 60s（access token 生命周期 1 小时） |
+| 净增代码 | `auth.rs` +约 430 行（含测试），`main.rs` +19 |
+
+- 一轮"失败即返回"的关键性质：拉取失败不改缓存。否则 issuer 抖一下所有人 401。
+- 测试环境坑：`drop(MockServer)` 不是同步关端口，wiremock 的 shutdown 是异步的；改用"绑定后立即释放的端口"构造确定不可连 URL。
+- 全量 9 个失败均为 `compiler::*`（本机无 SQL compiler jar → `SystemError`），在干净树上同样红，与本次改动无关；此外 `db_impl_behaves_like_model` 在默认栈大小下会栈溢出，需 `RUST_MIN_STACK=16777216`。

@@ -1191,6 +1191,7 @@ pub async fn run(
     let common_config_cloned = common_config.clone();
     let api_config_cloned = api_config.clone();
     let state_cloned = state.clone();
+    let refresh_configuration = auth_configuration.clone();
     let server = HttpServer::new(move || {
         let client = WebData::new(common_config_cloned.awc_client());
         build_app(&api_config_cloned, &auth_configuration)
@@ -1283,8 +1284,19 @@ Version: {} v{}{}
     drop(out_lock);
     drop(err_lock);
 
-    // Create a shutdown channel for the support collector
+    // Create a shutdown channel for the background tasks
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Keep the login provider's signing keys current. A rotation away from a
+    // key is invisible to the cache-miss path, so nothing else notices it.
+    let jwk_refresh_handle = refresh_configuration.as_ref().map(|configuration| {
+        crate::auth::spawn_jwk_refresh(
+            state.clone(),
+            configuration.provider.clone(),
+            std::time::Duration::from_secs(crate::auth::JWK_REFRESH_INTERVAL_SECONDS),
+            shutdown_rx.clone(),
+        )
+    });
 
     // Spawn the support collector in a dedicated thread with its own runtime and HTTP client
     let collector_handle = if api_config.support_data_collection_frequency > 0 {
@@ -1343,8 +1355,11 @@ Version: {} v{}{}
 
     // Await HTTP server; when it returns, signal the collector to stop and join
     let server_result = server.await;
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = jwk_refresh_handle {
+        handle.abort();
+    }
     if let Some(collector_handle) = collector_handle {
-        let _ = shutdown_tx.send(true);
         let _ = collector_handle.join();
     }
 
