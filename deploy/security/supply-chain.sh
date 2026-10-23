@@ -30,6 +30,13 @@ ALLOWLIST="${ALLOWLIST:-${SEC_DIR}/vulnerability-allowlist.json}"
 
 REPORTS_DIR="${SEC_DIR}/reports"
 
+# trivy falls back to mirror.gcr.io when its default repository is slow, and in
+# a network where mirror.gcr.io is unreachable that turns into a hard failure
+# halfway through a scan. Pin both databases to ghcr.io; override the variables
+# to point at an internal mirror instead.
+export TRIVY_DB_REPOSITORY="${TRIVY_DB_REPOSITORY:-ghcr.io/aquasecurity/trivy-db}"
+export TRIVY_JAVA_DB_REPOSITORY="${TRIVY_JAVA_DB_REPOSITORY:-ghcr.io/aquasecurity/trivy-java-db:1}"
+
 die() { echo "ERROR: $*" >&2; exit 1; }
 note() { echo "--- $*"; }
 

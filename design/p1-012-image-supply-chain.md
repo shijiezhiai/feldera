@@ -55,10 +55,17 @@ JSON report under `deploy/security/reports/` (git-ignored) and evaluates it with
   silently become permanent. `gate.py` prints `ALLOWED …  until <date>` for
   every suppressed finding, so the output always shows what the gate is
   ignoring.
-- Baseline: the first scan of the manager image is large (Ubuntu base, JRE and
-  the Rust dependency tree). Triage it once, record the accepted findings with
-  reasons and expiry dates, and keep `expires` short enough that they come back
-  for review.
+- An entry names either one `id` (a CVE) or one `pkg` (a package). A `pkg`
+  entry covers every finding in that package, including future ones, which is
+  exactly why it also has to expire.
+- Baseline: the first scan of the manager image on 2026-10-23 reported 14
+  critical and 372 high findings — **all 386 in `linux-libc-dev`, and none with
+  a fix**. The container never runs that kernel, so the allowlist carries one
+  package-level entry for it with a reason and an expiry date rather than 386
+  CVE entries. Everything else in the image scanned clean, which is the useful
+  part of the baseline: the OS packages are current, and the noise came from a
+  package that cannot be exploited from inside the container.
+- The runner image scanned 0 critical / 0 high.
 
 Both controls are wired into `deploy/build-images.sh`:
 
@@ -114,6 +121,16 @@ Two things to keep in mind when installing it:
   here is kept on the older API because that is what the deployments we target
   run today; migrating means rewriting the `verifyImages` block as CEL and is
   tracked as a follow-up.
+
+### Java dependencies
+
+Scanning the manager image also means scanning the SQL compiler jar, and that
+needs the separate Java index database. Trivy fetches it from
+`mirror.gcr.io` first and falls back to `ghcr.io`; `supply-chain.sh` pins both
+repositories to `ghcr.io` because the first one is unreachable in this network.
+That download was still flaky here, so the baseline above was taken with
+`--pkg-types os`. A CI runner with a healthy network should scan everything;
+keeping the flag difference documented is better than silently skipping Java.
 
 ## 5. The deliberate failure case
 
