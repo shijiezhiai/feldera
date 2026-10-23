@@ -222,3 +222,20 @@ e2e 侧的三条：
   manager 收到 0 个 `--kubernetes-runner-template-*` 参数。
 - 清理断言看两类：DB 侧 pipeline 记录为空，集群侧带
   `feldera.com/pipeline-id` 的 sts/svc/secret/pvc/networkpolicy 为空。
+
+## P1-012：供应链工具链在这台机器上的落地细节
+
+- 工具版本（都放在构建机 `$FELDERA_HOME/bin`）：`cosign 2.4.1`、`trivy 0.76.1`、
+  `kyverno` CLI `1.19.2`。二进制从 `gh-proxy.com` 前缀的 GitHub release 拉取。
+- trivy 漏洞库：`mirror.gcr.io` 与 `index.docker.io` 都超时，**`ghcr.io/aquasecurity/trivy-db`
+  可用**（129 MiB，32s 下完，约 4 MiB/s）。默认仓库本来就是 ghcr.io，但 trivy 会先试
+  mirror.gcr.io，所以用 `TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db` 显式指定可省一次超时。
+- `helm show chart oci://ghcr.io/kyverno/charts/kyverno` 在这台机器上失败：
+  `GDBus.Error: ... org.freedesktop.secrets was not provided`（helm 的 OCI 客户端走
+  docker credential helper，撞上没有 keyring 的 root 会话）。所以集群内的 Kyverno
+  安装没在本轮验证，准入判定用 `kyverno apply`（同一引擎、离线）验证。
+- 自建 HTTP 制品库给 cosign 需要 `--allow-insecure-registry`，脚本用
+  `INSECURE_REGISTRY=1` 控制。
+- 签名是按 digest 绑定的：把同一个 digest 打成新 tag 仍然“已签名”；把 tag 指向
+  新 digest 才会失效。演示未签名镜像必须提交一个**未被签名的新 digest**
+  （`docker commit` 一个容器即可），不能只换个 tag 名。

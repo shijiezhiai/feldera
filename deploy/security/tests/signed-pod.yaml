@@ -1,0 +1,16 @@
+# P1-012 positive case: replace SIGNED_IMAGE_TAG with a tag that was pushed and
+# signed by deploy/security/supply-chain.sh sign. The policy admits it and
+# mutates the tag to the verified digest.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: feldera-signed-demo
+  namespace: feldera
+  labels:
+    app: feldera-signed-demo
+spec:
+  restartPolicy: Never
+  containers:
+    - name: demo
+      image: localhost:5001/feldera-runner:SIGNED_IMAGE_TAG
+      command: ["sleep", "infinity"]

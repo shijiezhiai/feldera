@@ -1,0 +1,61 @@
+# P1-012: cluster-side admission control for the Feldera images.
+#
+# Every Feldera image in the platform namespaces must carry a valid cosign
+# signature made with the release key (deploy/security/cosign.pub). Images that
+# are unsigned, signed by another key, or whose digest does not match the
+# signature are rejected at admission time, before a pod is ever scheduled.
+#
+# The policy is key-based and, because a self-hosted registry has no Rekor, it
+# verifies without a transparency-log entry. That is a deliberate trade-off:
+# the signature proves "the release key signed this digest", not "the signing
+# happened at a publicly auditable time". See design/p1-012-image-supply-chain.md.
+#
+# The private key never leaves the CI secret store; only this public key is in
+# git. Rotating the key means shipping a new policy together with a new key.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: feldera-verify-images
+  annotations:
+    policies.kyverno.io/title: Verify Feldera image signatures
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Rejects pods that run a Feldera image without a valid cosign signature
+      from the release key.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  failurePolicy: Fail
+  rules:
+    - name: verify-feldera-images
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      # Only the platform's own images are verified: user pipelines run
+      # arbitrary images by design. `imageReferences` already scopes the rule,
+      # so no precondition is needed (a precondition on a list field would also
+      # have to reimplement glob matching by hand).
+      verifyImages:
+        - imageReferences:
+            - "localhost:5001/feldera-*"
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE4w63JGEvnZ/OUHqZUHe2wk5ZV1Fb
+                      LMACinz1eVijmUfrKIsDMp6P5ws7jC5k/Nv07FQAm9J+i0WC9khJlBTBdg==
+                      -----END PUBLIC KEY-----
+                    # A self-hosted deployment has no Rekor, so the transparency
+                    # log entry is not required; the digest is still pinned by
+                    # mutation below.
+                    rekor:
+                      ignoreTlog: true
+          mutateDigest: true
+          verifyDigest: true
+          required: true
