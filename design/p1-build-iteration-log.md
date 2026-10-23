@@ -210,3 +210,15 @@ e2e 侧的三条：
 - **有 storage 的 pipeline 必须有可写的 `{pipeline_storage_path}`**：K8s runner
   总是给 pipeline 一个 storage 路径，模板不挂 claim 就是
   `create failed: entity not found` + `recursive mkdir failed: permission denied`。
+
+## 第三轮补记：P1-011 chart 变更的回归跑
+
+- `TAG=…-bili.8 PROFILE=unoptimized REUSE=0 scripts/e2e-k8s-runner.sh` 在 kind 上
+  一次通过，65s：创建 → Running → ingest → `SELECT c FROM v` = 3 → 清理。
+- 比首轮的 331s 快，是因为编译缓存 PVC 里已有依赖与生成 crate 的 target，只剩
+  最终 crate 重编与链接；这也说明「删 pipeline 保留 target」是有意义的。
+- 回归判读要点：限额四个参数是「只加不减」（默认值与 chart values 一致，
+  既有渲染结果不变）；模板开关的默认值是空字符串，`{{- with }}` 整段不渲染，
+  manager 收到 0 个 `--kubernetes-runner-template-*` 参数。
+- 清理断言看两类：DB 侧 pipeline 记录为空，集群侧带
+  `feldera.com/pipeline-id` 的 sts/svc/secret/pvc/networkpolicy 为空。
