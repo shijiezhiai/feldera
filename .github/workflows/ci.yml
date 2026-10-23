@@ -83,6 +83,17 @@ jobs:
     uses: ./.github/workflows/test-integration-platform.yml
     secrets: inherit
 
+  invoke-tests-k8s-runner:
+    name: Kubernetes Runner E2E
+    # It builds its own images (the release publishes one image, the pipeline
+    # pod needs three), so it does not wait for invoke-build-docker. It does
+    # wait for the Rust build: the image build compiles the same crates inside
+    # the container, and failing after ten minutes of apt-get is worse than
+    # failing here.
+    needs: [invoke-build-rust]
+    uses: ./.github/workflows/test-k8s-runner.yml
+    secrets: inherit
+
   invoke-tests-integration-runtime:
     name: Integration Tests
     needs: [invoke-build-java]
@@ -243,6 +254,21 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
 
+  cancel-if-tests-k8s-runner-failed:
+    name: Cancel if Kubernetes Runner E2E Failed
+    needs: [invoke-tests-k8s-runner]
+    if: failure()
+    runs-on: ubuntu-latest-amd64
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel workflow
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
+
   cancel-if-tests-integration-runtime-failed:
     name: Cancel if Runtime Integration Tests Failed
     needs: [invoke-tests-integration-runtime]
@@ -305,6 +331,7 @@ jobs:
       - invoke-build-docker
       - invoke-generate-sbom
       - invoke-tests-integration-platform
+      - invoke-tests-k8s-runner
       - invoke-tests-integration-runtime
       - invoke-tests-java
       - invoke-publish-crates-dry-run

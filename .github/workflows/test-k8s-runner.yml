@@ -1,0 +1,166 @@
+# End-to-end check for the Kubernetes pipeline runner: build the three images,
+# install the chart into a kind cluster and drive a pipeline through its whole
+# lifecycle with the Python SDK.
+#
+# This job is the only place the Kubernetes runner is exercised against a real
+# API server. The Rust unit tests use a fake client, which proves what the
+# runner *renders*; only a cluster proves that what it renders is accepted,
+# scheduled and reachable.
+#
+# It builds its own images instead of pulling `$FELDERA_IMAGE_NAME`, because a
+# pipeline pod needs two images that the upstream release does not publish: the
+# compiler toolchain and the runtime image the pod executes in. See
+# docs/self-hosted-images.md.
+name: Kubernetes Runner E2E
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  kubernetes-runner-e2e:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'kubernetes-runner-e2e') }}
+    name: Pipeline lifecycle on kind
+    # This job builds three images and then runs a cluster, so it needs a runner
+    # with a Docker daemon that can start containers (kind is Docker-in-Docker),
+    # roughly 40 GiB of free disk for the layers, and enough CPU to compile the
+    # manager. Point K8S_E2E_RUNNER at a label with those properties; the
+    # default label has Docker but no guarantee of the disk. The job fails fast
+    # below rather than discovering the shortage an hour in.
+    runs-on: ${{ vars.K8S_E2E_RUNNER || 'ubuntu-latest-amd64' }}
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+
+      # helm/kind-action installs kind and kubectl but not helm, and the chart is
+      # the only way this job installs the runner.
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+
+      - name: Check the runner can host the cluster
+        run: |
+          set -euo pipefail
+          docker info >/dev/null || {
+            echo "error: no Docker daemon; kind needs one and the image build needs it too" >&2
+            exit 1
+          }
+          # The build alone produces several GiB of layers and the cluster's
+          # node keeps its own copy of the images after `kind load`.
+          available="$(df -Pk . | awk 'NR==2 { print int($4 / 1024 / 1024) }')"
+          echo "free disk: ${available} GiB"
+          if [ "${available}" -lt 40 ]; then
+            echo "error: need at least 40 GiB free, have ${available} GiB;" >&2
+            echo "point K8S_E2E_RUNNER at a larger runner" >&2
+            exit 1
+          fi
+
+      - name: Create the kind cluster
+        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          cluster_name: feldera-e2e
+
+      - name: Verify the default StorageClass
+        run: |
+          set -euo pipefail
+          kubectl get storageclass
+          kubectl get storageclass | grep -q '(default)' || {
+            echo "error: the cluster has no default StorageClass, so the pipeline's" >&2
+            echo "PersistentVolumeClaim would stay Pending and the pod would never start" >&2
+            exit 1
+          }
+
+      - name: Build the images
+        # The build is the slow part: it compiles the manager, the compiler
+        # toolchain and the runner runtime. Caching is per-layer, so a change
+        # under crates/ rebuilds the manager and nothing else.
+        env:
+          # Pushing needs a registry the cluster can reach; the local one the
+          # script starts is enough, and a `kind load` brings the images across.
+          PUSH: 1
+          # Keep the disk free for the next image; the script prunes per image
+          # on purpose.
+          PRUNE: 1
+          # The manager build compiles the whole workspace. Four jobs keeps peak
+          # memory inside what a runner has; more is how this OOMs.
+          BILI_CARGO_JOBS: 4
+        run: |
+          set -euo pipefail
+          deploy/build-images.sh
+          # Read the tag back from the images the script left behind instead of
+          # recomputing it: the script picks the first free `-bili.N`, so a
+          # rerun on a dirty node would not be `-bili.1`.
+          tag="$(docker image ls --format '{{.Tag}}' localhost:5001/feldera-runner | head -1)"
+          test -n "${tag}" || { echo "error: the build produced no runner image" >&2; exit 1; }
+          echo "FELDERA_E2E_TAG=${tag}" >> "$GITHUB_ENV"
+
+      - name: Install the release with the Kubernetes runner
+        # The suite expects a release that is already up, so this installs it
+        # the way scripts/e2e-k8s-runner.sh does, minus the pipeline itself.
+        run: |
+          set -euo pipefail
+          for ref in \
+            "localhost:5001/feldera-manager:${FELDERA_E2E_TAG}" \
+            "localhost:5001/feldera-runner:${FELDERA_E2E_TAG}" \
+            "localhost:5001/feldera-compiler:${FELDERA_E2E_TAG}" \
+            "postgres:17-alpine"; do
+            kind load docker-image --name feldera-e2e "${ref}"
+          done
+          helm upgrade --install feldera charts/feldera \
+            --namespace feldera --create-namespace \
+            --set "controlplane.image.tag=${FELDERA_E2E_TAG}" \
+            --set "controlplane.kubernetesRunner.image.tag=${FELDERA_E2E_TAG}" \
+            --set "compiler.image.tag=${FELDERA_E2E_TAG}" \
+            --set controlplane.controlPlane.deploymentTimeAnnotation=false \
+            --set controlplane.compilationCache.enabled=true \
+            --set controlplane.compilationCache.size=80Gi \
+            --wait --timeout 10m
+          kubectl rollout status deployment/feldera-controlplane-api-server \
+            --namespace feldera --timeout 5m
+
+      - name: Run the lifecycle suite
+        env:
+          FELDERA_K8S_E2E: 1
+          FELDERA_K8S_NAMESPACE: feldera
+          FELDERA_K8S_RELEASE: feldera
+          PYTHONPATH: ${{ github.workspace }}/python
+          IN_CI: 1
+        run: |
+          set -euo pipefail
+          # The suite opens its own port-forward to the API server, so there is
+          # no FELDERA_HOST here.
+          uv run --locked pytest -n0 -s \
+            tests/platform/test_selfhosted_k8s_lifecycle.py \
+            --timeout=5400 -vv
+        working-directory: python
+
+      - name: Collect the cluster state
+        if: failure()
+        run: |
+          set -uo pipefail
+          for kind in statefulset pod service networkpolicy persistentvolumeclaim secret; do
+            echo "=== $kind ==="
+            kubectl --namespace feldera get "$kind" -o wide || true
+          done
+          echo "=== pipeline pods ==="
+          kubectl --namespace feldera logs --selector 'app.kubernetes.io/name=feldera-pipeline' \
+            --tail=200 --all-containers || true
+          echo "=== control plane ==="
+          kubectl --namespace feldera logs statefulset/feldera-controlplane \
+            --tail=300 --all-containers || true
+          echo "=== events ==="
+          kubectl --namespace feldera get events --sort-by=.lastTimestamp || true
+
+      - name: Delete the cluster
+        if: always()
+        run: kind delete cluster --name feldera-e2e || true
