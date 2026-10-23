@@ -25,6 +25,13 @@ Allowlist format (JSON, no third-party parser needed):
 A ``pkg`` entry suppresses future findings in that package too, which is why it
 also has to expire: a suppression that covers more than one CVE cannot be
 reviewed CVE by CVE, so it must come back for review as a whole.
+
+Some ecosystems in an image are not deployed code. The manager image ships the
+Cargo registry and git checkouts so that pipelines compile offline inside the
+pod (see design/p1-009-kubernetes-runner.md), and scanning that cache reports
+every transitive dependency of every crate, none of which is executed or
+reachable at runtime. Those findings are counted and printed, but they do not
+decide the gate; ``--skip-ecosystems`` names them (default: cargo).
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ class Finding:
     installed: str
     fixed: str
     severity: str
+    ecosystem: str
 
 
 def load_report(path: str) -> tuple[str, list[Finding]]:
@@ -53,6 +61,7 @@ def load_report(path: str) -> tuple[str, list[Finding]]:
     image = report.get("ArtifactName") or os.path.basename(path)
     findings: list[Finding] = []
     for result in report.get("Results") or []:
+        ecosystem = result.get("Type") or result.get("Class") or "unknown"
         for entry in result.get("Vulnerabilities") or []:
             findings.append(
                 Finding(
@@ -62,6 +71,7 @@ def load_report(path: str) -> tuple[str, list[Finding]]:
                     installed=entry.get("InstalledVersion", "?"),
                     fixed=entry.get("FixedVersion") or "no fix",
                     severity=(entry.get("Severity") or "UNKNOWN").upper(),
+                    ecosystem=ecosystem,
                 )
             )
     return image, findings
@@ -107,6 +117,11 @@ def main() -> int:
     parser.add_argument("--allowlist", default="deploy/security/vulnerability-allowlist.json")
     parser.add_argument("--fail-on", default="CRITICAL,HIGH")
     parser.add_argument(
+        "--skip-ecosystems",
+        default="cargo",
+        help="comma separated ecosystems that are counted but never fail the gate",
+    )
+    parser.add_argument(
         "--summary",
         action="store_true",
         help="only print per-image counts; never fail",
@@ -114,11 +129,15 @@ def main() -> int:
     arguments = parser.parse_args()
 
     fail_on = {item.strip().upper() for item in arguments.fail_on.split(",") if item.strip()}
+    skip_ecosystems = {
+        item.strip() for item in arguments.skip_ecosystems.split(",") if item.strip()
+    }
     entries = load_allowlist(arguments.allowlist)
     today = dt.date.today()
 
     blocked: list[Finding] = []
     allowed: list[tuple[Finding, dict]] = []
+    skipped: dict[str, int] = {}
     per_image: dict[str, dict[str, int]] = {}
 
     for path in arguments.reports:
@@ -126,6 +145,9 @@ def main() -> int:
         counts = per_image.setdefault(image, {})
         for finding in findings:
             counts[finding.severity] = counts.get(finding.severity, 0) + 1
+            if finding.ecosystem in skip_ecosystems:
+                skipped[finding.ecosystem] = skipped.get(finding.ecosystem, 0) + 1
+                continue
             if arguments.summary or finding.severity not in fail_on:
                 continue
             entry = allows(entries, finding, today)
@@ -140,6 +162,12 @@ def main() -> int:
             f"{image[:52]:<52} {counts.get('CRITICAL', 0):>5} "
             f"{counts.get('HIGH', 0):>5} {counts.get('MEDIUM', 0):>5} "
             f"{counts.get('LOW', 0):>5}"
+        )
+
+    for ecosystem, count in sorted(skipped.items()):
+        print(
+            f"SKIPPED  {count:>5} finding(s) in {ecosystem}: build-time dependency cache, "
+            f"not deployed code (--skip-ecosystems)"
         )
 
     if arguments.summary:

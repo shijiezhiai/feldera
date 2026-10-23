@@ -60,7 +60,7 @@ JSON report under `deploy/security/reports/` (git-ignored) and evaluates it with
   exactly why it also has to expire.
 - Baseline: the first scan of the manager image on 2026-10-23 reported 14
   critical and 372 high findings — **all 386 in `linux-libc-dev`, and none with
-  a fix**. The container never runs that kernel, so the allowlist carries one
+  a fix** (re-confirmed with Java and Node scanning enabled, see below). The container never runs that kernel, so the allowlist carries one
   package-level entry for it with a reason and an expiry date rather than 386
   CVE entries. Everything else in the image scanned clean, which is the useful
   part of the baseline: the OS packages are current, and the noise came from a
@@ -125,12 +125,58 @@ Two things to keep in mind when installing it:
 ### Java dependencies
 
 Scanning the manager image also means scanning the SQL compiler jar, and that
-needs the separate Java index database. Trivy fetches it from
-`mirror.gcr.io` first and falls back to `ghcr.io`; `supply-chain.sh` pins both
-repositories to `ghcr.io` because the first one is unreachable in this network.
-That download was still flaky here, so the baseline above was taken with
-`--pkg-types os`. A CI runner with a healthy network should scan everything;
-keeping the flag difference documented is better than silently skipping Java.
+needs the separate Java index database: a 942 MiB OCI artifact
+(`ghcr.io/aquasecurity/trivy-java-db:1`, layer
+`sha256:65d5d63f…`, 987,770,154 bytes) that unpacks into a 1.5 GiB
+`trivy-java.db`. Trivy fetches it from `mirror.gcr.io` first and falls back to
+`ghcr.io`; `supply-chain.sh` pins both repositories to `ghcr.io` because the
+first one is unreachable in this network.
+
+Trivy's own OCI client could not finish that download here. It reported
+`oci download error: copy error: stream error: stream ID 1; PROTOCOL_ERROR;
+received from peer` after about a third of the artifact, and every retry started
+again from zero — a 942 MiB artifact that arrives in 300 MiB pieces never
+arrives at all.
+
+`deploy/security/fetch-java-db.sh` sidesteps the client: it reads the manifest
+directly, then downloads the blob with `curl -C -`, so an interrupted transfer
+resumes where it stopped, and only unpacks once the byte count matches the
+manifest. On the build host the artifact arrived at 37 MB/s in 25 seconds —
+the client was the bottleneck, not the link. `supply-chain.sh java-db` runs the
+script, and `supply-chain.sh scan` adds `--skip-java-db-update` once the index
+is in `$TRIVY_CACHE_DIR/java-db`, so scans never talk to the registry again.
+
+With the index in place the scans default to `--pkg-types os,library`
+(`SCAN_PKG_TYPES`) and do cover Java. That path is not taken on faith: a demo
+image built from `debian:9` with `log4j-core-2.14.1` dropped in reports
+`CVE-2021-44228`, `CVE-2021-45046` and `CVE-2021-45105` (`jar` results), and the
+gate blocks them. The manager image itself scans **clean for Java** (0
+findings): its compiler jar is shaded, so it exposes no dependency metadata.
+
+### Why `cargo` findings do not fail the gate
+
+`--pkg-types os,library` also scans the Cargo registry and git checkouts that
+the manager image ships *on purpose*, so that a pipeline can be compiled inside
+a pod without network access (see `design/p1-009-kubernetes-runner.md`). Trivy
+treats every `Cargo.lock` under `.cargo/registry/src/…` as a project and
+reports every transitive dependency of every crate — 1,023 findings in the
+first run, none of them executed or reachable at runtime.
+
+The gate therefore skips ecosystems that are build-time caches by default
+(`--skip-ecosystems cargo`, `SKIP_ECOSYSTEMS` in `supply-chain.sh`). It prints
+`SKIPPED <n> finding(s) in cargo: build-time dependency cache, not deployed
+code`, so the exclusion is visible and counted rather than silent. Rust
+dependencies are still covered where they matter: by the workspace
+`Cargo.lock` reviewed in code review, and by a `cargo audit` step that belongs
+in CI rather than in image scanning.
+
+### The baseline with Java enabled
+
+Re-running the scan with `--pkg-types os,library` on 2026-10-23 changed nothing
+that the gate looks at: the same 386 `linux-libc-dev` findings (allowlisted by
+package), zero Java findings, zero Node findings, and 1,023 `cargo` findings
+that are skipped as build-time cache. The compiler and runner images were
+scanned the same way (`supply-chain.sh gate` over all three).
 
 ## 5. The deliberate failure case
 
