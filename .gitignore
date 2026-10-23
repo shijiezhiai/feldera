@@ -115,3 +115,6 @@ js-packages/support-bundle-triage/
 
 # P1-009 迭代快速路径：本地编译出的 manager 二进制（overlay 构建用）
 deploy/.build/
+# P1-012: signing keys and scan reports never enter git.
+deploy/security/keys/
+deploy/security/reports/

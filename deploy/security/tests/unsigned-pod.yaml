@@ -1,0 +1,15 @@
+# P1-012 negative case: this image has no cosign signature, so the
+# feldera-verify-images policy must reject the pod at admission time.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: feldera-unsigned-demo
+  namespace: feldera
+  labels:
+    app: feldera-unsigned-demo
+spec:
+  restartPolicy: Never
+  containers:
+    - name: demo
+      image: localhost:5001/feldera-runner:unsigned-demo
+      command: ["sleep", "infinity"]

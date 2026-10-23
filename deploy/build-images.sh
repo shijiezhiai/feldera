@@ -34,6 +34,11 @@ fi
 
 PUSH="${PUSH:-1}"
 PRUNE="${PRUNE:-1}"
+# P1-012：推上去之后可以顺手签名/过 CVE 门禁。默认关，CI 里打开。
+# 第一次开 SCAN 时门禁几乎必然红——要先做一次基线扫描，把确认可接受的条目
+# 写进 deploy/security/vulnerability-allowlist.json（带 reason 与 expires）。
+SIGN="${SIGN:-0}"
+SCAN="${SCAN:-0}"
 REGISTRY_CONTAINER="${REGISTRY_CONTAINER:-feldera-local-registry}"
 REGISTRY_HOST="${REGISTRY%%:*}"
 REGISTRY_PORT="${REGISTRY##*:}"
@@ -86,6 +91,25 @@ next_n() {
   echo "${n}"
 }
 
+# P1-012：签名与 CVE 门禁都只对已推送的镜像有意义（cosign 把签名作为
+# 制品库里的另一个 tag 保存）。本地 http 制品库给 cosign 加 --allow-insecure-registry。
+supply_chain() {
+  local image="$1"
+  local -a extra=()
+  case "${REGISTRY_HOST}" in
+    localhost|127.0.0.1) extra=(INSECURE_REGISTRY=1) ;;
+  esac
+
+  if [[ "${SIGN}" == "1" ]]; then
+    echo "--- signing ${image}"
+    env "${extra[@]+"${extra[@]}"}" deploy/security/supply-chain.sh sign "${image}"
+  fi
+  if [[ "${SCAN}" == "1" ]]; then
+    echo "--- scanning ${image} (report under deploy/security/reports/)"
+    env "${extra[@]+"${extra[@]}"}" deploy/security/supply-chain.sh gate "${image}"
+  fi
+}
+
 # 构建成功后的收尾：报告体积、可选推送、可选清 build cache。
 finish_image() {
   local tag="$1"
@@ -96,6 +120,7 @@ finish_image() {
     echo "--- pushing ${REGISTRY}/${tag}"
     docker tag "${tag}" "${REGISTRY}/${tag}"
     docker push "${REGISTRY}/${tag}"
+    supply_chain "${REGISTRY}/${tag}"
   fi
 
   if [[ "${PRUNE}" == "1" ]]; then
