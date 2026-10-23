@@ -100,7 +100,8 @@ jobs:
           # Read the tag back from the images the script left behind instead of
           # recomputing it: the script picks the first free `-bili.N`, so a
           # rerun on a dirty node would not be `-bili.1`.
-          tag="$(docker image ls --format '{{.Tag}}' localhost:5001/feldera-runner | head -1)"
+          tag="$(docker image ls --format '{{.Tag}}' localhost:5001/feldera-runner \
+                   | grep -v '<none>' | head -1)"
           test -n "${tag}" || { echo "error: the build produced no runner image" >&2; exit 1; }
           echo "FELDERA_E2E_TAG=${tag}" >> "$GITHUB_ENV"
 
@@ -109,6 +110,10 @@ jobs:
         # the way scripts/e2e-k8s-runner.sh does, minus the pipeline itself.
         run: |
           set -euo pipefail
+          # `kind load` copies an image that is already in the local Docker, and
+          # nothing so far pulled this one: the chart asks for it by name and the
+          # node has no registry to fall back on.
+          docker pull postgres:17-alpine
           for ref in \
             "localhost:5001/feldera-manager:${FELDERA_E2E_TAG}" \
             "localhost:5001/feldera-runner:${FELDERA_E2E_TAG}" \
