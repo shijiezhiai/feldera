@@ -7,10 +7,12 @@
   runner uses:
 
     * pods            — read the pipeline pod's phase/conditions/container states
+    * pods/log        — follow the pipeline's stdout into the pipeline log API
     * statefulsets    — create the pipeline, scale it to zero, delete it
     * services        — create the headless Service and delete it
     * secrets         — create the pipeline's config.yaml secret and delete it
     * persistentvolumeclaims — create/read the storage claim and delete it
+    * networkpolicies — restrict the pipeline port to the manager namespace
 
   No cluster-scoped access is granted. `can_provision` checks the namespace by
   sending a dry-run Secret create into it, which the API server answers with
@@ -28,10 +30,16 @@ rules:
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
     resources: ["services", "secrets", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

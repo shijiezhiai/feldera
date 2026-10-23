@@ -18,6 +18,11 @@
 //! | `Service` (headless) | `pipeline-<id>` | stable DNS name for the pod |
 //! | `Secret` | `pipeline-<id>-config` | the pipeline's `config.yaml` |
 //! | `PersistentVolumeClaim` | `pipeline-<id>-storage` | checkpoint and fault-tolerance files |
+//! | `NetworkPolicy` | `pipeline-<id>` | only the manager namespace may reach the pipeline port |
+//!
+//! The manager reaches the pipeline through the headless Service's DNS name
+//! (`pipeline-<id>.<namespace>.svc.cluster.local:<port>`), which is also what
+//! `deployment_location` reports and what `check` probes on every pass.
 //!
 //! The pod pulls its program binary from `program_binary_url` (the compiler
 //! service) through `/usr/local/bin/pipeline-entrypoint`, which the pipeline
@@ -32,7 +37,8 @@
 //!   binary, and Gen-2 has none to download.
 //! * Manager↔pipeline TLS is rejected: the certificate and key would have to be
 //!   mounted into the pipeline pod, which is not part of this slice.
-//! * Pod logs are not streamed into the pipeline's log buffer yet (P1-010).
+//! * Pod logs are followed and forwarded into the pipeline's log buffer, but a
+//!   container that restarts loses the lines written before the restart.
 
 use crate::config::{CommonConfig, KubernetesRunnerConfig};
 use crate::db::types::pipeline::{
@@ -46,7 +52,7 @@ use crate::runner::error::RunnerError;
 use crate::runner::pipeline_executor::{
     PipelineExecutor, ProvisionStatus, discover_namespace_from_runtime_config_json,
 };
-use crate::runner::pipeline_logs::LogsSender;
+use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use async_trait::async_trait;
 use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
@@ -57,15 +63,25 @@ use k8s_openapi::api::core::v1::{
     PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, Secret, SecretVolumeSource,
     Service, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
 };
+use k8s_openapi::api::networking::v1::{
+    NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
+    NetworkPolicySpec,
+};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
-use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use tracing::{info, warn};
+use futures_util::{AsyncBufReadExt, TryStreamExt};
+use tokio::task::JoinHandle;
+use tracing::{Level, info, warn};
 use uuid::Uuid;
+
+/// Label every namespace carries, set by the API server, which makes a
+/// namespace selector independent of how the namespace was named or labeled.
+const NAMESPACE_NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 /// Timeout for the `Provisioning` stage.
 ///
@@ -273,6 +289,8 @@ struct RenderInput {
     resources: ResourceRequirements,
     storage: Option<StorageRequest>,
     service_account: Option<String>,
+    /// Namespace the manager runs in. Only its pods may reach the pipeline port.
+    manager_namespace: String,
 }
 
 /// The objects provisioning creates for one pipeline deployment.
@@ -281,6 +299,7 @@ struct PipelineObjects {
     secret: Secret,
     storage_claim: Option<PersistentVolumeClaim>,
     service: Service,
+    network_policy: NetworkPolicy,
     statefulset: StatefulSet,
 }
 
@@ -294,6 +313,7 @@ impl RenderInput {
             secret: self.render_secret(),
             storage_claim: self.render_storage_claim(),
             service: self.render_service(),
+            network_policy: self.render_network_policy(),
             statefulset: self.render_statefulset(),
         }
     }
@@ -361,6 +381,49 @@ impl RenderInput {
                 }]),
                 selector: Some(selector_labels(self.pipeline_id)),
                 ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Restricts the pipeline port to the manager namespace.
+    ///
+    /// The pipeline's HTTP API is an internal control interface: the manager
+    /// polls it for health and forwards user queries to it. Sources and sinks
+    /// are the pipeline's own business, so egress stays unrestricted (the
+    /// policy only lists `Ingress` in `policyTypes`). A cluster whose CNI does
+    /// not implement NetworkPolicy ignores the object, which is the Kubernetes
+    /// contract for it.
+    fn render_network_policy(&self) -> NetworkPolicy {
+        NetworkPolicy {
+            metadata: ObjectMeta {
+                name: Some(resource_base(self.pipeline_id)),
+                ..self.metadata()
+            },
+            spec: Some(NetworkPolicySpec {
+                pod_selector: Some(LabelSelector {
+                    match_labels: Some(selector_labels(self.pipeline_id)),
+                    ..Default::default()
+                }),
+                policy_types: Some(vec!["Ingress".to_string()]),
+                ingress: Some(vec![NetworkPolicyIngressRule {
+                    from: Some(vec![NetworkPolicyPeer {
+                        namespace_selector: Some(LabelSelector {
+                            match_labels: Some(BTreeMap::from([(
+                                NAMESPACE_NAME_LABEL.to_string(),
+                                self.manager_namespace.clone(),
+                            )])),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    ports: Some(vec![NetworkPolicyPort {
+                        port: Some(IntOrString::Int(i32::from(PIPELINE_PORT))),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    }]),
+                }]),
+                egress: None,
             }),
             ..Default::default()
         }
@@ -665,13 +728,13 @@ pub struct KubernetesRunner {
     pipeline_id: PipelineId,
     common_config: CommonConfig,
     config: KubernetesRunnerConfig,
-    /// Reserved for later slices: used to call the pipeline's management
-    /// endpoint from the manager side (today the automaton does that itself).
-    #[allow(dead_code)]
+    /// Used by [`PipelineExecutor::check`] to probe the pipeline's `/status`
+    /// endpoint through the headless Service.
     client: reqwest::Client,
-    /// Reserved for P1-010, which streams pod logs into the pipeline log buffer.
-    #[allow(dead_code)]
+    /// Receives the lines of the pipeline pod's log stream.
     logs_sender: LogsSender,
+    /// Task that follows the pod's log stream; aborted when the pipeline stops.
+    logs_task: Option<JoinHandle<()>>,
     /// Lazily initialized API client: it validates the credentials before any
     /// resource is touched, and its construction is fallible.
     kubernetes: Option<Client>,
@@ -809,6 +872,11 @@ impl KubernetesRunner {
             resources: pod_resources(config),
             storage,
             service_account: config.global.resources.service_account_name.clone(),
+            manager_namespace: self
+                .config
+                .kubernetes_runner_manager_namespace
+                .clone()
+                .unwrap_or_else(|| namespace.to_string()),
         }
     }
 
@@ -893,6 +961,7 @@ impl PipelineExecutor for KubernetesRunner {
             config,
             client,
             logs_sender,
+            logs_task: None,
             kubernetes: None,
         }
     }
@@ -1076,10 +1145,25 @@ impl PipelineExecutor for KubernetesRunner {
         self.apply(&services, &service_name, &objects.service)
             .await?;
 
+        // The policy has to exist before the pod, otherwise the pod is briefly
+        // reachable from everywhere the cluster allows.
+        let policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), &namespace);
+        let policy_name = resource_base(self.pipeline_id);
+        self.apply(&policies, &policy_name, &objects.network_policy)
+            .await?;
+
         let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &namespace);
         let statefulset_name = resource_base(self.pipeline_id);
         self.apply(&statefulsets, &statefulset_name, &objects.statefulset)
             .await?;
+
+        // Follow the pod's log stream from now on. The task ends when it is
+        // aborted by `stop` or `clear`, or when the stream ends and the pod is
+        // gone for good.
+        if let Some(task) = self.logs_task.take() {
+            task.abort();
+        }
+        self.logs_task = Some(self.spawn_log_follower(client.clone(), namespace.clone()));
 
         info!(
             pipeline_id = %self.pipeline_id,
@@ -1131,7 +1215,34 @@ impl PipelineExecutor for KubernetesRunner {
         if let Some(failure) = pod_failure(&pod) {
             return Err(RunnerError::RunnerCheckError { error: failure }.into());
         }
-        Ok(pod_details(&pod))
+        // Probe the same route the automaton and the user will use, so a broken
+        // path shows up in the pipeline's resource details instead of only when
+        // the first query arrives. A refused connection is not fatal: the
+        // pipeline binds its port a moment after the pod is ready, and the
+        // automaton would otherwise bounce a starting pipeline.
+        let status_url = format!("http://{}/status", self.location(&namespace));
+        let probe = fetch_status(&self.client, &status_url).await;
+        // The pipeline documents three outcomes: 200 with its runtime status,
+        // 503 when it cannot read that status right now, and anything else,
+        // which means the pipeline is unhealthy.
+        match probe.http_status {
+            Some(code) if !status_is_healthy(code) => {
+                return Err(RunnerError::RunnerCheckError {
+                    error: format!(
+                        "the pipeline's {status_url} returned {code}, which is neither a status                          report (200) nor a temporary unavailability (503)"
+                    ),
+                }
+                .into());
+            }
+            _ => {}
+        }
+        Ok(serde_json::json!({
+            "pod": pod_details(&pod),
+            "status_url": status_url,
+            "http_status": probe.http_status,
+            "pipeline": probe.body,
+            "status_error": probe.error,
+        }))
     }
 
     /// Scales the pipeline down to zero replicas, keeping its storage claim.
@@ -1141,6 +1252,7 @@ impl PipelineExecutor for KubernetesRunner {
         // cached client; the resources still exist and are found by name.
         let client = self.kubernetes_client().await?;
         self.kubernetes = Some(client);
+        self.stop_log_follower();
         self.scale_to_zero(&namespace).await
     }
 
@@ -1148,14 +1260,16 @@ impl PipelineExecutor for KubernetesRunner {
     async fn clear(&mut self, runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
         let namespace = self.namespace(runtime_config);
         let client = self.kubernetes_client().await?;
+        self.stop_log_follower();
         let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &namespace);
         let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
         let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
-        let claims: Api<PersistentVolumeClaim> = Api::namespaced(client, &namespace);
-
-        let deletions: [(&str, String); 4] = [
+        let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
+        let policies: Api<NetworkPolicy> = Api::namespaced(client, &namespace);
+        let deletions: [(&str, String); 5] = [
             ("StatefulSet", resource_base(self.pipeline_id)),
             ("Service", resource_base(self.pipeline_id)),
+            ("NetworkPolicy", resource_base(self.pipeline_id)),
             ("Secret", config_secret_name(self.pipeline_id)),
             (
                 "PersistentVolumeClaim",
@@ -1173,6 +1287,10 @@ impl PipelineExecutor for KubernetesRunner {
                     .await
                     .map(|_| ()),
                 "Secret" => secrets
+                    .delete(&name, &DeleteParams::default())
+                    .await
+                    .map(|_| ()),
+                "NetworkPolicy" => policies
                     .delete(&name, &DeleteParams::default())
                     .await
                     .map(|_| ()),
@@ -1196,7 +1314,141 @@ impl PipelineExecutor for KubernetesRunner {
     }
 }
 
+/// Whether an HTTP status from the pipeline's `/status` endpoint means the
+/// pipeline is alive.
+///
+/// `200` carries the runtime status and `503` means the pipeline cannot read
+/// that status at this instant, which its documentation calls "unavailable"
+/// rather than broken. Everything else is a failure.
+fn status_is_healthy(code: u16) -> bool {
+    code == 200 || code == 503
+}
+
+/// One probe of the pipeline's `/status` endpoint.
+#[derive(Debug)]
+struct StatusProbe {
+    /// HTTP status code, absent when the request never completed.
+    http_status: Option<u16>,
+    /// Parsed response body, absent when the response is not JSON or failed.
+    body: Option<serde_json::Value>,
+    /// Transport or parsing error, absent on a successful exchange.
+    error: Option<String>,
+}
+
+/// Calls the pipeline's `/status` endpoint once.
+///
+/// Split out from [`PipelineExecutor::check`] so that the timeout and the
+/// error-shape mapping can be tested against a local socket, without a cluster.
+async fn fetch_status(client: &reqwest::Client, url: &str) -> StatusProbe {
+    let response = match client.get(url).timeout(Duration::from_secs(5)).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return StatusProbe {
+                http_status: None,
+                body: None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+    let http_status = response.status().as_u16();
+    let body = match response.json::<serde_json::Value>().await {
+        Ok(body) => Some(body),
+        Err(error) => {
+            return StatusProbe {
+                http_status: Some(http_status),
+                body: None,
+                error: Some(format!("the response is not JSON: {error}")),
+            };
+        }
+    };
+    StatusProbe {
+        http_status: Some(http_status),
+        body,
+        error: None,
+    }
+}
+
 impl KubernetesRunner {
+    /// Follows the pod's log stream and forwards every line into the pipeline's
+    /// log buffer.
+    ///
+    /// The stream ends whenever the container restarts, so the follower starts a
+    /// new one after a short pause until it is aborted. API errors are reported
+    /// once per burst rather than once per retry, which would otherwise flood
+    /// the buffer with the same message.
+    fn spawn_log_follower(&self, client: Client, namespace: String) -> JoinHandle<()> {
+        let mut logs_sender = self.logs_sender.clone();
+        let pipeline_id = self.pipeline_id;
+        tokio::spawn(async move {
+            let pods: Api<Pod> = Api::namespaced(client, &namespace);
+            let name = pod_name(pipeline_id);
+            let mut last_error: Option<String> = None;
+            loop {
+                let params = LogParams {
+                    follow: true,
+                    ..Default::default()
+                };
+                match pods.log_stream(&name, &params).await {
+                    Ok(stream) => {
+                        last_error = None;
+                        let mut lines = stream.lines();
+                        loop {
+                            match lines.try_next().await {
+                                Ok(Some(line)) => {
+                                    logs_sender
+                                        .send(LogMessage::new_from_pipeline(&line))
+                                        .await;
+                                }
+                                Ok(None) => break,
+                                Err(error) => {
+                                    let line = format!("pod log stream ended: {error}");
+                                    if last_error.as_deref() != Some(line.as_str()) {
+                                        logs_sender
+                                            .send(LogMessage::new_from_control_plane(
+                                                module_path!(),
+                                                "runner",
+                                                String::new(),
+                                                pipeline_id.to_string(),
+                                                Level::ERROR,
+                                                &line,
+                                            ))
+                                            .await;
+                                        last_error = Some(line);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let line = format!("unable to follow the pod log stream: {error}");
+                        if last_error.as_deref() != Some(line.as_str()) {
+                            logs_sender
+                                .send(LogMessage::new_from_control_plane(
+                                    module_path!(),
+                                    "runner",
+                                    String::new(),
+                                    pipeline_id.to_string(),
+                                    Level::ERROR,
+                                    &line,
+                                ))
+                                .await;
+                            last_error = Some(line);
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        })
+    }
+
+    /// Stops forwarding pod logs.
+    fn stop_log_follower(&mut self) {
+        if let Some(task) = self.logs_task.take() {
+            task.abort();
+        }
+    }
+
     /// Patches the `StatefulSet` to zero replicas and waits until the pod is
     /// gone, so that `stop()` really blocks until compute is released.
     async fn scale_to_zero(&mut self, namespace: &str) -> Result<(), ManagerError> {
@@ -1302,7 +1554,104 @@ mod tests {
                     storage_class: config.global.resources.storage_class.clone(),
                 }),
             service_account: config.global.resources.service_account_name.clone(),
+            manager_namespace: "feldera".to_string(),
         }
+    }
+
+    #[test]
+    fn network_policy_admits_only_the_manager_namespace() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let policy = render_input(&config).render_network_policy();
+        let spec = policy.spec.expect("the policy has a spec");
+
+        assert_eq!(
+            spec.pod_selector.and_then(|selector| selector.match_labels),
+            Some(selector_labels(PipelineId(Uuid::nil())))
+        );
+        // Ingress only: source and sink traffic leaves the pod freely.
+        assert_eq!(spec.policy_types, Some(vec!["Ingress".to_string()]));
+
+        let rules = spec.ingress.expect("one ingress rule");
+        assert_eq!(rules.len(), 1);
+        let peers = rules[0].from.clone().expect("one peer");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0]
+                .namespace_selector
+                .as_ref()
+                .and_then(|selector| selector.match_labels.clone()),
+            Some(BTreeMap::from([(
+                NAMESPACE_NAME_LABEL.to_string(),
+                "feldera".to_string()
+            )]))
+        );
+        // Any pod of the manager namespace may call the pipeline port; the
+        // port is the only thing exposed.
+        assert!(peers[0].pod_selector.is_none());
+        let ports = rules[0].ports.clone().expect("one port");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, Some(IntOrString::Int(8080)));
+        assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));
+    }
+
+    #[test]
+    fn only_a_status_report_or_a_temporary_unavailability_is_healthy() {
+        assert!(status_is_healthy(200));
+        assert!(status_is_healthy(503));
+        assert!(!status_is_healthy(500));
+        assert!(!status_is_healthy(404));
+        assert!(!status_is_healthy(401));
+    }
+
+    #[tokio::test]
+    async fn fetch_status_parses_a_json_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let body = r#"{"state":"Running","num_workers":1}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let probe = fetch_status(
+            &reqwest::Client::new(),
+            &format!("http://{address}/status"),
+        )
+        .await;
+        assert_eq!(probe.http_status, Some(200));
+        assert!(probe.error.is_none(), "unexpected error: {probe:?}");
+        assert_eq!(
+            probe.body.expect("a JSON body")["state"],
+            serde_json::json!("Running")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_status_reports_an_unreachable_endpoint() {
+        // Binding and immediately dropping the listener yields a port nothing
+        // listens on, which is what a pipeline that has not bound yet looks
+        // like from the manager.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let probe = fetch_status(
+            &reqwest::Client::new(),
+            &format!("http://{address}/status"),
+        )
+        .await;
+        assert!(probe.http_status.is_none());
+        assert!(probe.body.is_none());
+        assert!(probe.error.is_some());
     }
 
     #[test]
@@ -1538,10 +1887,12 @@ mod tests {
                 kubernetes_runner_namespace: "feldera".to_string(),
                 kubernetes_runner_pipeline_executor_image: None,
                 kubernetes_runner_per_pipeline_namespace: false,
+                kubernetes_runner_manager_namespace: None,
                 kubernetes_runner_allow_kubernetes_env_prefix: false,
             },
             client: reqwest::Client::new(),
             logs_sender: logs_sender(),
+            logs_task: None,
             kubernetes: None,
         };
         assert_eq!(runner.namespace(&json!({})), "feldera");
@@ -1662,6 +2013,7 @@ mod tests {
                 "persistentvolumeclaims" => ("v1", "PersistentVolumeClaim"),
                 "namespaces" => ("v1", "Namespace"),
                 "statefulsets" => ("apps/v1", "StatefulSet"),
+                "networkpolicies" => ("networking.k8s.io/v1", "NetworkPolicy"),
                 _ => ("v1", "Unknown"),
             }
         }
@@ -1692,8 +2044,10 @@ mod tests {
             let (kind, name) = match parts.as_slice() {
                 ["api", "v1", "namespaces", _ns, kind] => (*kind, None),
                 ["api", "v1", "namespaces", _ns, kind, name] => (*kind, Some(*name)),
-                ["apis", "apps", "v1", "namespaces", _ns, kind] => (*kind, None),
-                ["apis", "apps", "v1", "namespaces", _ns, kind, name] => (*kind, Some(*name)),
+                ["apis", _group, _version, "namespaces", _ns, kind] => (*kind, None),
+                ["apis", _group, _version, "namespaces", _ns, kind, name] => {
+                    (*kind, Some(*name))
+                }
                 _ => return status(StatusCode::NOT_FOUND, "route", path),
             };
             if kind == "pods" && method == Method::GET {
@@ -1748,6 +2102,7 @@ mod tests {
             kubernetes_runner_namespace: "feldera".to_string(),
             kubernetes_runner_pipeline_executor_image: Some("example/pipeline:1".to_string()),
             kubernetes_runner_per_pipeline_namespace: false,
+            kubernetes_runner_manager_namespace: None,
             kubernetes_runner_allow_kubernetes_env_prefix: false,
         }
     }
@@ -1767,6 +2122,7 @@ mod tests {
             config: runner_config(),
             client: reqwest::Client::new(),
             logs_sender: logs_sender(),
+            logs_task: None,
             kubernetes: Some(fake_api::client(cluster.clone())),
         }
     }
@@ -1814,6 +2170,8 @@ mod tests {
             vec![
                 "/api/v1/namespaces/feldera/secrets",
                 "/api/v1/namespaces/feldera/services",
+                // The policy is in place before the pod exists.
+                "/apis/networking.k8s.io/v1/namespaces/feldera/networkpolicies",
                 "/apis/apps/v1/namespaces/feldera/statefulsets",
             ]
         );
@@ -1857,7 +2215,7 @@ mod tests {
             posted[0],
             "/api/v1/namespaces/feldera/persistentvolumeclaims"
         );
-        assert_eq!(posted.len(), 4);
+        assert_eq!(posted.len(), 5);
     }
 
     #[tokio::test]
@@ -1971,7 +2329,11 @@ mod tests {
             .check(&json!({}))
             .await
             .expect("a ready pod is healthy");
-        assert_eq!(details["restarts"], serde_json::json!(0));
+        assert_eq!(details["pod"]["restarts"], serde_json::json!(0));
+        // The probe runs against the Service DNS name, which does not resolve
+        // in a unit test: it reports the failure instead of panicking.
+        assert!(details["status_error"].is_string());
+        assert_eq!(details["http_status"], serde_json::Value::Null);
     }
 
     #[tokio::test]
