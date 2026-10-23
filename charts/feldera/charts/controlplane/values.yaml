@@ -69,6 +69,16 @@ kubernetesRunner:
   connectorKubernetesSecrets:
     enableAllowlist: false
     allowlist: []
+  template:
+    # Name of an existing ConfigMap that holds a StatefulSet template for
+    # pipeline pods (P1-011). Empty means the runner renders its built-in
+    # StatefulSet. See docs/design/p1-011-pipeline-template.md for the
+    # placeholder reference and an example template.
+    configMap: ""
+    # Key of the template inside that ConfigMap.
+    key: pipelineTemplate
+    # Namespace of the ConfigMap; empty means the release namespace.
+    namespace: ""
 
 compilerPvcStorageSize: 20Gi
 compilationProfile: optimized

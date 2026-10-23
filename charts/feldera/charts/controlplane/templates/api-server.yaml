@@ -79,6 +79,19 @@ spec:
             {{- if .Values.kubernetesRunner.allowCustomPipelineTemplate }}
             - "--kubernetes-runner-allow-kubernetes-env-prefix=true"
             {{- end }}
+            # Resource range of the platform; the runner clamps every pipeline
+            # request into it (P1-011).
+            - "--kubernetes-runner-lower-memory-mb={{ .Values.kubernetesRunner.lowerLimitMemoryMegabyte }}"
+            - "--kubernetes-runner-upper-memory-mb={{ .Values.kubernetesRunner.upperLimitMemoryMegabyte }}"
+            - "--kubernetes-runner-default-storage-mb={{ .Values.kubernetesRunner.defaultStorageMegabyte }}"
+            - "--kubernetes-runner-upper-storage-mb={{ .Values.kubernetesRunner.upperLimitStorageMegabyte }}"
+            {{- with .Values.kubernetesRunner.template.configMap }}
+            - "--kubernetes-runner-template-configmap={{ . }}"
+            - "--kubernetes-runner-template-key={{ $.Values.kubernetesRunner.template.key }}"
+            {{- with $.Values.kubernetesRunner.template.namespace }}
+            - "--kubernetes-runner-template-namespace={{ . }}"
+            {{- end }}
+            {{- end }}
             {{- end }}
           ports:
             - name: http

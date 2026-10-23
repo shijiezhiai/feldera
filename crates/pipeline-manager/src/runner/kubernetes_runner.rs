@@ -58,7 +58,8 @@ use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource, ObjectFieldSelector,
+    ConfigMap, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
+    ObjectFieldSelector,
     PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod,
     PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, Secret, SecretVolumeSource,
     Service, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
@@ -110,10 +111,6 @@ const STORAGE_MOUNT_BASE: &str = "/var/feldera/storage";
 /// Entrypoint the pipeline executor image must provide. It downloads (or
 /// locates) the program binary and `exec`s it with the arguments passed here.
 const PIPELINE_ENTRYPOINT: &str = "/usr/local/bin/pipeline-entrypoint";
-
-/// Storage reserved when the runtime configuration requests none, matching the
-/// documented default of 30 GiB.
-const DEFAULT_STORAGE_MB: u64 = 30 * 1024;
 
 /// Name of the dry-run Secret that `can_provision` sends to check that the
 /// runner may deploy into the namespace. It is never persisted.
@@ -211,23 +208,78 @@ fn mebibyte_quantity(mb: u64) -> Quantity {
     Quantity(format!("{mb}Mi"))
 }
 
-/// Storage requested for the pipeline's claim, in MiB.
+/// The platform limits applied to what one pipeline may request.
 ///
-/// `storage_mb_max` wins because it is the ceiling of an autoscaling claim;
-/// without any size the documented default applies.
-fn storage_mb(config: &PipelineConfig) -> u64 {
-    let resources = &config.global.resources;
-    resources
-        .storage_mb_max
-        .or(resources.storage_mb_min)
-        .unwrap_or(DEFAULT_STORAGE_MB)
+/// They mirror the `kubernetesRunner` section of the Helm chart
+/// (`lowerLimitMemoryMegabyte`, `upperLimitMemoryMegabyte`,
+/// `defaultStorageMegabyte`, `upperLimitStorageMegabyte`), so an operator
+/// changes the range by changing chart values, not by rebuilding the manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Smallest memory the platform provisions, in MB.
+    ///
+    /// Below this a container is killed before its runtime finishes starting.
+    pub memory_mb_min: u64,
+    /// Largest memory the platform provisions, in MB.
+    pub memory_mb_max: u64,
+    /// Storage a pipeline gets when it asks for none, in MB.
+    pub storage_mb_default: u64,
+    /// Largest storage claim the platform provisions, in MB.
+    pub storage_mb_max: u64,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            memory_mb_min: 100,
+            memory_mb_max: 32_000,
+            storage_mb_default: 30_000,
+            storage_mb_max: 128_000,
+        }
+    }
+}
+
+impl ResourceLimits {
+    /// Caps a requested memory quantity to the range the platform provisions.
+    ///
+    /// The clamp applies to what the user asked for, not to the derived
+    /// container limit, so a request of 1 MB becomes the lower limit and a
+    /// request of a terabyte becomes the upper limit.
+    pub fn clamp_memory(&self, mb: u64) -> u64 {
+        mb.clamp(self.memory_mb_min, self.memory_mb_max)
+    }
+
+    /// Caps a requested storage size to the platform's ceiling.
+    pub fn clamp_storage(&self, mb: u64) -> u64 {
+        mb.min(self.storage_mb_max)
+    }
+
+    /// Reads the range the deployment configured in the chart values.
+    fn from_config(config: &KubernetesRunnerConfig) -> Self {
+        Self {
+            memory_mb_min: config.kubernetes_runner_lower_memory_mb,
+            memory_mb_max: config.kubernetes_runner_upper_memory_mb,
+            storage_mb_default: config.kubernetes_runner_default_storage_mb,
+            storage_mb_max: config.kubernetes_runner_upper_storage_mb,
+        }
+    }
+
+    /// Storage requested by a pipeline, in MB, with the default applied.
+    pub fn storage_for(&self, config: &PipelineConfig) -> u64 {
+        let resources = &config.global.resources;
+        let requested = resources
+            .storage_mb_max
+            .or(resources.storage_mb_min)
+            .unwrap_or(self.storage_mb_default);
+        self.clamp_storage(requested)
+    }
 }
 
 /// Maps the runtime configuration's resource requests onto pod resources.
 ///
 /// Zero quantities are dropped: a `cpu: "0"` request is legal but meaningless,
 /// and it hides the fact that the user never asked for a reservation.
-fn pod_resources(config: &PipelineConfig) -> ResourceRequirements {
+fn pod_resources(config: &PipelineConfig, platform: ResourceLimits) -> ResourceRequirements {
     let resources = &config.global.resources;
     let mut requests = BTreeMap::new();
     let mut limits = BTreeMap::new();
@@ -235,13 +287,14 @@ fn pod_resources(config: &PipelineConfig) -> ResourceRequirements {
         requests.insert("cpu".to_string(), cpu_quantity(cores));
     }
     if let Some(mb) = resources.memory_mb_min.filter(|mb| *mb > 0) {
-        requests.insert("memory".to_string(), mebibyte_quantity(mb));
+        requests.insert("memory".to_string(), mebibyte_quantity(platform.clamp_memory(mb)));
     }
     if let Some(cores) = resources.cpu_cores_max.filter(|cores| *cores > 0.0) {
         limits.insert("cpu".to_string(), cpu_quantity(cores));
     }
     if let Some(mb) = resources.memory_mb_max.filter(|mb| *mb > 0) {
-        limits.insert("memory".to_string(), mebibyte_quantity(memory_limit_mb(mb)));
+        let limit = memory_limit_mb(platform.clamp_memory(mb)).min(platform.memory_mb_max);
+        limits.insert("memory".to_string(), mebibyte_quantity(limit));
     }
     ResourceRequirements {
         requests: (!requests.is_empty()).then_some(requests),
@@ -264,6 +317,69 @@ const MIN_MEMORY_HEADROOM_MB: u64 = 256;
 fn memory_limit_mb(max_rss_mb: u64) -> u64 {
     let headroom = ((max_rss_mb as f64) * 0.25).ceil() as u64;
     max_rss_mb + headroom.max(MIN_MEMORY_HEADROOM_MB)
+}
+
+/// Placeholder values the runner substitutes into a StatefulSet template.
+///
+/// The names match the ones the pipeline template documentation lists, so a
+/// template written against the documented set needs no translation.
+struct TemplateValues<'a> {
+    /// Kubernetes name of the pipeline, used for object names and labels.
+    id: &'a str,
+    /// Namespace the pipeline runs in.
+    namespace: &'a str,
+    /// Image of the pipeline executor.
+    image: &'a str,
+    /// URL the entrypoint downloads the program binary from.
+    binary_ref: &'a str,
+    /// URL of the program information document.
+    program_info_ref: &'a str,
+    /// Mount path of the pipeline's storage, if it has any.
+    pipeline_storage_path: &'a str,
+    /// Storage class of the pipeline's claim, if it has any.
+    storage_class_name: &'a str,
+    /// UUID of this deployment.
+    deployment_id: &'a str,
+    /// Initial runtime status, as the pipeline CLI spells it.
+    deployment_initial: &'a str,
+    /// Bootstrap policy, or the empty string when there is none.
+    bootstrap_policy: &'a str,
+}
+
+impl TemplateValues<'_> {
+    /// The placeholder/value pairs, in the order the documentation lists them.
+    fn pairs(&self) -> [(&'static str, &str); 11] {
+        [
+            ("{id}", self.id),
+            ("{namespace}", self.namespace),
+            ("{pipeline_executor_image}", self.image),
+            ("{binary_ref}", self.binary_ref),
+            ("{program_info_ref}", self.program_info_ref),
+            ("{pipeline_storage_path}", self.pipeline_storage_path),
+            ("{storage_class_name}", self.storage_class_name),
+            ("{deployment_id}", self.deployment_id),
+            ("{deployment_initial}", self.deployment_initial),
+            ("{bootstrap_policy}", self.bootstrap_policy),
+            // Belt and braces: a template that adds a trailing slash, or a
+            // manifest written by an operator who read the placeholder as
+            // `{storage_class}`, still renders.
+            ("{storage_class}", self.storage_class_name),
+        ]
+    }
+}
+
+/// Replaces the documented placeholders in a StatefulSet template.
+///
+/// Substitution is plain string replacement, as the documentation promises:
+/// a placeholder in a comment is replaced too, and an unknown `{name}` is left
+/// alone so that the YAML parser reports where it is instead of the runner
+/// silently dropping it.
+fn substitute_placeholders(template: &str, values: &TemplateValues<'_>) -> String {
+    let mut rendered = template.to_string();
+    for (placeholder, value) in values.pairs() {
+        rendered = rendered.replace(placeholder, value);
+    }
+    rendered
 }
 
 /// A storage request for one pipeline.
@@ -735,6 +851,9 @@ pub struct KubernetesRunner {
     logs_sender: LogsSender,
     /// Task that follows the pod's log stream; aborted when the pipeline stops.
     logs_task: Option<JoinHandle<()>>,
+    /// The platform's resource range, read from the chart values through the
+    /// manager configuration.
+    limits: ResourceLimits,
     /// Lazily initialized API client: it validates the credentials before any
     /// resource is touched, and its construction is fallible.
     kubernetes: Option<Client>,
@@ -858,7 +977,7 @@ impl KubernetesRunner {
             .as_ref()
             .map(|storage_config| StorageRequest {
                 mount_path: storage_config.path.clone(),
-                size_mb: storage_mb(config),
+                size_mb: self.limits.storage_for(config),
                 storage_class: config.global.resources.storage_class.clone(),
             });
         RenderInput {
@@ -869,7 +988,7 @@ impl KubernetesRunner {
             config_yaml,
             args,
             env,
-            resources: pod_resources(config),
+            resources: pod_resources(config, self.limits),
             storage,
             service_account: config.global.resources.service_account_name.clone(),
             manager_namespace: self
@@ -940,6 +1059,85 @@ impl KubernetesRunner {
             .into()),
         }
     }
+
+    /// Renders the StatefulSet from the operator-supplied template.
+    ///
+    /// The template lives in a ConfigMap so that an operator can change the pod
+    /// shape without rebuilding the manager. Everything that identifies the
+    /// object (name and namespace) is set here rather than taken from the
+    /// template, because the runner looks the StatefulSet up by that name when
+    /// it stops or scales the pipeline.
+    async fn render_from_template(
+        &self,
+        client: &Client,
+        configmap_name: &str,
+        pipeline_namespace: &str,
+        values: &TemplateValues<'_>,
+    ) -> Result<StatefulSet, ManagerError> {
+        let namespace = self
+            .config
+            .kubernetes_runner_template_namespace
+            .clone()
+            .unwrap_or_else(|| pipeline_namespace.to_string());
+        let key = &self.config.kubernetes_runner_template_key;
+        let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
+        let configmap = configmaps.get(configmap_name).await.map_err(|error| {
+            RunnerError::RunnerProvisionError {
+                error: format!(
+                    "unable to read the pipeline template ConfigMap '{namespace}/{configmap_name}':                      {error} (the runner's Role needs 'get' on configmaps)"
+                ),
+            }
+        })?;
+        let template = configmap
+            .data
+            .as_ref()
+            .and_then(|data| data.get(key))
+            .ok_or_else(|| RunnerError::RunnerProvisionError {
+                error: format!(
+                    "the template ConfigMap '{namespace}/{configmap_name}' has no '{key}' entry:                      set --kubernetes-runner-template-key to the entry that holds the template"
+                ),
+            })?
+            .clone();
+
+        let rendered = substitute_placeholders(&template, values);
+        let mut statefulset: StatefulSet =
+            serde_yaml::from_str(&rendered).map_err(|error| {
+                RunnerError::RunnerProvisionError {
+                    error: format!(
+                        "the pipeline template in '{namespace}/{configmap_name}' is not a valid                          StatefulSet after placeholder substitution: {error}"
+                    ),
+                }
+            })?;
+        // The manager owns the identity of the pipeline pod, not the template.
+        // A template that spelled its own selector labels would leave the
+        // headless Service without endpoints — the placeholder set carries no
+        // bare pipeline UUID, so it could not even spell them correctly — and a
+        // template that named its own object would escape the runner's
+        // lifecycle. Both are overwritten here instead of being validated,
+        // because a working pipeline beats a rejected template.
+        let name = resource_base(self.pipeline_id);
+        let selectors = selector_labels(self.pipeline_id);
+        let spec = statefulset
+            .spec
+            .as_mut()
+            .ok_or_else(|| RunnerError::RunnerProvisionError {
+                error: format!(
+                    "the pipeline template in '{namespace}/{configmap_name}' has no spec:                      a StatefulSet template must describe the pod it runs"
+                ),
+            })?;
+        statefulset.metadata.name = Some(name.clone());
+        statefulset.metadata.namespace = Some(pipeline_namespace.to_string());
+        spec.service_name = Some(name);
+        spec.selector.match_labels = Some(selectors.clone());
+        let pod_labels = spec
+            .template
+            .metadata
+            .get_or_insert_with(Default::default)
+            .labels
+            .get_or_insert_with(Default::default);
+        pod_labels.extend(selectors);
+        Ok(statefulset)
+    }
 }
 
 #[async_trait]
@@ -955,6 +1153,7 @@ impl PipelineExecutor for KubernetesRunner {
         client: reqwest::Client,
         logs_sender: LogsSender,
     ) -> Self {
+        let limits = ResourceLimits::from_config(&config);
         Self {
             pipeline_id,
             common_config,
@@ -962,6 +1161,7 @@ impl PipelineExecutor for KubernetesRunner {
             client,
             logs_sender,
             logs_task: None,
+            limits,
             kubernetes: None,
         }
     }
@@ -1045,7 +1245,7 @@ impl PipelineExecutor for KubernetesRunner {
         deployment_config: &PipelineConfig,
         program_info: &serde_json::Value,
         program_binary_url: &str,
-        _program_info_url: &str,
+        program_info_url: &str,
         _program_version: Version,
         runtime_config: &serde_json::Value,
         is_gen2: bool,
@@ -1120,7 +1320,7 @@ impl PipelineExecutor for KubernetesRunner {
         let input = self.render(
             *deployment_id,
             &namespace,
-            image,
+            image.clone(),
             &config,
             config_yaml,
             args,
@@ -1128,6 +1328,44 @@ impl PipelineExecutor for KubernetesRunner {
             Some(program_binary_url),
         );
         let objects = input.render();
+
+        // Resolve the template before the first object is applied: a broken or
+        // missing template then fails provisioning while nothing has been
+        // created, instead of leaving a claim and a service behind.
+        let statefulset_name = resource_base(self.pipeline_id);
+        let statefulset = match self.config.kubernetes_runner_template_configmap.clone() {
+            None => objects.statefulset.clone(),
+            Some(configmap_name) => {
+                let initial = runtime_desired_status_to_string(deployment_initial);
+                let bootstrap_policy = bootstrap_config
+                    .map(|config| bootstrap_policy_to_string(config.active_bootstrap_policy()))
+                    .unwrap_or_default();
+                let deployment_id = deployment_id.to_string();
+                let values = TemplateValues {
+                    id: &statefulset_name,
+                    namespace: &namespace,
+                    image: &image,
+                    binary_ref: program_binary_url,
+                    program_info_ref: program_info_url,
+                    pipeline_storage_path: input
+                        .storage
+                        .as_ref()
+                        .map(|storage| storage.mount_path.as_str())
+                        .unwrap_or(""),
+                    storage_class_name: config
+                        .global
+                        .resources
+                        .storage_class
+                        .as_deref()
+                        .unwrap_or(""),
+                    deployment_id: &deployment_id,
+                    deployment_initial: &initial,
+                    bootstrap_policy: &bootstrap_policy,
+                };
+                self.render_from_template(&client, &configmap_name, &namespace, &values)
+                    .await?
+            }
+        };
 
         // Storage first: the pod cannot start without its claim.
         let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
@@ -1153,8 +1391,7 @@ impl PipelineExecutor for KubernetesRunner {
             .await?;
 
         let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &namespace);
-        let statefulset_name = resource_base(self.pipeline_id);
-        self.apply(&statefulsets, &statefulset_name, &objects.statefulset)
+        self.apply(&statefulsets, &statefulset_name, &statefulset)
             .await?;
 
         // Follow the pod's log stream from now on. The task ends when it is
@@ -1544,13 +1781,13 @@ mod tests {
             config_yaml: yaml,
             args: program_args(deployment_id, RuntimeDesiredStatus::Paused, None),
             env: platform_env(config),
-            resources: pod_resources(config),
+            resources: pod_resources(config, ResourceLimits::default()),
             storage: config
                 .storage_config
                 .as_ref()
                 .map(|storage| StorageRequest {
                     mount_path: storage.path.clone(),
-                    size_mb: storage_mb(config),
+                    size_mb: ResourceLimits::default().storage_for(config),
                     storage_class: config.global.resources.storage_class.clone(),
                 }),
             service_account: config.global.resources.service_account_name.clone(),
@@ -1592,6 +1829,158 @@ mod tests {
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, Some(IntOrString::Int(8080)));
         assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));
+    }
+
+    #[test]
+    fn placeholders_are_replaced_and_unknown_braces_are_left_alone() {
+        let values = TemplateValues {
+            id: "pipeline-abc",
+            namespace: "feldera",
+            image: "example/pipeline:1",
+            binary_ref: "http://compiler/binary/abc",
+            program_info_ref: "http://compiler/program_info/abc",
+            pipeline_storage_path: "/var/feldera/storage",
+            storage_class_name: "standard",
+            deployment_id: "0190f4d0-0000-7000-8000-000000000000",
+            deployment_initial: "running",
+            bootstrap_policy: "await_approval",
+        };
+        let template = concat!(
+            "id: {id}\n",
+            "namespace: {namespace}\n",
+            "image: {pipeline_executor_image}\n",
+            "binary: {binary_ref}\n",
+            "program_info: {program_info_ref}\n",
+            "storage: {pipeline_storage_path}\n",
+            "class: {storage_class_name}\n",
+            "deployment: {deployment_id}\n",
+            "initial: {deployment_initial}\n",
+            "bootstrap: {bootstrap_policy}\n",
+            "unknown: {not_a_placeholder}\n",
+        );
+        let rendered = substitute_placeholders(template, &values);
+        for (placeholder, value) in values.pairs() {
+            assert!(
+                !rendered.contains(placeholder),
+                "the rendered template still contains {placeholder}"
+            );
+            assert!(
+                rendered.contains(value),
+                "the rendered template lost the value {value}"
+            );
+        }
+        assert!(rendered.contains("{not_a_placeholder}"));
+    }
+
+    #[tokio::test]
+    async fn a_template_configmap_provides_the_statefulset() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let template = concat!(
+            "apiVersion: apps/v1\n",
+            "kind: StatefulSet\n",
+            "metadata:\n",
+            "  name: from-the-template\n",
+            "spec:\n",
+            "  serviceName: {id}\n",
+            "  replicas: 1\n",
+            "  selector:\n",
+            "    matchLabels:\n",
+            "      app: {id}\n",
+            "  template:\n",
+            "    metadata:\n",
+            "      labels:\n",
+            "        app: {id}\n",
+            "    spec:\n",
+            "      containers:\n",
+            "        - name: pipeline\n",
+            "          image: {pipeline_executor_image}\n",
+            "          args: [\"{deployment_initial}\"]\n",
+        );
+        *cluster.configmap.lock().unwrap() = Some(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "pipelines", "namespace": "feldera"},
+            "data": {"pipelineTemplate": template},
+        }));
+        let mut runner = fake_runner(&cluster);
+        runner.config.kubernetes_runner_template_configmap = Some("pipelines".to_string());
+
+        let values = TemplateValues {
+            id: &resource_base(runner.pipeline_id),
+            namespace: "feldera",
+            image: "example/pipeline:1",
+            binary_ref: "http://compiler/binary/abc",
+            program_info_ref: "http://compiler/program_info/abc",
+            pipeline_storage_path: "",
+            storage_class_name: "",
+            deployment_id: "0190f4d0-0000-7000-8000-000000000000",
+            deployment_initial: "running",
+            bootstrap_policy: "",
+        };
+        let statefulset = runner
+            .render_from_template(&fake_api::client(cluster.clone()), "pipelines", "feldera", &values)
+            .await
+            .expect("the template renders");
+
+        // The runner keeps its own name, because it looks the object up by it.
+        assert_eq!(
+            statefulset.metadata.name,
+            Some(resource_base(runner.pipeline_id))
+        );
+        assert_eq!(statefulset.metadata.namespace.as_deref(), Some("feldera"));
+        let spec = statefulset.spec.expect("a spec");
+        assert_eq!(
+            spec.service_name,
+            Some(resource_base(runner.pipeline_id)),
+            "the {{id}} placeholder must be substituted"
+        );
+        // The identity the runner relies on is the manager's, not the
+        // template's: the Service selects the pod by these labels, so a template
+        // that spelled its own would leave the pipeline unreachable.
+        assert_eq!(
+            spec.selector.match_labels,
+            Some(selector_labels(runner.pipeline_id))
+        );
+        let pod_labels = spec
+            .template
+            .metadata
+            .expect("pod metadata")
+            .labels
+            .expect("pod labels");
+        for (label, value) in selector_labels(runner.pipeline_id) {
+            assert_eq!(pod_labels.get(&label), Some(&value), "label {label}");
+        }
+        let container = &spec.template.spec.expect("a pod spec").containers[0];
+        assert_eq!(container.image.as_deref(), Some("example/pipeline:1"));
+        assert_eq!(
+            container.args,
+            Some(vec!["running".to_string()]),
+            "the {{deployment_initial}} placeholder must be substituted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_template_configmap_fails_provisioning() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        runner.config.kubernetes_runner_template_configmap = Some("pipelines".to_string());
+        let values = TemplateValues {
+            id: "pipeline-abc",
+            namespace: "feldera",
+            image: "example/pipeline:1",
+            binary_ref: "",
+            program_info_ref: "",
+            pipeline_storage_path: "",
+            storage_class_name: "",
+            deployment_id: "0190f4d0-0000-7000-8000-000000000000",
+            deployment_initial: "running",
+            bootstrap_policy: "",
+        };
+        let error = runner
+            .render_from_template(&fake_api::client(cluster.clone()), "pipelines", "feldera", &values)
+            .await
+            .expect_err("a missing ConfigMap is a provisioning error");
+        assert!(error.to_string().contains("pipelines"), "unexpected: {error}");
     }
 
     #[test]
@@ -1737,7 +2126,7 @@ mod tests {
         let requests = claim_spec.resources.unwrap().requests.unwrap();
         assert_eq!(
             requests.get("storage").map(|quantity| quantity.0.clone()),
-            Some(format!("{DEFAULT_STORAGE_MB}Mi"))
+            Some(format!("{}Mi", ResourceLimits::default().storage_mb_default))
         );
         // The pod mounts the claim at the path the storage config points at.
         let pod_spec = input
@@ -1767,7 +2156,7 @@ mod tests {
             memory_mb_max: None,
             ..ResourceConfig::default()
         };
-        let requirements = pod_resources(&pipeline_config(resources, &[]));
+        let requirements = pod_resources(&pipeline_config(resources, &[]), ResourceLimits::default());
         assert!(requirements.limits.is_none());
     }
 
@@ -1780,7 +2169,7 @@ mod tests {
             memory_mb_max: Some(1024),
             ..ResourceConfig::default()
         };
-        let requirements = pod_resources(&pipeline_config(resources, &[]));
+        let requirements = pod_resources(&pipeline_config(resources, &[]), ResourceLimits::default());
         let requests = requirements.requests.unwrap_or_default();
         assert!(!requests.contains_key("cpu"), "a zero CPU request is noise");
         assert!(!requests.contains_key("memory"));
@@ -1889,10 +2278,18 @@ mod tests {
                 kubernetes_runner_per_pipeline_namespace: false,
                 kubernetes_runner_manager_namespace: None,
                 kubernetes_runner_allow_kubernetes_env_prefix: false,
+                kubernetes_runner_template_configmap: None,
+                kubernetes_runner_template_key: "pipelineTemplate".to_string(),
+                kubernetes_runner_template_namespace: None,
+                kubernetes_runner_lower_memory_mb: 100,
+                kubernetes_runner_upper_memory_mb: 32_000,
+                kubernetes_runner_default_storage_mb: 30_000,
+                kubernetes_runner_upper_storage_mb: 128_000,
             },
             client: reqwest::Client::new(),
             logs_sender: logs_sender(),
             logs_task: None,
+            limits: ResourceLimits::default(),
             kubernetes: None,
         };
         assert_eq!(runner.namespace(&json!({})), "feldera");
@@ -1904,6 +2301,72 @@ mod tests {
             runner.location("tenant-a"),
             "pipeline-00000000-0000-0000-0000-000000000000.tenant-a.svc.cluster.local:8080"
         );
+    }
+
+    /// Property tests: the DoD of P1-011 asks for them, because the interesting
+    /// inputs are the arbitrary numbers a user can put in a resource request.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn a_memory_request_is_clamped_into_the_platform_range(mb in 0u64..200_000) {
+                let limits = ResourceLimits::default();
+                let clamped = limits.clamp_memory(mb);
+                prop_assert!(clamped >= limits.memory_mb_min);
+                prop_assert!(clamped <= limits.memory_mb_max);
+                // Clamping is idempotent: the platform never re-clamps a value
+                // it produced.
+                prop_assert_eq!(limits.clamp_memory(clamped), clamped);
+            }
+
+            #[test]
+            fn the_container_limit_never_falls_below_the_budget(mb in 1u64..200_000) {
+                let limits = ResourceLimits::default();
+                let budget = limits.clamp_memory(mb);
+                let limit = memory_limit_mb(budget).min(limits.memory_mb_max);
+                // A limit below the budget is an OOM kill waiting for the
+                // pipeline to reach its own ceiling.
+                prop_assert!(limit >= budget);
+            }
+
+            #[test]
+            fn a_storage_request_never_exceeds_the_platform_ceiling(mb in 0u64..1_000_000) {
+                let limits = ResourceLimits::default();
+                let clamped = limits.clamp_storage(mb);
+                prop_assert!(clamped <= limits.storage_mb_max);
+                prop_assert_eq!(limits.clamp_storage(clamped), clamped);
+            }
+
+            #[test]
+            fn placeholder_substitution_consumes_every_known_placeholder(
+                id in "[a-z0-9-]{1,40}",
+                namespace in "[a-z0-9-]{1,20}",
+            ) {
+                let template = "{id}|{namespace}|{pipeline_executor_image}|{binary_ref}|{program_info_ref}|{pipeline_storage_path}|{storage_class_name}|{deployment_id}|{deployment_initial}|{bootstrap_policy}|{storage_class}";
+                let values = TemplateValues {
+                    id: &id,
+                    namespace: &namespace,
+                    image: "example/pipeline:1",
+                    binary_ref: "http://compiler/binary",
+                    program_info_ref: "http://compiler/program_info",
+                    pipeline_storage_path: "/var/feldera/storage",
+                    storage_class_name: "standard",
+                    deployment_id: "00000000-0000-0000-0000-000000000001",
+                    deployment_initial: "paused",
+                    bootstrap_policy: "await_approval",
+                };
+                let rendered = substitute_placeholders(template, &values);
+                for (placeholder, _) in values.pairs() {
+                    prop_assert!(
+                        !rendered.contains(placeholder),
+                        "the substitution left {placeholder} in {rendered}"
+                    );
+                }
+                prop_assert!(rendered.starts_with(id.as_str()));
+            }
+        }
     }
 
     #[test]
@@ -1938,6 +2401,8 @@ mod tests {
             /// The pod's JSON, or `None` when it does not exist.
             pub pod: Arc<Mutex<Option<serde_json::Value>>>,
             pub namespace_exists: Arc<Mutex<bool>>,
+            /// The template ConfigMap's JSON, or `None` when it does not exist.
+            pub configmap: Arc<Mutex<Option<serde_json::Value>>>,
         }
 
         impl FakeCluster {
@@ -2012,6 +2477,7 @@ mod tests {
                 "services" => ("v1", "Service"),
                 "persistentvolumeclaims" => ("v1", "PersistentVolumeClaim"),
                 "namespaces" => ("v1", "Namespace"),
+                "configmaps" => ("v1", "ConfigMap"),
                 "statefulsets" => ("apps/v1", "StatefulSet"),
                 "networkpolicies" => ("networking.k8s.io/v1", "NetworkPolicy"),
                 _ => ("v1", "Unknown"),
@@ -2050,6 +2516,12 @@ mod tests {
                 }
                 _ => return status(StatusCode::NOT_FOUND, "route", path),
             };
+            if kind == "configmaps" && method == Method::GET {
+                return match cluster.configmap.lock().unwrap().clone() {
+                    Some(configmap) => json(configmap),
+                    None => status(StatusCode::NOT_FOUND, kind, name.unwrap_or("")),
+                };
+            }
             if kind == "pods" && method == Method::GET {
                 return match cluster.pod.lock().unwrap().clone() {
                     Some(pod) => json(pod),
@@ -2104,6 +2576,13 @@ mod tests {
             kubernetes_runner_per_pipeline_namespace: false,
             kubernetes_runner_manager_namespace: None,
             kubernetes_runner_allow_kubernetes_env_prefix: false,
+            kubernetes_runner_template_configmap: None,
+            kubernetes_runner_template_key: "pipelineTemplate".to_string(),
+            kubernetes_runner_template_namespace: None,
+            kubernetes_runner_lower_memory_mb: 100,
+            kubernetes_runner_upper_memory_mb: 32_000,
+            kubernetes_runner_default_storage_mb: 30_000,
+            kubernetes_runner_upper_storage_mb: 128_000,
         }
     }
 
@@ -2123,6 +2602,7 @@ mod tests {
             client: reqwest::Client::new(),
             logs_sender: logs_sender(),
             logs_task: None,
+            limits: ResourceLimits::default(),
             kubernetes: Some(fake_api::client(cluster.clone())),
         }
     }

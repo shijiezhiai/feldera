@@ -194,3 +194,19 @@ e2e 侧的三条：
 - **follow pod 日志需要 `pods/log` 权限**：只给 `pods` 的 Role 会让
   `log_stream` 报 403，而这条错误只出现在 manager 自己的日志里（pipeline 照跑），
   所以 e2e 必须反过来断言「pipeline 自己打印的行出现在 log API 里」才抓得到。
+
+## 第三轮：模板渲染（P1-011）
+
+- **StatefulSet 的 selector 不可变**：改了模板里的 selector 标签后，对已存在的
+  STS 做 merge patch 会被 API server 拒（`unable to patch ...: ApiError`），
+  provision 每次重试都失败。迭代期把旧 STS 删掉再起，或者先 `clear()`。
+- **模板必须自带 `--deployment-id`**：pipeline 二进制的 CLI 把它列为必需参数，
+  模板漏了就是 pod 启动即退出（`the following required arguments were not
+  provided: --deployment-id`），表现为 CrashLoopBackOff。
+- **selector 标签只能由 manager 写**：占位符集合里没有裸 pipeline UUID，模板
+  无法拼出 `app.kubernetes.io/instance=<uuid>`，于是 Service 没有 endpoint、
+  pipeline 一直 `Unavailable`。现在 manager 直接覆盖 `name`/`serviceName`/
+  selector，并把 selector 标签并入 pod labels。
+- **有 storage 的 pipeline 必须有可写的 `{pipeline_storage_path}`**：K8s runner
+  总是给 pipeline 一个 storage 路径，模板不挂 claim 就是
+  `create failed: entity not found` + `recursive mkdir failed: permission denied`。
