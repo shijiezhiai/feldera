@@ -283,3 +283,16 @@ INTERNALERROR 退出**（`PluginValidationError: unknown hook 'pytest_configure_
 时对 `fault_tolerance.is_enabled()` 直接返回 `ValidationError::EnterpriseFeature`；没有
 FT 就没有 checkpoint 快照，PVC 上只有 spill / checkpoint 文件，启动不从它们恢复。
 套件因此断言"重启后计数为 0"并把 claim 的 UID 不变作为"卷被复用而非重建"的证据。
+
+## P1-013 — Kubernetes 生命周期 e2e（2026-10-23）
+
+| 项 | 结果 |
+|---|---|
+| 两个用例（暖缓存） | 2 passed / 84.66s，复跑 87.69s |
+| 五十轮 flaky 复跑 | **50 pass / 0 fail**，4300s（每轮约 86s） |
+| 冷编译 | ~20 分钟（首次，集群内编译缓存为空） |
+| 暖编译 | 12.1s |
+| 启动 / 停止 | 7.6–8.6s / 11.8–12.2s |
+
+修的两处真问题：`pipeline.id` 是方法不是 property；`unique_pipeline_name()`
+在本地无 `GITHUB_SHA` 时前缀恒为 `local`，50 轮会撞名，套件自带随机后缀。
