@@ -5,7 +5,8 @@
 #   keygen            生成自托管 cosign 密钥对（私钥不进 git，见 deploy/security/keys/）
 #   sign  IMAGE...    cosign 签名（key-based，离线，不传 Rekor）
 #   verify IMAGE...   cosign 验签；未签名/签名不匹配 -> 非零退出
-#   scan  IMAGE...    trivy 扫描，报告写到 deploy/security/reports/<name>.json
+#   scan  IMAGE...    trivy 扫描（OS 包 + 语言包，含 Java jar），报告写到 deploy/security/reports/<name>.json
+#   java-db           把 trivy 的 Java 索引下载到本地缓存（可断点续传）
 #   gate  IMAGE...    扫描 + 按 allowlist 判定，未豁免的 CRITICAL/HIGH -> 非零退出
 #   summary           打印已有报告的汇总表
 #
@@ -17,6 +18,8 @@
 #   FAIL_ON                默认 "CRITICAL,HIGH"
 #   ALLOWLIST              默认 deploy/security/vulnerability-allowlist.json
 #   INSECURE_REGISTRY=1    本地 http 制品库，给 cosign 加 --allow-insecure-registry
+#   SCAN_PKG_TYPES         trivy --pkg-types，默认 "os,library"（library 才会扫 jar）
+#   SKIP_ECOSYSTEMS        gate 不判定、只计数的生态，默认 "cargo"（见 gate.py）
 
 set -euo pipefail
 
@@ -27,6 +30,10 @@ COSIGN_KEY="${COSIGN_KEY:-${SEC_DIR}/keys/cosign.key}"
 COSIGN_PUB="${COSIGN_PUB:-${SEC_DIR}/cosign.pub}"
 FAIL_ON="${FAIL_ON:-CRITICAL,HIGH}"
 ALLOWLIST="${ALLOWLIST:-${SEC_DIR}/vulnerability-allowlist.json}"
+
+SCAN_PKG_TYPES="${SCAN_PKG_TYPES:-os,library}"
+SKIP_ECOSYSTEMS="${SKIP_ECOSYSTEMS:-cargo}"
+TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR:-${HOME}/.cache/trivy}"
 
 REPORTS_DIR="${SEC_DIR}/reports"
 
@@ -104,12 +111,27 @@ cmd_scan() {
   require_trivy
   [ "$#" -gt 0 ] || die "用法：supply-chain.sh scan IMAGE..."
   mkdir -p "${REPORTS_DIR}"
+
+  # Only skip the Java index update when it is already on disk: trivy needs the
+  # index to scan the compiler jar, and downloading it on demand is exactly what
+  # fails on a slow link (see fetch-java-db.sh).
+  local java_args=()
+  if [ -e "${TRIVY_CACHE_DIR}/java-db/trivy-java.db" ]; then
+    java_args+=(--skip-java-db-update)
+  fi
+
   for image in "$@"; do
     local report="${REPORTS_DIR}/$(image_to_report "${image}").json"
     note "扫描 ${image} -> ${report}"
     trivy image --quiet --scanners vuln --format json --output "${report}" \
+      --pkg-types "${SCAN_PKG_TYPES}" "${java_args[@]}" \
       --severity "${FAIL_ON}" --timeout 20m "${image}"
   done
+}
+
+cmd_java_db() {
+  note "下载 trivy Java 索引到 ${TRIVY_CACHE_DIR}/java-db"
+  bash "${SEC_DIR}/fetch-java-db.sh"
 }
 
 cmd_gate() {
@@ -121,7 +143,8 @@ cmd_gate() {
     reports+=("${REPORTS_DIR}/$(image_to_report "${image}").json")
   done
   python3 "${SEC_DIR}/gate.py" \
-    --allowlist "${ALLOWLIST}" --fail-on "${FAIL_ON}" "${reports[@]}"
+    --allowlist "${ALLOWLIST}" --fail-on "${FAIL_ON}" \
+    --skip-ecosystems "${SKIP_ECOSYSTEMS}" "${reports[@]}"
 }
 
 cmd_summary() {
@@ -137,9 +160,10 @@ main() {
     sign)    cmd_sign "$@" ;;
     verify)  cmd_verify "$@" ;;
     scan)    cmd_scan "$@" ;;
+    java-db) cmd_java_db ;;
     gate)    cmd_gate "$@" ;;
     summary) cmd_summary "$@" ;;
-    *) die "用法：supply-chain.sh {keygen|sign|verify|scan|gate|summary} [IMAGE...]" ;;
+    *) die "用法：supply-chain.sh {keygen|sign|verify|scan|java-db|gate|summary} [IMAGE...]" ;;
   esac
 }
 

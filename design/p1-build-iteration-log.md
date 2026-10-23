@@ -246,3 +246,18 @@ e2e 侧的三条：
 - 基线结果（2026-10-23）：manager 14 critical / 372 high，**全部来自
   `linux-libc-dev` 且全部无修复版本**（容器不跑该内核，不可达），用一条包级
   allowlist 条目带 reason + expires 处理；runner 0 critical / 0 high。
+- **Java 索引库的下半段（同日晚些时候）**：`stream ID 1; PROTOCOL_ERROR` 不是网络问题，
+  是 trivy 的 OCI 客户端：同一时刻用 `curl -C -` 拉同一个 blob（ghcr 的
+  `sha256:65d5d63f…`，987,770,154 字节）只花 **25 秒**（37 MB/s）。trivy 客户端失败后
+  从零重试，所以永远到不了终点。`deploy/security/fetch-java-db.sh` 直接读 manifest、
+  用 curl 断点续传，校验字节数后解包到 `$TRIVY_CACHE_DIR/java-db`；之后
+  `supply-chain.sh scan` 自动加 `--skip-java-db-update`，扫描不再访问网络。
+- **jar 路径不是“配好了”而是“验证过”**：造了一个 `debian:9 + log4j-core-2.14.1`
+  的镜像（`localhost:5001/feldera-jardemo:v1`），trivy 报出 `CVE-2021-44228` /
+  `CVE-2021-45046` / `CVE-2021-45105`（`jar` 类型），gate 判 33 条 BLOCKED。
+  manager 镜像本身 jar 扫描 0 条（shed 掉的编译器 jar 不带依赖元数据）。
+- **cargo 噪声**：`--pkg-types os,library` 会把镜像里 `.cargo/registry` 的每个
+  `Cargo.lock` 当项目扫，manager 镜像因此多出 1,023 条（P1-009 为了 pod 内离线编译
+  才把这些缓存烘进镜像）。gate 默认 `--skip-ecosystems cargo`，只计数并打印
+  `SKIPPED …`，不参与判定；Rust 依赖交给代码评审时的 workspace `Cargo.lock` 与
+  未来的 `cargo audit`。
