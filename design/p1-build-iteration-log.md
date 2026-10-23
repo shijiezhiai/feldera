@@ -261,3 +261,25 @@ e2e 侧的三条：
   才把这些缓存烘进镜像）。gate 默认 `--skip-ecosystems cargo`，只计数并打印
   `SKIPPED …`，不参与判定；Rust 依赖交给代码评审时的 workspace `Cargo.lock` 与
   未来的 `cargo audit`。
+
+## P1-013：e2e 套件在 Linux 构建机上的落地（2026-10-23）
+
+远端 flink-test-02（48 vCPU / 124 GiB / Debian 10）上跑 `python/tests/platform`
+的条件比 Rust 侧苛刻：`tests/platform/conftest.py` 定义了 `pytest_configure_node`，
+这是 xdist 专用钩子，**不装 pytest-xdist 时连 `-n0` 串行跑都会在 collection 阶段
+INTERNALERROR 退出**（`PluginValidationError: unknown hook 'pytest_configure_node'`）。
+装齐：`pytest pytest-timeout pytest-rerunfailures pytest-xdist pretty-errors`。
+
+两个 SDK 用法坑：
+
+- `Pipeline.id` 是**方法**不是 property，`pipeline.id` 拿到的是绑定方法，
+  拼进 kubectl 查询会得到 `<bound method …>`；必须 `pipeline.id()`。
+- `input_json(..., update_format="insert_delete")` 走的是带 envelope 的格式
+  （`{"insert": {...}}`），直接喂 `[{"i": 1}]` 会 400 `ParseErrors`：`unknown field
+  'i', expected one of table/insert/delete/update`。裸行数据要用 `update_format="raw"`。
+
+一个被测试暴露的语义：**社区版没有快照恢复**，所以"stop 后重启数据还在"是错的
+预期。`crates/pipeline-manager/src/db/types/utils.rs:204` 在未开 `feldera-enterprise`
+时对 `fault_tolerance.is_enabled()` 直接返回 `ValidationError::EnterpriseFeature`；没有
+FT 就没有 checkpoint 快照，PVC 上只有 spill / checkpoint 文件，启动不从它们恢复。
+套件因此断言"重启后计数为 0"并把 claim 的 UID 不变作为"卷被复用而非重建"的证据。
