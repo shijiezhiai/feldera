@@ -165,3 +165,32 @@ e2e 侧的三条：
 性能数字：这台上第一次编译（依赖已在镜像里、target 目录空）331 s，第二次编译
 （PVC 里 target 已热）17 s，pod 起来 7 s。
 
+
+## P1-010：网络通路迭代
+
+`manager↔runner` 这一层只改 manager 与 chart，不需要新镜像层，所以迭代循环是最短的
+一圈：改 Rust → 容器内增量编译 → overlay 镜像 → `kind load` → 跑 e2e。
+
+- **`--features feldera-enterprise` 的编译要求工作区两个 enterprise 成员可读**：
+  `crates/dbsp-enterprise` 与 `crates/sync-checkpoint` 是未跟踪的本地目录，
+  `Cargo.toml` 的 `members` 却引用它们。宿主机上 `cargo` 以属主身份跑没问题，
+  容器里以 uid 1000 跑就报 `failed to read .../Cargo.toml: Permission denied`。
+  复制/同步源码前给这两个目录 `chmod -R a+rX`（本地已改，`git` 不跟踪）。
+- **`kind load` 只认已存在的 tag**：P1-010 只重建 manager，runner/compiler 镜像
+  没变，直接用 `docker tag ... bili.5 bili.6` 造同 tag 别名，脚本就能一次 load
+  三张（脚本按同一个 `TAG` 找三张镜像）。
+- **NetworkPolicy 的 selector 用 `kubernetes.io/metadata.name`**：API server 给
+  每个 namespace 自动打这个名字标签，不依赖 release 名。用
+  `app.kubernetes.io/name` 一类自造标签会在别的 release 里失配。
+- **pipeline pod 不能有 kubelet 探针**：探针从节点网络命名空间发起，ingress 规则
+  只放行 manager namespace，探针会被自己挡掉。就绪信号交给 manager 的
+  `is_provisioned` 轮询。
+- **`check` 的状态契约**：`/status` 的 200/503 视为健康（503 是"暂时读不到"），
+  其它状态码视为不健康；连接被拒（容器刚起、还在下载二进制）不算失败，否则
+  automaton 会在正常启动窗口里把 pipeline 判死。
+- **`GET /v0/pipelines/{name}/logs` 是流式接口**：body 发完就挂着等新日志，
+  `curl` 会一直等到 `--max-time` 才退出（表现为 `time_total` 正好等于超时值）。
+  断言脚本要容忍超时退出码，只按内容判断。
+- **follow pod 日志需要 `pods/log` 权限**：只给 `pods` 的 Role 会让
+  `log_stream` 报 403，而这条错误只出现在 manager 自己的日志里（pipeline 照跑），
+  所以 e2e 必须反过来断言「pipeline 自己打印的行出现在 log API 里」才抓得到。

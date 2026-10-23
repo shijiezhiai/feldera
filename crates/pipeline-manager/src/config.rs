@@ -1691,6 +1691,16 @@ pub struct KubernetesRunnerConfig {
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_PER_PIPELINE_NAMESPACE")]
     pub kubernetes_runner_per_pipeline_namespace: bool,
 
+    /// Namespace the manager runs in.
+    ///
+    /// The runner's `NetworkPolicy` only admits pods of this namespace on the
+    /// pipeline port. When unset, the manager is assumed to run in
+    /// `--kubernetes-runner-namespace`, which is the case for the chart and for
+    /// a manager running beside its pipelines.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_MANAGER_NAMESPACE")]
+    pub kubernetes_runner_manager_namespace: Option<String>,
+
     /// Allow user-provided pipeline environment variables whose name starts
     /// with `KUBERNETES_`.
     ///

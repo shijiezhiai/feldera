@@ -140,14 +140,14 @@ start_forward || {
 api_call() {
   local method="$1" path="$2"
   shift 2
-  if response="$(curl --silent --fail --max-time 10 -X "${method}" "${api}${path}" "$@")"; then
+  if response="$(curl --silent --fail --max-time 30 -X "${method}" "${api}${path}" "$@")"; then
     printf '%s' "${response}"
     return 0
   fi
   echo "  (reconnecting to the API server)" >&2
   kill "${forward_pid}" 2>/dev/null || true
   start_forward || return 1
-  curl --silent --fail --max-time 10 -X "${method}" "${api}${path}" "$@"
+  curl --silent --fail --max-time 30 -X "${method}" "${api}${path}" "$@"
 }
 
 t0=$(date +%s)
@@ -255,11 +255,49 @@ kubectl get pods --namespace "${NAMESPACE}" \
 
 pipeline_id="$(api_call GET "/v0/pipelines/${PIPELINE}" \
   | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
-kubectl get statefulset,service,pod --namespace "${NAMESPACE}" \
+kubectl get statefulset,service,networkpolicy,pod --namespace "${NAMESPACE}" \
   -l "feldera.com/pipeline-id=${pipeline_id}" -o wide
+
+say "checking the manager reaches the pipeline over the Service"
+network_policy="$(kubectl get networkpolicy --namespace "${NAMESPACE}" \
+  "pipeline-${pipeline_id}" -o name 2>/dev/null || true)"
+[ -n "${network_policy}" ] || {
+  echo "error: the runner did not create a NetworkPolicy for the pipeline" >&2
+  exit 1
+}
+# The manager polls the pipeline's /status through the headless Service; the
+# result of the last poll is what the API reports as resource details.
+details="$(api_call GET "/v0/pipelines/${PIPELINE}" \
+  | sed -n 's/.*"deployment_resources_status_details":\({.*\}\)[,}].*/\1/p')"
+printf '  resources status details: %s\n' "${details:-<none>}"
+echo "${details}" | grep -q '"http_status":200' || {
+  echo "error: the manager has not read the pipeline's /status endpoint yet: ${details}" >&2
+  exit 1
+}
+# The pipeline reports its runtime state as `runtime_status`; a running
+# pipeline must say so in the body the manager read.
+echo "${details}" | grep -q '"runtime_status":"Running"' || {
+  echo "error: the /status report does not say the pipeline is running: ${details}" >&2
+  exit 1
+}
 
 say "pipeline pod logs (tail)"
 kubectl logs --namespace "${NAMESPACE}" "pipeline-${pipeline_id}-0" --tail 10 || true
+
+say "checking the manager collected the pipeline's stdout"
+# The manager follows the pod's log stream into the pipeline log API. A line the
+# pipeline itself printed is the proof that the follower, the RBAC rule for
+# `pods/log` and the log store all work.
+# The log endpoint streams: it sends the stored lines and then keeps the
+# connection open waiting for new ones, so the transfer ends at our deadline
+# instead of at a Content-Length. A timeout is therefore the expected outcome,
+# and the assertion below is what decides whether the lines arrived.
+logs="$(curl --silent --max-time 20 "${api}/v0/pipelines/${PIPELINE}/logs" || true)"
+if ! echo "${logs}" | grep -q "Pipeline initialization complete"; then
+  echo "error: the pipeline log API carries the pipeline's own lines: ${logs:0:800}" >&2
+  exit 1
+fi
+echo "  pipeline log API carries $(echo "${logs}" | grep -c .) lines"
 
 say "ingesting into and querying the running pipeline"
 PF_PORT="${PF_PORT:-18082}"
@@ -310,7 +348,7 @@ say "cleaning up pipeline ${PIPELINE}"
 delete_pipeline
 
 sleep 5
-orphans="$(kubectl get statefulset,service,persistentvolumeclaim --namespace "${NAMESPACE}" \
+orphans="$(kubectl get statefulset,service,networkpolicy,persistentvolumeclaim --namespace "${NAMESPACE}" \
   -l "feldera.com/pipeline-id=${pipeline_id}" -o name 2>/dev/null || true)"
 [ -z "${orphans}" ] || {
   echo "error: resources left behind after delete: ${orphans}" >&2
