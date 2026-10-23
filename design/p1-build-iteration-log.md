@@ -239,3 +239,10 @@ e2e 侧的三条：
 - 签名是按 digest 绑定的：把同一个 digest 打成新 tag 仍然“已签名”；把 tag 指向
   新 digest 才会失效。演示未签名镜像必须提交一个**未被签名的新 digest**
   （`docker commit` 一个容器即可），不能只换个 tag 名。
+- trivy 扫含 jar 的镜像会额外拉 Java 索引库；它先试 `mirror.gcr.io`（这台机器不通），
+  脚本里把 `TRIVY_DB_REPOSITORY` 与 `TRIVY_JAVA_DB_REPOSITORY` 都钉到 `ghcr.io`。
+  即便如此 ghcr 的 java-db 仍有 `stream ID 1; PROTOCOL_ERROR` 的半途失败，本轮
+  manager 镜像的基线用 `--pkg-types os` 取（OS 包），Java 依赖留给 CI。
+- 基线结果（2026-10-23）：manager 14 critical / 372 high，**全部来自
+  `linux-libc-dev` 且全部无修复版本**（容器不跑该内核，不可达），用一条包级
+  allowlist 条目带 reason + expires 处理；runner 0 critical / 0 high。

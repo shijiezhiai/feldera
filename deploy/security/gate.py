@@ -10,12 +10,21 @@ Allowlist format (JSON, no third-party parser needed):
 
     [
       {
-        "id": "CVE-2024-1234",
-        "image": "feldera-manager",   # substring match on the image name
+        "id": "CVE-2024-1234",        # exactly one of id / pkg
+        "image": "feldera-manager",   # optional substring match on the image
         "reason": "not reachable in our deployment",
         "expires": "2026-12-31"       # inclusive last day
+      },
+      {
+        "pkg": "linux-libc-dev",      # covers every finding in that package
+        "reason": "kernel headers, never executed in the container",
+        "expires": "2027-01-31"
       }
     ]
+
+A ``pkg`` entry suppresses future findings in that package too, which is why it
+also has to expire: a suppression that covers more than one CVE cannot be
+reviewed CVE by CVE, so it must come back for review as a whole.
 """
 
 from __future__ import annotations
@@ -70,7 +79,9 @@ def load_allowlist(path: str) -> list[dict]:
 
 def allows(entries: list[dict], finding: Finding, today: dt.date) -> dict | None:
     for entry in entries:
-        if entry.get("id") != finding.vulnerability_id:
+        matches_id = entry.get("id") == finding.vulnerability_id
+        matches_package = entry.get("pkg") == finding.package
+        if not (matches_id or matches_package):
             continue
         if entry.get("image") and entry["image"] not in finding.image:
             continue
@@ -135,9 +146,10 @@ def main() -> int:
         return 0
 
     for finding, entry in allowed:
+        scope = entry.get("id") or f"pkg {entry.get('pkg')}"
         print(
             f"ALLOWED  {finding.vulnerability_id:<18} {finding.image:<40} "
-            f"until {entry.get('expires', 'never')}: {entry.get('reason', 'no reason')}"
+            f"[{scope}] until {entry.get('expires', 'never')}: {entry.get('reason', 'no reason')}"
         )
     for finding in blocked:
         print(
