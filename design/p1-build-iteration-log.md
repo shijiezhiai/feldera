@@ -341,3 +341,53 @@ FT 就没有 checkpoint 快照，PVC 上只有 spill / checkpoint 文件，启�
 
 另外 `histogram_quantile` 在采样太少的窗口里返回 `NaN` 是正常的（本例只 checkpoint 了一两次），
 所以断言分两层：面板有结果（证明接线通）+ count 是有限且 ≥1（证明数值真到了）。
+
+## P1-016 —— 优雅停机与恢复
+
+| 项 | 结果 |
+|---|---|
+| 单测 `runner::` | 100 passed（新增 2 项：后端是 File、路径在挂载点下；此前的 98 项无回归） |
+| 单测 `server::test_http_helpers` | 11 passed（新增 1 项：第二次 suspend 不启动第二个 checkpoint） |
+| `dbsp_adapters` `server::` | 26 passed / 1 failed；失败是 `test_with_kafka::test_server`（要活的 Kafka broker，本机没有） |
+| 远端 kind e2e（`scripts/e2e-k8s-graceful.sh`） | **PASS**，128 s：编译+部署 104 s、`SIGTERM`→exit checkpoint **1 s**、重启 17 s、恢复后仍 1000 行 |
+
+两个缺口，第二个才是这单的关键：
+
+1. **`SIGTERM` 没人接**。`pipeline-entrypoint.sh` 用 `exec` 把信号交给 pipeline 进程，但 pipeline 从没注册
+   handler，默认处置是立即退出——不写 exit checkpoint。只有在 manager 的 `/stop`（走 HTTP `/suspend`）
+   之外停机时才暴露：`kubectl delete pod`、`StatefulSet` 缩容、节点 drain、驱逐。
+   修法：`spawn_shutdown_handler` 把 `SIGTERM` 变成和 `/suspend` 完全一样的路径（复用抽出的
+   `begin_suspend`），checkpoint 写完再 `exit(0)`。
+2. **卷有了，后端没配**。k8s runner 会建 PVC 并挂载，`generate_storage_config` 也报目录，但从没填
+   `PipelineConfig::global.storage`。`PipelineConfig::storage()` 要两半齐全，缺后端就当"没有存储"，
+   `can_checkpoint()` 直接报没有存储。后果：开了 FT 的 pipeline 在自己刚建的卷上报
+   `FtRequiresStorage`；没开 FT 的 pipeline 则没有任何 checkpoint 后端供新的 `SIGTERM` handler 写。
+   修法：`PipelineExecutor` 新增 `generate_storage_options()`（默认 `None`，其它 runner 行为不变），
+   k8s 实现返回 File 后端，automaton 只在**用户开了 FT 且配置里没写后端**时补上。
+
+刻意的两条边界：用户写了对象存储就不覆盖；没开 FT 的 pipeline 完全不动（不加存储、不 checkpoint、不挂卷）。
+
+三个坑：
+
+1. **`fake_runner` 需要 Tokio reactor**。测"返回什么后端"这种纯函数时用它，会因为构造 kube client
+   而 panic `there is no reactor running`。直接构造结构体即可。
+2. **e2e 不能 `kubectl delete pod`**。StatefulSet 拥有的 pod 被删会立刻重建，没有"停止窗口"可恢复；
+   而且 pod 对象消失后 `kubectl logs` 和 exitCode 一起没了。正确做法是 `scale --replicas=0`
+   （StatefulSet 控制器删 pod，kubelet 发 SIGTERM），日志用 `--follow` 在后台先接上。
+3. **checkpoint 的磁盘布局不是 `<storage>/checkpoints/`**，而是 `<storage>/<uuid>/`。断言别猜目录，
+   走 `/status` 的 `storage_status_details.checkpoints`（manager 自己也是读这个）。
+
+第四个坑值得单独记，因为它让前三次运行全部误判：
+
+**overlay 镜像只换二进制，不换源码**。manager 自己不编 pipeline 二进制——
+provision 时把镜像里的 `crates/` 复制到 compiler pod 里现编。所以
+`Dockerfile.manager.overlay` 只 `COPY` 二进制时，manager 是新代码、pipeline 还是上次的代码。
+表现是"改了 handler、加了日志，pipeline 一个字都不打，但退出码是 0"——很像 handler 没生效，
+实际是 handler 不在镜像里。修法：overlay 同时 `COPY` `Cargo.toml`/`Cargo.lock`/`crates/`/
+`sql-to-dbsp-compiler/{lib,temp}`；验证方式是 `docker run --rm --entrypoint sh <image> -c
+"grep -c SIGTERM /home/ubuntu/feldera/crates/adapters/src/server.rs"`，命中数非 0 才算对。
+
+顺带两个脚本级的坑：①`/v0/pipelines/{name}/status` 这个端点**不存在**（真实字段在
+`GET /v0/pipelines/{name}` 的 `deployment_runtime_status` 与 `storage_status_details` 里），
+探测一个 404 且用 `2>/dev/null || true` 兜住，会让脚本安静地空转到超时。②`format=json`
+单行结果返回的是**对象本身**不是数组（`{"c": 1000}`），按 `[0]` 取会 IndexError。
