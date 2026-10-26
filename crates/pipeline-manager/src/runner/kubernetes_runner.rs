@@ -54,7 +54,9 @@ use crate::runner::pipeline_executor::{
 };
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use async_trait::async_trait;
-use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
+use feldera_types::config::{
+    PipelineConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig, StorageOptions,
+};
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
 use futures_util::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
@@ -1290,6 +1292,19 @@ impl PipelineExecutor for KubernetesRunner {
         }
     }
 
+    /// The pipeline pod writes its state to the volume the runner mounts, so
+    /// the backend is the local file system.
+    ///
+    /// Only a fault-tolerant pipeline asks for this (see the automaton), which
+    /// keeps a plain in-memory pipeline exactly as it was: no storage, no
+    /// checkpointing, no volume access.
+    fn generate_storage_options(&self) -> Option<StorageOptions> {
+        Some(StorageOptions {
+            backend: StorageBackendConfig::File(Box::default()),
+            ..Default::default()
+        })
+    }
+
     /// Rejects provisioning early when the runner cannot work at all.
     ///
     /// Failing here surfaces a clear error while the pipeline is still `Stopped`
@@ -1961,6 +1976,60 @@ mod tests {
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, Some(IntOrString::Int(8080)));
         assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));
+    }
+
+    /// The Kubernetes runner's state lives on a volume, so it names a file
+    /// backend for it.
+    ///
+    /// The controller reads the mount path and the backend as one pair. Naming
+    /// only the path leaves `PipelineConfig::storage()` at `None`, and a
+    /// fault-tolerant deployment then fails with `FtRequiresStorage` on a
+    /// volume it provisioned and mounted itself.
+    #[test]
+    fn the_runner_names_a_file_backend_for_its_volume() {
+        // The backend decision reads no cluster state, so this builds the
+        // runner without a fake API server: `fake_runner` would start a kube
+        // client that needs a Tokio reactor and an API server it never uses.
+        let runner = KubernetesRunner {
+            pipeline_id: PipelineId(Uuid::nil()),
+            common_config: common_config(),
+            config: runner_config(),
+            client: reqwest::Client::new(),
+            logs_sender: logs_sender(),
+            logs_task: None,
+            limits: ResourceLimits::default(),
+            kubernetes: None,
+        };
+
+        let options = runner
+            .generate_storage_options()
+            .expect("a Kubernetes pipeline keeps its state on a volume");
+        assert!(
+            matches!(options.backend, StorageBackendConfig::File(_)),
+            "the volume is a mounted file system, not object storage: {:?}",
+            options.backend
+        );
+    }
+
+    /// The two halves of the storage configuration describe the same volume.
+    ///
+    /// `generate_storage_config` names the directory inside the pod and
+    /// `generate_storage_options` names the backend that reads it; a
+    /// deployment where they disagree would checkpoint into one place and
+    /// resume from another.
+    #[tokio::test]
+    async fn the_storage_path_lives_under_the_mount_point() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let runner = fake_runner(&cluster);
+
+        let config = runner.generate_storage_config().await;
+        assert!(
+            config.path.starts_with(STORAGE_MOUNT_BASE),
+            "the state directory '{}' must be inside the mounted volume '{}'",
+            config.path,
+            STORAGE_MOUNT_BASE
+        );
+        assert!(runner.generate_storage_options().is_some());
     }
 
     /// The default deployment creates no scrape target.

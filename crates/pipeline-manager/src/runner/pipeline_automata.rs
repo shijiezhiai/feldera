@@ -1007,6 +1007,18 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         // Deployment configuration
         let mut deployment_config =
             generate_pipeline_config(pipeline.id, &pipeline.name, &runtime_config);
+        // A pipeline that asks for fault tolerance needs a storage backend to
+        // checkpoint to, and on this platform the volume is already there: the
+        // runner provisions the claim and says where to mount it. Only the
+        // backend part was missing, so a fault-tolerant deployment failed with
+        // `FtRequiresStorage` even though its volume was mounted and idle. The
+        // user keeps the last word, so this fills the gap and never overrides a
+        // backend the pipeline configuration already names.
+        if deployment_config.global.storage.is_none()
+            && runtime_config.fault_tolerance.is_enabled()
+        {
+            deployment_config.global.storage = self.pipeline_handle.generate_storage_options();
+        }
         deployment_config.storage_config =
             Some(self.pipeline_handle.generate_storage_config().await);
         let deployment_config_json = match serde_json::to_value(&deployment_config) {

@@ -975,6 +975,10 @@ pub fn run_server(
         config.global.workers as usize
     };
 
+    // The shutdown handler outlives the closure that builds the HTTP server,
+    // which consumes its own clone.
+    let state_for_signals = state.clone();
+
     let server = HttpServer::new({
         move || {
             let state = state.clone();
@@ -1093,6 +1097,9 @@ pub fn run_server(
         tokio::fs::rename(&tmp_server_port_file, SERVER_PORT_FILE)
             .await
             .map_err(|e| ControllerError::io_error("renaming server port file", e))?;
+
+        spawn_shutdown_handler(state_for_signals.clone());
+
         server
             .await
             .map_err(|e| ControllerError::io_error("in the HTTP server", e))
@@ -1100,6 +1107,63 @@ pub fn run_server(
 
     Ok(())
 }
+
+/// Turns `SIGTERM` into the same exit checkpoint `/suspend` takes.
+///
+/// A pipeline pod is stopped in two ways: the manager calls `/suspend` through
+/// the API, or Kubernetes sends `SIGTERM` when the pod is deleted, the
+/// `StatefulSet` is scaled down, or the node is drained. Without this handler
+/// the second path terminates the process without a checkpoint, so the
+/// deployment loses everything since the last one even though its storage
+/// claim survives. The manager's `/stop?force=false` happens to use the API
+/// path, which is why the difference only shows up on a shutdown the manager
+/// did not initiate.
+///
+/// The pod's `terminationGracePeriodSeconds` bounds how long this has; the
+/// pipeline writes its exit checkpoint inside that budget or the kubelet
+/// sends `SIGKILL`.
+#[cfg(unix)]
+fn spawn_shutdown_handler(state: WebData<ServerState>) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    tokio::spawn(async move {
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                // Without a handler the process dies as it did before this
+                // change; say so rather than failing the deployment, because
+                // the pipeline itself is healthy.
+                error!("unable to install the SIGTERM handler ({error}); a shutdown will not checkpoint");
+                return;
+            }
+        };
+        terminate.recv().await;
+        info!("SIGTERM received: suspending the pipeline so that it checkpoints");
+        match begin_suspend(&state) {
+            Some(suspend_task) => {
+                // The exit checkpoint is the only reason this process is
+                // still alive. Await it, then exit: the kubelet kills
+                // whatever is left when `terminationGracePeriodSeconds` runs
+                // out, and exiting here keeps that budget for the checkpoint
+                // instead of spending it on an idle HTTP server.
+                if let Err(error) = suspend_task.await {
+                    error!("the suspend task ended unexpectedly ({error})");
+                }
+                info!("exit checkpoint written; stopping");
+            }
+            None => {
+                // Already suspending or already suspended: the first caller
+                // owns the checkpoint, and a second one would race it.
+                info!("SIGTERM received while already suspending; nothing further to do");
+            }
+        }
+        std::process::exit(0);
+    });
+}
+
+/// Non-Unix platforms have no `SIGTERM`; the pipeline runs on Linux.
+#[cfg(not(unix))]
+fn spawn_shutdown_handler(_state: WebData<ServerState>) {}
 
 fn parse_config(config_file: impl AsRef<Path>) -> Result<PipelineConfig, ControllerError> {
     fn read_config_file_as_string(path: &Path) -> Result<String, ControllerError> {
@@ -2619,12 +2683,41 @@ async fn sync_checkpoint_status(
 /// suspend requests act like just one.
 #[post("/suspend")]
 async fn suspend(state: WebData<ServerState>) -> Result<impl Responder, PipelineError> {
+    if state.desired_status() == RuntimeDesiredStatus::Standby {
+        return Err(PipelineError::InvalidTransition(
+            "suspend",
+            RuntimeDesiredStatus::Standby,
+        ));
+    }
+    // A second request while the first is still running finds the pipeline
+    // already `Suspended` and changes nothing; answering 202 again keeps the
+    // handler idempotent, which is what callers retry against.
+    begin_suspend(&state);
+    Ok(HttpResponse::Accepted().json("Pipeline is suspending"))
+}
+
+/// Moves the pipeline to `Suspended` and starts the suspend on a background
+/// task, returning the task so that a caller who has to wait for the exit
+/// checkpoint can do so.
+///
+/// Shared by the `/suspend` endpoint and the `SIGTERM` handler. Both mean the
+/// same thing to the pipeline: take an exit checkpoint, write it to storage,
+/// and stop. Keeping one implementation matters because a shutdown that
+/// checkpointed differently from an explicit suspend would lose records the
+/// deployment's owner believes are durable.
+///
+/// Returns `None` when the pipeline is already suspended or cannot suspend
+/// (`Standby`), so a repeated signal does no work and a second checkpoint
+/// cannot race the first.
+///
+/// The API handler drops the task handle on purpose: it answers 202 and lets
+/// the client poll `/status`. The signal handler awaits it, because after a
+/// `SIGTERM` the only thing keeping the process alive is this checkpoint.
+fn begin_suspend(state: &WebData<ServerState>) -> Option<tokio::task::JoinHandle<()>> {
     let mut desired_status = state.desired_status.lock().unwrap();
     match *desired_status {
         RuntimeDesiredStatus::Unavailable => unreachable!(),
-        RuntimeDesiredStatus::Standby => {
-            return Err(PipelineError::InvalidTransition("suspend", *desired_status));
-        }
+        RuntimeDesiredStatus::Standby => None,
         RuntimeDesiredStatus::Coordination
         | RuntimeDesiredStatus::Running
         | RuntimeDesiredStatus::Paused => {
@@ -2633,47 +2726,50 @@ async fn suspend(state: WebData<ServerState>) -> Result<impl Responder, Pipeline
             state.desired_status_change.notify_waiters();
             drop(desired_status);
 
-            async fn suspend(state: WebData<ServerState>) {
-                let mut suspend_error = None;
-                loop {
-                    if let Ok(controller) = state.controller() {
-                        if let Err(error) = controller.async_suspend().await {
-                            error!("controller suspend failed ({error})");
-                            suspend_error = Some(error);
-                        }
-                        break;
-                    }
-
-                    match state.phase() {
-                        PipelinePhase::Initializing(_) | PipelinePhase::InitializationComplete => {}
-                        PipelinePhase::InitializationError(_)
-                        | PipelinePhase::Failed(_)
-                        | PipelinePhase::Suspended => break,
-                    };
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                // A failed suspend leaves the pipeline unsuspended: `suspended`
-                // reports it as a fatal error so the pipeline manager records the
-                // failure rather than a clean suspend. The circuit is deliberately
-                // left running on failure (see the `SuspendCommand` handler in
-                // `controller.rs`), so `/status` never observed a `Terminated`
-                // circuit to mask as `Suspended`; this phase is what the poll sees
-                // once the controller is deallocated.
-                if let Some(controller) = state.suspended(suspend_error)
-                    && let Err(error) = controller.async_stop().await
-                {
-                    error!("stopping controller failed ({error})");
-                }
-            }
-
             // This can only be spawned once, because we only transition to
             // [RuntimeDesiredStatus::Suspended] once and we never transition
             // out of it.
-            tokio::spawn(async move { suspend(state).await });
+            Some(tokio::spawn(suspend_to_storage(state.clone())))
         }
-        RuntimeDesiredStatus::Suspended => (),
-    };
-    Ok(HttpResponse::Accepted().json("Pipeline is suspending"))
+        RuntimeDesiredStatus::Suspended => None,
+    }
+}
+
+/// Waits for the controller, suspends it, and stops it.
+///
+/// Split out of [`begin_suspend`] only so that the async block reads as a
+/// plain function; the comments inside explain why a failed suspend is
+/// reported rather than retried.
+async fn suspend_to_storage(state: WebData<ServerState>) {
+    let mut suspend_error = None;
+    loop {
+        if let Ok(controller) = state.controller() {
+            if let Err(error) = controller.async_suspend().await {
+                error!("controller suspend failed ({error})");
+                suspend_error = Some(error);
+            }
+            break;
+        }
+
+        match state.phase() {
+            PipelinePhase::Initializing(_) | PipelinePhase::InitializationComplete => {}
+            PipelinePhase::InitializationError(_)
+            | PipelinePhase::Failed(_)
+            | PipelinePhase::Suspended => break,
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A failed suspend leaves the pipeline unsuspended: `suspended` reports it
+    // as a fatal error so the pipeline manager records the failure rather than
+    // a clean suspend. The circuit is deliberately left running on failure
+    // (see the `SuspendCommand` handler in `controller.rs`), so `/status`
+    // never observed a `Terminated` circuit to mask as `Suspended`; this phase
+    // is what the poll sees once the controller is deallocated.
+    if let Some(controller) = state.suspended(suspend_error)
+        && let Err(error) = controller.async_stop().await
+    {
+        error!("stopping controller failed ({error})");
+    }
 }
 
 #[post("/start_transaction")]
@@ -3700,8 +3796,8 @@ impl StoredStatus {
 #[cfg(test)]
 mod test_http_helpers {
     use super::{
-        ServerArgs, ServerState, bootstrap, build_app, error_handler, get_status, parse_config,
-        terminated_status,
+        ServerArgs, ServerState, begin_suspend, bootstrap, build_app, error_handler, get_status,
+        parse_config, terminated_status,
     };
     use crate::{
         ControllerError,
@@ -3817,6 +3913,69 @@ outputs:
             "a completed suspend read back as {:?}",
             status.runtime_status
         );
+    }
+
+    /// A second suspend must not start a second exit checkpoint.
+    ///
+    /// `SIGTERM` can arrive while `/suspend` is already running (a `kubectl
+    /// delete` during a manager-initiated stop), and two checkpoints writing
+    /// the same storage directory concurrently would corrupt it. The first
+    /// caller owns the transition; everyone after it gets nothing to await.
+    #[actix_web::test]
+    async fn a_second_suspend_starts_no_second_checkpoint() {
+        ensure_default_crypto_provider();
+
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::InitializationComplete,
+            String::default(),
+            RuntimeDesiredStatus::Running,
+            BootstrapConfig::default(),
+            Uuid::now_v7(),
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let suspend_task = begin_suspend(&state);
+        assert!(suspend_task.is_some(), "the first suspend must take effect");
+        assert_eq!(state.desired_status(), RuntimeDesiredStatus::Suspended);
+
+        // Stop the task before it can do anything: without a controller it
+        // would poll the phase until the test ends.
+        suspend_task.unwrap().abort();
+
+        let second = begin_suspend(&state);
+        assert!(
+            second.is_none(),
+            "a suspend while already suspended must not start another checkpoint"
+        );
+        assert_eq!(state.desired_status(), RuntimeDesiredStatus::Suspended);
+    }
+
+    /// A pipeline that has not been activated has nothing to suspend, and a
+    /// `SIGTERM` at that point must not turn it into a suspended pipeline.
+    #[actix_web::test]
+    async fn suspending_a_standby_pipeline_is_refused() {
+        ensure_default_crypto_provider();
+
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            RuntimeDesiredStatus::Standby,
+            BootstrapConfig::default(),
+            Uuid::now_v7(),
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        assert!(
+            begin_suspend(&state).is_none(),
+            "a standby pipeline must not suspend"
+        );
+        assert_eq!(state.desired_status(), RuntimeDesiredStatus::Standby);
     }
 
     /// A circuit that dies while a suspend is pending must not be reported as a

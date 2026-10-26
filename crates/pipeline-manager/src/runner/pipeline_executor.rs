@@ -4,7 +4,7 @@ use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use crate::runner::pipeline_logs::LogsSender;
 use async_trait::async_trait;
-use feldera_types::config::{PipelineConfig, StorageConfig};
+use feldera_types::config::{PipelineConfig, StorageConfig, StorageOptions};
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
 use std::time::Duration;
 use uuid::Uuid;
@@ -41,6 +41,22 @@ pub trait PipelineExecutor: Sync + Send {
     /// Generates the storage configuration of the pipeline if storage is enabled.
     /// The storage configuration is part of the pipeline deployment configuration.
     async fn generate_storage_config(&self) -> StorageConfig;
+
+    /// Storage options that describe how the pipeline reaches the storage
+    /// `generate_storage_config` names.
+    ///
+    /// `StorageConfig` only says *where* the state lives; the backend choice
+    /// and its tuning live in `PipelineConfig::global.storage`. A deployment
+    /// whose state lives on a volume must set both, because the controller
+    /// reads the pair through
+    /// [`PipelineConfig::storage`](feldera_types::config::PipelineConfig::storage)
+    /// and treats an absent `global.storage` as "no storage at all", which
+    /// silently disables checkpointing even though the volume is mounted.
+    ///
+    /// Returns `None` when the deployment keeps state in memory only.
+    fn generate_storage_options(&self) -> Option<StorageOptions> {
+        None
+    }
 
     /// Checks whether it is able to manage (i.e., create, retrieve, update, delete) the compute and
     /// storage resources that would be provisioned to back the pipeline.
