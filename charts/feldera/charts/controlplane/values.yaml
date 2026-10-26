@@ -69,6 +69,14 @@ kubernetesRunner:
   connectorKubernetesSecrets:
     enableAllowlist: false
     allowlist: []
+  # P1-015: expose one ClusterIP Service per pipeline, labelled for a scrape
+  # job, and admit the namespace below on the pipeline port. Off by default
+  # because it adds an object and a policy peer per pipeline.
+  metrics:
+    enabled: false
+    # Namespace of the scrape client. Empty means the manager namespace, which
+    # is the common case for a monitoring stack in the same release namespace.
+    namespace: ""
   template:
     # Name of an existing ConfigMap that holds a StatefulSet template for
     # pipeline pods (P1-011). Empty means the runner renders its built-in

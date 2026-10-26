@@ -1,0 +1,46 @@
+# Prometheus for a Kubernetes install of the platform (P1-015).
+#
+# The Docker Compose stack uses `prometheus.yml` instead: there the manager's
+# local runner publishes every pipeline on a host port it allocates, which a
+# Prometheus container cannot discover. Kubernetes gives each pipeline a
+# Service, so this file discovers them and needs no static target list.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # The manager aggregates pipeline *status* only. It is still worth scraping:
+  # its readiness and restart counts explain a dashboard that suddenly goes
+  # blank.
+  - job_name: 'feldera-manager'
+    metrics_path: '/v0/metrics'
+    kubernetes_sd_configs:
+      - role: endpoints
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: '.*-controlplane-api-server'
+        action: keep
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        regex: http
+        action: keep
+
+  # One target per pipeline pod. The manager creates the Service only when the
+  # chart sets `kubernetesRunner.metrics.enabled`; the label below is what it
+  # stamps on that Service (see `LABEL_METRICS_SCRAPE` in kubernetes_runner.rs).
+  - job_name: 'feldera-pipelines'
+    metrics_path: '/metrics'
+    kubernetes_sd_configs:
+      - role: endpoints
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_label_feldera_com_metrics_scrape]
+        regex: "true"
+        action: keep
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        regex: http
+        action: keep
+      # The pipeline exports the name the user gave it; keeping it as
+      # `pipeline_name` is what makes the dashboard variable work.
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod

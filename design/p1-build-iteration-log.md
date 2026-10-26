@@ -309,3 +309,35 @@ FT 就没有 checkpoint 快照，PVC 上只有 spill / checkpoint 文件，启�
 - 一轮"失败即返回"的关键性质：拉取失败不改缓存。否则 issuer 抖一下所有人 401。
 - 测试环境坑：`drop(MockServer)` 不是同步关端口，wiremock 的 shutdown 是异步的；改用"绑定后立即释放的端口"构造确定不可连 URL。
 - 全量 9 个失败均为 `compiler::*`（本机无 SQL compiler jar → `SystemError`），在干净树上同样红，与本次改动无关；此外 `db_impl_behaves_like_model` 在默认栈大小下会栈溢出，需 `RUST_MIN_STACK=16777216`。
+
+## P1-015 — 监控：抓取目标与 Grafana 看板（2026-10-26）
+
+| 项 | 结果 |
+|---|---|
+| 单测 | `runner::kubernetes_runner` 新增 4 项（Service/端口名/NetworkPolicy peer/默认关闭），全模块 42 passed |
+| 全新 pipeline 全链 | **78 s**（编译 unoptimized + 部署 + Running + 手动 checkpoint + Prometheus 抓到 + Grafana 读到） |
+| 复用 pipeline | 18 s |
+| `/metrics` | HTTP 200 / 294 KB / 1867 行带 `pipeline_name` |
+| Grafana 读到的 checkpoint 数 | 2（与 `_count` 一致） |
+
+五个坑，前三个都是"看起来像平台 bug、其实是脚本或环境"：
+
+1. **clap 布尔 flag 不能写 `=true`**。chart 里 `--kubernetes-runner-metrics-service=true` 让 manager 启动即崩
+   （`unexpected value 'true' ... no more were expected`）。同批还发现 `per-pipeline-namespace` 与
+   `allow-kubernetes-env-prefix` 两处同样写错——这两处是 P1-009 遗留，从未被执行到。
+2. **`pipefail` + `grep -q` 是陷阱**。`printf '%s\n' "$metrics" | grep -q ...` 在匹配后 grep 提前退出，
+   producer 收 SIGPIPE（141），整条管道失败。表现是"显然是 200 且显然有这一行，断言却说没有"。
+   修法：落文件后对文件 grep，其余几处改 `grep -c`（读到底）。
+3. **overlay 镜像漏了 enterprise feature**。`Dockerfile.manager.overlay` 只是替换二进制，
+   二进制必须自己带 `--features feldera-enterprise`，否则 manager 对 checkpoint 返 501。
+   更隐蔽的是：即使 manager 带了，pipeline 二进制也得带，否则 checkpoint 异步失败
+   （"Suspend is an enterprise feature"）——这个错误比 501 难读得多。
+4. **`kubectl port-forward` 会随 Pod 重建而死**，而 Grafana 报 Ready 早于 HTTP 端口绑定。
+   表现是 `failed to connect to localhost:3000 inside namespace`。修法：轮询里检测 forward 进程退出就重启，
+   端口用空闲探测而非硬编码（上一轮残留的 13000 会让下一次以"与平台无关"的理由失败）。
+5. **dashboard 的 `${DS_PROMETHEUS}` 在 proxy 调用里不会被替换**。Grafana 渲染时才替换变量，
+   直接拿面板 expr 打 `/api/datasources/proxy` 会让 Prometheus 收到字面量 `${...}`，比出空 label。
+   e2e 显式替换 `$DS_PROMETHEUS`/`$pipeline_name`/`$__rate_interval`，并用 `case *'$'*` 兜住未来新增变量。
+
+另外 `histogram_quantile` 在采样太少的窗口里返回 `NaN` 是正常的（本例只 checkpoint 了一两次），
+所以断言分两层：面板有结果（证明接线通）+ count 是有限且 ≥1（证明数值真到了）。
