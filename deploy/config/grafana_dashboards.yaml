@@ -1,0 +1,17 @@
+# Grafana dashboard provisioning (P1-015).
+#
+# Mounting the dashboard JSON instead of importing it by hand means an upgrade
+# of the platform ships an upgrade of the panels, and a fresh stack has them on
+# first start.
+apiVersion: 1
+
+providers:
+  - name: feldera
+    orgId: 1
+    folder: Feldera
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

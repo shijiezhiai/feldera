@@ -1790,6 +1790,32 @@ pub struct KubernetesRunnerConfig {
         default_value_t = default_kubernetes_runner_upper_storage_mb()
     )]
     pub kubernetes_runner_upper_storage_mb: u64,
+
+    /// Give every pipeline pod a `Service` that a Prometheus server may scrape.
+    ///
+    /// A pipeline pod already serves its `/metrics` on the pipeline port, but
+    /// the only Service the runner creates is headless and its NetworkPolicy
+    /// admits the manager namespace alone, so a monitoring namespace cannot
+    /// reach it. With this flag the runner additionally creates one
+    /// `ClusterIP` Service per pipeline, labelled
+    /// `feldera.com/metrics-scrape: "true"`, and widens the policy to admit
+    /// `--kubernetes-runner-metrics-namespace`.
+    ///
+    /// Off by default: exposing pipeline metrics is a deliberate decision, not
+    /// a side effect of installing the chart.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_METRICS_SERVICE")]
+    pub kubernetes_runner_metrics_service: bool,
+
+    /// Namespace allowed to scrape the pipeline metrics Service.
+    ///
+    /// Only used with `--kubernetes-runner-metrics-service`. Unset means the
+    /// metrics Service exists but the NetworkPolicy still admits only the
+    /// manager namespace, which is useful only on a CNI without policy
+    /// enforcement; set it to the namespace of the Prometheus server.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_METRICS_NAMESPACE")]
+    pub kubernetes_runner_metrics_namespace: Option<String>,
 }
 
 /// Default for `--kubernetes-runner-lower-memory-mb`.
@@ -2057,6 +2083,8 @@ mod tests {
         assert_eq!(config.kubernetes_runner_pipeline_executor_image, None);
         assert!(!config.kubernetes_runner_per_pipeline_namespace);
         assert!(!config.kubernetes_runner_allow_kubernetes_env_prefix);
+        assert!(!config.kubernetes_runner_metrics_service);
+        assert_eq!(config.kubernetes_runner_metrics_namespace, None);
     }
 
     /// Every Kubernetes runner option can be set from the command line.
@@ -2072,6 +2100,9 @@ mod tests {
             "ghcr.io/example/runner:1",
             "--kubernetes-runner-per-pipeline-namespace",
             "--kubernetes-runner-allow-kubernetes-env-prefix",
+            "--kubernetes-runner-metrics-service",
+            "--kubernetes-runner-metrics-namespace",
+            "monitoring",
         ])
         .unwrap();
         assert_eq!(
@@ -2085,5 +2116,10 @@ mod tests {
         );
         assert!(config.kubernetes_runner_per_pipeline_namespace);
         assert!(config.kubernetes_runner_allow_kubernetes_env_prefix);
+        assert!(config.kubernetes_runner_metrics_service);
+        assert_eq!(
+            config.kubernetes_runner_metrics_namespace.as_deref(),
+            Some("monitoring")
+        );
     }
 }

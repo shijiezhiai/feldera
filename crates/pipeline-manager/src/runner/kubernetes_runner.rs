@@ -56,13 +56,14 @@ use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use async_trait::async_trait;
 use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
+use futures_util::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
-    ObjectFieldSelector,
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod,
-    PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, Secret, SecretVolumeSource,
-    Service, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
+    ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, PodTemplateSpec,
+    ResourceRequirements, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Volume,
+    VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -75,7 +76,6 @@ use kube::Client;
 use kube::api::{Api, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use futures_util::{AsyncBufReadExt, TryStreamExt};
 use tokio::task::JoinHandle;
 use tracing::{Level, info, warn};
 use uuid::Uuid;
@@ -140,6 +140,14 @@ const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 /// Label carrying the pipeline identifier, part of the stable selector.
 const LABEL_INSTANCE: &str = "app.kubernetes.io/instance";
 
+/// Label a scrape job selects on to find the metrics `Service` of a pipeline.
+///
+/// It follows the `app.kubernetes.io` convention the rest of the objects use
+/// instead of the `prometheus.io/scrape` annotation: annotations cannot be
+/// selected by a `ServiceMonitor`, and a label also survives a scraper that
+/// reads Services rather than pods.
+const LABEL_METRICS_SCRAPE: &str = "feldera.com/metrics-scrape";
+
 /// Name shared by the `StatefulSet` and its headless `Service`.
 fn resource_base(pipeline_id: PipelineId) -> String {
     format!("pipeline-{pipeline_id}")
@@ -158,6 +166,30 @@ fn storage_claim_name(pipeline_id: PipelineId) -> String {
 /// Name of the single pod a `StatefulSet` with one replica creates.
 fn pod_name(pipeline_id: PipelineId) -> String {
     format!("{}-0", resource_base(pipeline_id))
+}
+
+/// The `ClusterIP` `Service` a Prometheus server scrapes.
+///
+/// Distinct from [`resource_base`] because that name belongs to the headless
+/// `Service` the manager talks to, and a `StatefulSet` may name only one
+/// governing Service.
+fn metrics_service_name(pipeline_id: PipelineId) -> String {
+    format!("{}-metrics", resource_base(pipeline_id))
+}
+
+/// Labels that identify the metrics `Service` to a generic scrape job.
+///
+/// A Prometheus Operator `ServiceMonitor` and a plain
+/// `kubernetes_sd_configs` job both select on these, so they are the hook a
+/// deployment uses to pick pipeline metrics up without knowing the pipeline
+/// ids.
+fn metrics_service_labels(
+    pipeline_id: PipelineId,
+    deployment_id: Uuid,
+) -> BTreeMap<String, String> {
+    let mut labels = object_labels(pipeline_id, deployment_id);
+    labels.insert(LABEL_METRICS_SCRAPE.to_string(), "true".to_string());
+    labels
 }
 
 /// Labels applied to every object of one deployment.
@@ -287,7 +319,10 @@ fn pod_resources(config: &PipelineConfig, platform: ResourceLimits) -> ResourceR
         requests.insert("cpu".to_string(), cpu_quantity(cores));
     }
     if let Some(mb) = resources.memory_mb_min.filter(|mb| *mb > 0) {
-        requests.insert("memory".to_string(), mebibyte_quantity(platform.clamp_memory(mb)));
+        requests.insert(
+            "memory".to_string(),
+            mebibyte_quantity(platform.clamp_memory(mb)),
+        );
     }
     if let Some(cores) = resources.cpu_cores_max.filter(|cores| *cores > 0.0) {
         limits.insert("cpu".to_string(), cpu_quantity(cores));
@@ -407,6 +442,11 @@ struct RenderInput {
     service_account: Option<String>,
     /// Namespace the manager runs in. Only its pods may reach the pipeline port.
     manager_namespace: String,
+    /// Namespace allowed to scrape the pipeline metrics Service, if any.
+    ///
+    /// `Some` adds the metrics Service and widens the `NetworkPolicy` to
+    /// admit that namespace; see `--kubernetes-runner-metrics-service`.
+    metrics_namespace: Option<String>,
 }
 
 /// The objects provisioning creates for one pipeline deployment.
@@ -415,6 +455,9 @@ struct PipelineObjects {
     secret: Secret,
     storage_claim: Option<PersistentVolumeClaim>,
     service: Service,
+    /// `ClusterIP` Service a Prometheus server scrapes; absent unless the
+    /// platform exposes pipeline metrics.
+    metrics_service: Option<Service>,
     network_policy: NetworkPolicy,
     statefulset: StatefulSet,
 }
@@ -429,6 +472,7 @@ impl RenderInput {
             secret: self.render_secret(),
             storage_claim: self.render_storage_claim(),
             service: self.render_service(),
+            metrics_service: self.render_metrics_service(),
             network_policy: self.render_network_policy(),
             statefulset: self.render_statefulset(),
         }
@@ -481,12 +525,14 @@ impl RenderInput {
         })
     }
 
+    /// The headless Service the manager addresses the pipeline through.
+    ///
+    /// `headless`: the DNS name resolves to the pod's own address, so the
+    /// manager can reach the pipeline without a stable ClusterIP.
     fn render_service(&self) -> Service {
         Service {
             metadata: self.metadata(),
             spec: Some(ServiceSpec {
-                // Headless: the DNS name resolves to the pod's own address, so
-                // the manager can reach the pipeline without a stable ClusterIP.
                 cluster_ip: Some("None".to_string()),
                 ports: Some(vec![ServicePort {
                     name: Some("http".to_string()),
@@ -502,6 +548,45 @@ impl RenderInput {
         }
     }
 
+    /// Renders the Service a Prometheus server scrapes.
+    ///
+    /// The headless Service above exists for the manager: its DNS name resolves
+    /// to the pod's own address, which is exactly what the manager needs and
+    /// exactly what a `prometheus.io/scrape` target list cannot use, because a
+    /// headless Service has no cluster address to point at. This Service is
+    /// therefore a second, `ClusterIP`-backed one with the metrics labels a
+    /// generic Prometheus job selects on.
+    ///
+    /// It points at the same port as the headless Service: the pipeline serves
+    /// its `/metrics` from the same HTTP server as its API. Widening the scrape
+    /// path would mean a second listener in the pipeline, which buys nothing
+    /// because the payload is public inside the cluster anyway.
+    fn render_metrics_service(&self) -> Option<Service> {
+        self.metrics_namespace.as_ref()?;
+        Some(Service {
+            metadata: ObjectMeta {
+                name: Some(metrics_service_name(self.pipeline_id)),
+                labels: Some(metrics_service_labels(self.pipeline_id, self.deployment_id)),
+                ..self.metadata()
+            },
+            spec: Some(ServiceSpec {
+                // ClusterIP, not headless: a scraper needs a stable address.
+                ports: Some(vec![ServicePort {
+                    // The name becomes the endpoint port name, which is what
+                    // `prometheus-k8s.yml` selects on; keep the two in step.
+                    name: Some("http".to_string()),
+                    port: i32::from(PIPELINE_PORT),
+                    target_port: Some(IntOrString::Int(i32::from(PIPELINE_PORT))),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+                selector: Some(selector_labels(self.pipeline_id)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
     /// Restricts the pipeline port to the manager namespace.
     ///
     /// The pipeline's HTTP API is an internal control interface: the manager
@@ -510,7 +595,20 @@ impl RenderInput {
     /// policy only lists `Ingress` in `policyTypes`). A cluster whose CNI does
     /// not implement NetworkPolicy ignores the object, which is the Kubernetes
     /// contract for it.
+    ///
+    /// When the platform exposes pipeline metrics, the scrape namespace is
+    /// admitted as a second peer on the same port. It has to be a peer of its
+    /// own: a peer matches whole namespaces, and folding the two names into one
+    /// selector would match neither.
     fn render_network_policy(&self) -> NetworkPolicy {
+        let mut peers = vec![self.namespace_peer(&self.manager_namespace)];
+        if let Some(metrics_namespace) = self
+            .metrics_namespace
+            .as_deref()
+            .filter(|namespace| *namespace != self.manager_namespace)
+        {
+            peers.push(self.namespace_peer(metrics_namespace));
+        }
         NetworkPolicy {
             metadata: ObjectMeta {
                 name: Some(resource_base(self.pipeline_id)),
@@ -523,16 +621,7 @@ impl RenderInput {
                 }),
                 policy_types: Some(vec!["Ingress".to_string()]),
                 ingress: Some(vec![NetworkPolicyIngressRule {
-                    from: Some(vec![NetworkPolicyPeer {
-                        namespace_selector: Some(LabelSelector {
-                            match_labels: Some(BTreeMap::from([(
-                                NAMESPACE_NAME_LABEL.to_string(),
-                                self.manager_namespace.clone(),
-                            )])),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }]),
+                    from: Some(peers),
                     ports: Some(vec![NetworkPolicyPort {
                         port: Some(IntOrString::Int(i32::from(PIPELINE_PORT))),
                         protocol: Some("TCP".to_string()),
@@ -540,6 +629,23 @@ impl RenderInput {
                     }]),
                 }]),
                 egress: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A peer that admits every pod of `namespace`.
+    ///
+    /// The selector uses the label the API server stamps on every namespace,
+    /// so it does not depend on how the namespace was created.
+    fn namespace_peer(&self, namespace: &str) -> NetworkPolicyPeer {
+        NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    NAMESPACE_NAME_LABEL.to_string(),
+                    namespace.to_string(),
+                )])),
+                ..Default::default()
             }),
             ..Default::default()
         }
@@ -996,6 +1102,16 @@ impl KubernetesRunner {
                 .kubernetes_runner_manager_namespace
                 .clone()
                 .unwrap_or_else(|| namespace.to_string()),
+            // A metrics Service without a namespace to admit would create an
+            // object nobody may scrape. Fall back to the manager namespace,
+            // which keeps the policy exactly as it was and still leaves the
+            // Service reachable on a CNI that does not enforce the policy.
+            metrics_namespace: self.config.kubernetes_runner_metrics_service.then(|| {
+                self.config
+                    .kubernetes_runner_metrics_namespace
+                    .clone()
+                    .unwrap_or_else(|| namespace.to_string())
+            }),
         }
     }
 
@@ -1382,6 +1498,11 @@ impl PipelineExecutor for KubernetesRunner {
         let service_name = resource_base(self.pipeline_id);
         self.apply(&services, &service_name, &objects.service)
             .await?;
+        if let Some(metrics_service) = &objects.metrics_service {
+            let metrics_name = metrics_service_name(self.pipeline_id);
+            self.apply(&services, &metrics_name, metrics_service)
+                .await?;
+        }
 
         // The policy has to exist before the pod, otherwise the pod is briefly
         // reachable from everywhere the cluster allows.
@@ -1503,9 +1624,13 @@ impl PipelineExecutor for KubernetesRunner {
         let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
         let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
         let policies: Api<NetworkPolicy> = Api::namespaced(client, &namespace);
-        let deletions: [(&str, String); 5] = [
+        let deletions: [(&str, String); 6] = [
             ("StatefulSet", resource_base(self.pipeline_id)),
             ("Service", resource_base(self.pipeline_id)),
+            // Deleting a Service that was never created is a 404, which the
+            // loop below tolerates, so the metrics Service needs no branch on
+            // whether this deployment had one.
+            ("Service", metrics_service_name(self.pipeline_id)),
             ("NetworkPolicy", resource_base(self.pipeline_id)),
             ("Secret", config_secret_name(self.pipeline_id)),
             (
@@ -1632,9 +1757,7 @@ impl KubernetesRunner {
                         loop {
                             match lines.try_next().await {
                                 Ok(Some(line)) => {
-                                    logs_sender
-                                        .send(LogMessage::new_from_pipeline(&line))
-                                        .await;
+                                    logs_sender.send(LogMessage::new_from_pipeline(&line)).await;
                                 }
                                 Ok(None) => break,
                                 Err(error) => {
@@ -1792,6 +1915,15 @@ mod tests {
                 }),
             service_account: config.global.resources.service_account_name.clone(),
             manager_namespace: "feldera".to_string(),
+            metrics_namespace: None,
+        }
+    }
+
+    /// Same as [`render_input`], with pipeline metrics exposed to `namespace`.
+    fn render_input_with_metrics(config: &PipelineConfig, namespace: &str) -> RenderInput {
+        RenderInput {
+            metrics_namespace: Some(namespace.to_string()),
+            ..render_input(config)
         }
     }
 
@@ -1829,6 +1961,122 @@ mod tests {
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, Some(IntOrString::Int(8080)));
         assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));
+    }
+
+    /// The default deployment creates no scrape target.
+    ///
+    /// Exposing pipeline metrics widens the NetworkPolicy, so it has to be an
+    /// explicit choice and not something the chart does on install.
+    #[test]
+    fn no_metrics_service_by_default() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let input = render_input(&config);
+        assert!(input.render_metrics_service().is_none());
+        let objects = input.render();
+        assert!(objects.metrics_service.is_none());
+    }
+
+    /// The metrics Service is a ClusterIP, labelled for a scrape job, and
+    /// selects the same pods as the headless Service.
+    #[test]
+    fn metrics_service_is_scrapable() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let input = render_input_with_metrics(&config, "monitoring");
+        let service = input.render_metrics_service().expect("metrics are exposed");
+
+        assert_eq!(
+            service.metadata.name.as_deref(),
+            Some(metrics_service_name(PipelineId(Uuid::nil())).as_str())
+        );
+        let labels = service.metadata.labels.clone().expect("labels");
+        assert_eq!(
+            labels.get(LABEL_METRICS_SCRAPE).map(String::as_str),
+            Some("true")
+        );
+        // The pipeline identity survives on the Service, so a scrape job can
+        // still tell instances apart.
+        assert_eq!(
+            labels.get(LABEL_PIPELINE_ID).map(String::as_str),
+            Some(Uuid::nil().to_string().as_str())
+        );
+
+        let spec = service.spec.expect("the service has a spec");
+        // Not headless: a scraper needs an address to send requests to.
+        assert_eq!(spec.cluster_ip, None);
+        let ports = spec.ports.expect("one port");
+        assert_eq!(ports.len(), 1);
+        // The port name is what the endpoint carries, and therefore what the
+        // scrape job matches on (`prometheus-k8s.yml` selects `http`).
+        assert_eq!(ports[0].name.as_deref(), Some("http"));
+        assert_eq!(ports[0].port, 8080);
+        assert_eq!(ports[0].target_port, Some(IntOrString::Int(8080)));
+        assert_eq!(
+            spec.selector,
+            Some(selector_labels(PipelineId(Uuid::nil())))
+        );
+    }
+
+    /// The metrics Service must not reuse the headless Service's name: a
+    /// StatefulSet names exactly one governing Service, and a second Service
+    /// with the same name cannot exist.
+    #[test]
+    fn metrics_service_has_its_own_name() {
+        let pipeline_id = PipelineId(Uuid::nil());
+        assert_ne!(
+            metrics_service_name(pipeline_id),
+            resource_base(pipeline_id),
+            "the metrics Service would collide with the headless Service"
+        );
+        assert_eq!(
+            metrics_service_name(pipeline_id),
+            format!("{}-metrics", resource_base(pipeline_id))
+        );
+    }
+
+    /// Exposing metrics admits the scrape namespace in the NetworkPolicy.
+    #[test]
+    fn network_policy_admits_the_metrics_namespace() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let policy = render_input_with_metrics(&config, "monitoring").render_network_policy();
+        let rules = policy
+            .spec
+            .expect("the policy has a spec")
+            .ingress
+            .expect("one ingress rule");
+        let peers = rules[0].from.clone().expect("two peers");
+        assert_eq!(
+            peers.len(),
+            2,
+            "the manager namespace and the scrape namespace are separate peers, \
+             because a namespace selector matches one name"
+        );
+        let names: Vec<String> = peers
+            .iter()
+            .filter_map(|peer| {
+                peer.namespace_selector
+                    .as_ref()
+                    .and_then(|selector| selector.match_labels.as_ref())
+                    .and_then(|labels| labels.get(NAMESPACE_NAME_LABEL))
+                    .cloned()
+            })
+            .collect();
+        assert_eq!(names, vec!["feldera".to_string(), "monitoring".to_string()]);
+    }
+
+    /// A scrape namespace equal to the manager namespace adds no peer.
+    ///
+    /// It would be the same selector twice, which Kubernetes accepts but which
+    /// makes the rendered object misleading.
+    #[test]
+    fn metrics_namespace_that_is_the_manager_namespace_adds_no_peer() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let policy = render_input_with_metrics(&config, "feldera").render_network_policy();
+        let rules = policy
+            .spec
+            .expect("the policy has a spec")
+            .ingress
+            .expect("one ingress rule");
+        assert_eq!(rules[0].from.clone().expect("one peer").len(), 1);
     }
 
     #[test]
@@ -1918,7 +2166,12 @@ mod tests {
             bootstrap_policy: "",
         };
         let statefulset = runner
-            .render_from_template(&fake_api::client(cluster.clone()), "pipelines", "feldera", &values)
+            .render_from_template(
+                &fake_api::client(cluster.clone()),
+                "pipelines",
+                "feldera",
+                &values,
+            )
             .await
             .expect("the template renders");
 
@@ -1977,10 +2230,18 @@ mod tests {
             bootstrap_policy: "",
         };
         let error = runner
-            .render_from_template(&fake_api::client(cluster.clone()), "pipelines", "feldera", &values)
+            .render_from_template(
+                &fake_api::client(cluster.clone()),
+                "pipelines",
+                "feldera",
+                &values,
+            )
             .await
             .expect_err("a missing ConfigMap is a provisioning error");
-        assert!(error.to_string().contains("pipelines"), "unexpected: {error}");
+        assert!(
+            error.to_string().contains("pipelines"),
+            "unexpected: {error}"
+        );
     }
 
     #[test]
@@ -2011,11 +2272,8 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let probe = fetch_status(
-            &reqwest::Client::new(),
-            &format!("http://{address}/status"),
-        )
-        .await;
+        let probe =
+            fetch_status(&reqwest::Client::new(), &format!("http://{address}/status")).await;
         assert_eq!(probe.http_status, Some(200));
         assert!(probe.error.is_none(), "unexpected error: {probe:?}");
         assert_eq!(
@@ -2033,11 +2291,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
 
-        let probe = fetch_status(
-            &reqwest::Client::new(),
-            &format!("http://{address}/status"),
-        )
-        .await;
+        let probe =
+            fetch_status(&reqwest::Client::new(), &format!("http://{address}/status")).await;
         assert!(probe.http_status.is_none());
         assert!(probe.body.is_none());
         assert!(probe.error.is_some());
@@ -2126,7 +2381,10 @@ mod tests {
         let requests = claim_spec.resources.unwrap().requests.unwrap();
         assert_eq!(
             requests.get("storage").map(|quantity| quantity.0.clone()),
-            Some(format!("{}Mi", ResourceLimits::default().storage_mb_default))
+            Some(format!(
+                "{}Mi",
+                ResourceLimits::default().storage_mb_default
+            ))
         );
         // The pod mounts the claim at the path the storage config points at.
         let pod_spec = input
@@ -2156,7 +2414,8 @@ mod tests {
             memory_mb_max: None,
             ..ResourceConfig::default()
         };
-        let requirements = pod_resources(&pipeline_config(resources, &[]), ResourceLimits::default());
+        let requirements =
+            pod_resources(&pipeline_config(resources, &[]), ResourceLimits::default());
         assert!(requirements.limits.is_none());
     }
 
@@ -2169,7 +2428,8 @@ mod tests {
             memory_mb_max: Some(1024),
             ..ResourceConfig::default()
         };
-        let requirements = pod_resources(&pipeline_config(resources, &[]), ResourceLimits::default());
+        let requirements =
+            pod_resources(&pipeline_config(resources, &[]), ResourceLimits::default());
         let requests = requirements.requests.unwrap_or_default();
         assert!(!requests.contains_key("cpu"), "a zero CPU request is noise");
         assert!(!requests.contains_key("memory"));
@@ -2285,6 +2545,8 @@ mod tests {
                 kubernetes_runner_upper_memory_mb: 32_000,
                 kubernetes_runner_default_storage_mb: 30_000,
                 kubernetes_runner_upper_storage_mb: 128_000,
+                kubernetes_runner_metrics_service: false,
+                kubernetes_runner_metrics_namespace: None,
             },
             client: reqwest::Client::new(),
             logs_sender: logs_sender(),
@@ -2511,9 +2773,7 @@ mod tests {
                 ["api", "v1", "namespaces", _ns, kind] => (*kind, None),
                 ["api", "v1", "namespaces", _ns, kind, name] => (*kind, Some(*name)),
                 ["apis", _group, _version, "namespaces", _ns, kind] => (*kind, None),
-                ["apis", _group, _version, "namespaces", _ns, kind, name] => {
-                    (*kind, Some(*name))
-                }
+                ["apis", _group, _version, "namespaces", _ns, kind, name] => (*kind, Some(*name)),
                 _ => return status(StatusCode::NOT_FOUND, "route", path),
             };
             if kind == "configmaps" && method == Method::GET {
@@ -2583,6 +2843,8 @@ mod tests {
             kubernetes_runner_upper_memory_mb: 32_000,
             kubernetes_runner_default_storage_mb: 30_000,
             kubernetes_runner_upper_storage_mb: 128_000,
+            kubernetes_runner_metrics_service: false,
+            kubernetes_runner_metrics_namespace: None,
         }
     }
 
@@ -2836,6 +3098,14 @@ mod tests {
                 "/services/pipeline-00000000-0000-0000-0000-000000000000"
             ),
             1
+        );
+        assert_eq!(
+            cluster.count(
+                "DELETE",
+                "/services/pipeline-00000000-0000-0000-0000-000000000000-metrics"
+            ),
+            1,
+            "a deployment that exposed metrics must not leave its Service behind"
         );
         assert_eq!(
             cluster.count(

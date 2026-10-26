@@ -129,3 +129,6 @@ services:
     restart: unless-stopped
     volumes:
         - ./config/grafana_data_sources.yaml:/etc/grafana/provisioning/datasources/grafana_data_sources.yaml
+        # P1-015: load the dashboard instead of asking the user to import it.
+        - ./config/grafana_dashboards.yaml:/etc/grafana/provisioning/dashboards/grafana_dashboards.yaml
+        - ./grafana_dashboard.json:/etc/grafana/dashboards/grafana_dashboard.json

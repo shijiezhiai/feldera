@@ -74,10 +74,10 @@ spec:
             - "--kubernetes-runner-namespace={{ .Release.Namespace }}"
             - "--kubernetes-runner-pipeline-executor-image={{ .Values.kubernetesRunner.image.registry }}/{{ .Values.kubernetesRunner.image.repository }}:{{ .Values.kubernetesRunner.image.tag }}"
             {{- if .Values.kubernetesRunner.enablePerPipelineNamespace }}
-            - "--kubernetes-runner-per-pipeline-namespace=true"
+            - "--kubernetes-runner-per-pipeline-namespace"
             {{- end }}
             {{- if .Values.kubernetesRunner.allowCustomPipelineTemplate }}
-            - "--kubernetes-runner-allow-kubernetes-env-prefix=true"
+            - "--kubernetes-runner-allow-kubernetes-env-prefix"
             {{- end }}
             # Resource range of the platform; the runner clamps every pipeline
             # request into it (P1-011).
@@ -85,6 +85,13 @@ spec:
             - "--kubernetes-runner-upper-memory-mb={{ .Values.kubernetesRunner.upperLimitMemoryMegabyte }}"
             - "--kubernetes-runner-default-storage-mb={{ .Values.kubernetesRunner.defaultStorageMegabyte }}"
             - "--kubernetes-runner-upper-storage-mb={{ .Values.kubernetesRunner.upperLimitStorageMegabyte }}"
+            {{- if .Values.kubernetesRunner.metrics.enabled }}
+            # P1-015: scrape target per pipeline, labelled feldera.com/metrics-scrape.
+            - "--kubernetes-runner-metrics-service"
+            {{- with .Values.kubernetesRunner.metrics.namespace }}
+            - "--kubernetes-runner-metrics-namespace={{ . }}"
+            {{- end }}
+            {{- end }}
             {{- with .Values.kubernetesRunner.template.configMap }}
             - "--kubernetes-runner-template-configmap={{ . }}"
             - "--kubernetes-runner-template-key={{ $.Values.kubernetesRunner.template.key }}"
