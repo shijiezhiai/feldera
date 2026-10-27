@@ -37,8 +37,12 @@ spec:
             # host must be the in-cluster address, never 127.0.0.1.
             - name: FELDERA_RUNNER
               value: "kubernetes"
+            # P1-018: the artifacts live in the compiler StatefulSet, not in
+            # this pod, so this process serves the API and the runner only.
+            - name: FELDERA_SERVICES
+              value: "api"
             - name: COMPILER_HOST
-              value: {{ include "controlplane.fullname" . }}-api-server.{{ .Release.Namespace }}.svc.cluster.local
+              value: {{ .Values.compilerServiceHost | default (printf "%s-compiler.%s.svc.cluster.local" .Release.Name .Release.Namespace) | quote }}
             {{- end }}
             {{- if not .Values.postgresExternal }}
             - name: DB_USER

@@ -415,3 +415,33 @@ kind 上 `scripts/e2e-k8s-reaper.sh` 全绿（报告模式 4 步 + 删除模式�
 另有一个部署层面的坑：`--kubernetes-runner-reap-orphans=true` 会报
 `unexpected value 'true'`,clap 的布尔 flag 只接受裸写 `--kubernetes-runner-reap-orphans`
 （或者用 env `FELDERA_KUBERNETES_RUNNER_REAP_ORPHANS=true`，config 里两个都声明了）。
+
+## P1-018：编译放到独立 Pod
+
+单测 `runner::`+`config::` 128 passed（新增 `ServiceRole` 解析 7 个）。
+kind 上 `scripts/e2e-k8s-compiler.sh` 七步全绿：两个 pod 角色不同、API server 无编译
+worker、跨 pod HTTP 可达、pipeline 编译成功、制品落在 compiler 的 claim 上、API server
+pod 从 HTTP 取回同一份字节且 sha256 与文件名一致、编译错误原样穿过 API。
+另测崩溃隔离：删掉 compiler pod 后 API server 的 `/healthz` 与 `/v0/pipelines` 仍是
+200，compiler pod 自行重建。
+
+实现中发现的问题，按"会不会在单测里暴露"排序：
+
+1. **compiler 的 database 地址是空的**。`charts/feldera/values.yaml` 的
+   `compiler.postgresPort` 从没被父 chart 设过，渲染出来是
+   `@feldera-db:/feldera`，connection string 解析失败只在 pod 起来时才炸。
+   subchart 读不到兄弟的 values，所以父 chart 显式给了一份。
+2. **`program_status` 是字符串不是对象**。第一版 e2e 按
+   `["program_status"]["status"]` 取，永远得到空串，于是"编译超时"——实际早就
+   Success 了。同一版本里 `program_error.sql_compilation.messages` 是
+   对象数组（取 `m["message"]`），不是字符串数组。
+3. **编译器日志里的 checksum 是 12 位截断**，而文件名里的 `_sc_`/`_ic_` 是全量
+   sha256。想核对"日志说的"和"磁盘上的"必须按前缀匹配，全等比较永远失败。
+   制品真身是 `rust-compilation/pipeline-binaries/pipeline_<id>_v<N>_sc_<64>_ic_<64>`，
+   `target/unoptimized/feldera_pipe_*_main` 只是 cargo 的中间产物。
+4. **取制品的端点有两个**：`/artifacts/<id>/<v>/<sc>/<ic>/<pic>` 只返回存在性
+   （200/404，旧调用方传 `none` 当占位），`/binary/<id>/<v>/<sc>/<ic>` 才返回字节。
+   拿 `/artifacts/...` 去 `sha256sum` 得到的是空响应体。
+
+部署名也不是想当然的 `feldera-api-server`，而是
+`feldera-controlplane-api-server`（chart 的 fullname 由 release 名加子 chart 名拼成）。

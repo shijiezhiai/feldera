@@ -188,7 +188,16 @@ build_manager() {
 # CPU 0% 永久挂，见 MEMORY 教训）。buildkit 缓存本就按层留存：同一 Dockerfile
 # 的中间层随全量构建缓存，不必预烤。
 build_manager
-build_one feldera-compiler Dockerfile.compiler
+# The compiler image is the manager image plus a service selection (P1-018), so
+# it is built from the manager tag that was just produced rather than through
+# its own toolchain stack.
+COMPILER_BASE_IMAGE="$(docker image ls --format '{{.Repository}}:{{.Tag}}' \
+  | grep -E "^feldera-manager:${VER}-bili\\.[0-9]+$" | sort -t. -k5 -n | tail -1)"
+if [[ -z "${COMPILER_BASE_IMAGE}" ]]; then
+  echo "ERROR: no feldera-manager:${VER}-bili.N image to derive the compiler image from" >&2
+  exit 1
+fi
+build_one feldera-compiler Dockerfile.compiler --build-arg BASE_IMAGE="${COMPILER_BASE_IMAGE}"
 build_one feldera-runner Dockerfile.runner
 
 echo

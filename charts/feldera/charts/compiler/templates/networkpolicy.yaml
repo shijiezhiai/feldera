@@ -1,0 +1,85 @@
+{{- if .Values.networkPolicy.enabled }}
+# P1-018: the compiler pod is the one pod that runs `cargo` against the
+# internet-shaped network. Everything a pipeline compilation fetches comes from
+# the crates mirror baked into the image or from a mirror an operator runs, so
+# the policy below allows exactly those and the database, and drops the rest.
+#
+# Egress to the artifact server is not listed because it is this pod: a
+# compilation uploads to itself. When `compileInThisPod` is turned off and the
+# compilers become separate pods, they talk to the artifact server over the
+# in-cluster API server rule below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "compiler.fullname" . }}
+  labels:
+    {{- include "compiler.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "compiler.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Egress
+    {{- if .Values.networkPolicy.restrictIngress }}
+    - Ingress
+    {{- end }}
+  egress:
+    # The database, which is the work queue and the artifact registry.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # The API server, which polls this pod for health and, in a future
+    # split-compiler shape, for artifacts.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Chart.Name }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.compilerPort }}
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- with .Values.networkPolicy.egressAllow }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if .Values.networkPolicy.restrictIngress }}
+  ingress:
+    # Only the API server may call this pod: the compilation endpoints return
+    # pipeline binaries, and a pod that can reach them can read every pipeline
+    # program in the namespace.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Chart.Name }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.compilerPort }}
+    # The kubelet's probes come from the node, not from a pod, so blocking all
+    # ingress would restart a healthy compiler forever.
+    - from:
+        - namespaceSelector: {}
+          podSelector: {}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: {{ .Values.compilerPort }}
+  {{- end }}
+{{- end }}

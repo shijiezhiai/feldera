@@ -4,6 +4,22 @@ image:
   tag: "v0.357.0-20-g7a5128651-bili.1"
   pullPolicy: IfNotPresent
 
+# Runs the SQL and Rust compilation tasks in this pod. On by default: this is
+# the compiler of the split deployment, and the API server pod has neither the
+# source tree nor the cargo cache a compilation needs. Turning it off leaves a
+# pure artifact store, which is the shape to grow into one store plus N
+# stateless compilers (P1-018).
+compileInThisPod: true
+
+# Port of the artifact store; the API server reaches it at
+# --compiler-host=<release>-compiler.<namespace>.svc.cluster.local.
+compilerPort: 8085
+
+# Port the platform database listens on inside the cluster. The umbrella chart
+# sets the same value under `controlplane`; this copy exists because a subchart
+# cannot read its sibling's values.
+postgresPort: 5431
+
 compilerPvcStorageSize: 20Gi
 compilationProfile: optimized
 
@@ -15,6 +31,18 @@ compilerServer:
 parallelCompilation:
   enabled: false
   replicas: 1
+
+# P1-018: the compiler pod runs cargo, which fetches crates. The default policy
+# allows the database, DNS and the API server, and nothing else: a compilation
+# that needs another endpoint has it added to `egressAllow` deliberately rather
+# than a pod silently reaching the whole cluster and the internet.
+networkPolicy:
+  enabled: false
+  # Restrict who may call the artifact endpoints as well. Off by default
+  # because the kubelet probes arrive from the node; turning it on requires the
+  # node CIDR in `egressAllow`-style rules to keep liveness checks working.
+  restrictIngress: false
+  egressAllow: []
 
 resources:
   requests:

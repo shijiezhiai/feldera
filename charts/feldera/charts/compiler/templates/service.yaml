@@ -11,5 +11,5 @@ spec:
     app.kubernetes.io/instance: {{ .Release.Name }}
   ports:
     - name: compiler
-      port: 8080
-      targetPort: 8080
+      port: {{ .Values.compilerPort }}
+      targetPort: {{ .Values.compilerPort }}
