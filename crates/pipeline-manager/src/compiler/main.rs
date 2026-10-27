@@ -970,6 +970,54 @@ pub async fn compiler_main(
     }))
 }
 
+/// Runs only the compiler's two worker tasks, without the HTTP server.
+///
+/// This is the compilation half of a split deployment: the tasks claim work
+/// from the database and upload their results to whichever artifact server
+/// `--compiler-host` names, which is exactly what they do inside
+/// [`compiler_main`]. Splitting it out lets compilation scale on machines
+/// that hold no artifacts, and lets the artifact server restart without
+/// taking in-flight compilations down with it.
+pub async fn compilation_tasks_main(
+    common_config: CommonConfig,
+    config: CompilerConfig,
+    db: Arc<Mutex<StoragePostgres>>,
+    worker_id: usize,
+    total_workers: usize,
+    allow_exit_upon_target_cleared: bool,
+) -> Result<(), ManagerError> {
+    // The working directory holds in-progress compilation state, not
+    // artifacts: artifacts are uploaded as soon as a compilation finishes.
+    create_working_directory_if_not_exists(&config).await?;
+
+    // Spawn compilation threads
+    let sql_task = spawn(sql_compiler_task(
+        worker_id,
+        total_workers,
+        common_config.clone(),
+        config.clone(),
+        db.clone(),
+    ));
+    let rust_task = spawn(rust_compiler_task(
+        worker_id,
+        total_workers,
+        common_config,
+        config,
+        db,
+        allow_exit_upon_target_cleared,
+    ));
+
+    let error = tokio::select! {
+        _ = sql_task => "Compiler SQL task ended prematurely",
+        _ = rust_task => "Compiler Rust task ended prematurely",
+    };
+    error!("{error}");
+    error!("Returning compiler thread");
+    Err(ManagerError::from(CompilerError::TaskFailed {
+        error: error.to_string(),
+    }))
+}
+
 /// Runs the artifact-store variant of the compiler server: the full HTTP
 /// surface plus a janitor, but no SQL or Rust compilation tasks. Serves
 /// deployments where compiler workers are ephemeral and this process is the

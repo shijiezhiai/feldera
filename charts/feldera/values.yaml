@@ -49,6 +49,7 @@ compiler:
     pullPolicy: IfNotPresent
   compilerPvcStorageSize: 20Gi
   compilationProfile: optimized
+  compileInThisPod: true
   parallelCompilation:
     replicas: 1
   resources:

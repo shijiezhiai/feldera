@@ -2235,6 +2235,7 @@ mod test {
         let automaton = PipelineAutomaton::new(
             CommonConfig {
                 platform_version: "v0".to_string(),
+                services: vec![crate::config::ServiceRole::All],
                 bind_address: "127.0.0.1".to_string(),
                 api_host: "127.0.0.1".to_string(),
                 api_port: 8080,

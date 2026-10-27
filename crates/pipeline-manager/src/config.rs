@@ -314,6 +314,37 @@ pub struct CommonConfig {
     #[arg(verbatim_doc_comment, long, default_value_t = default_http_workers(), env = "FELDERA_HTTP_WORKERS", value_parser = cpu_quantity_to_workers)]
     pub http_workers: usize,
 
+    /// Services this process runs, as a comma-separated list of `all`,
+    /// `api`, `compiler`, `artifact-server`.
+    ///
+    /// `all` (the default) runs the API server, the compiler and the runner in
+    /// one process, which is what a single-container deployment wants.
+    ///
+    /// `compiler` runs only the SQL and Rust compilation tasks, which pull work
+    /// from the database and push artifacts back over HTTP: the process needs
+    /// the same compiler working directory as the artifact server but no API.
+    ///
+    /// `artifact-server` runs the artifact HTTP surface (binaries, program
+    /// infos, uploads, validation) and its janitor, but neither compiles nor
+    /// serves the API. This is the durable store the
+    /// [`Self::compiler_host`] of the API server points at, and the only
+    /// process that needs the compiler working directory to survive a restart.
+    ///
+    /// `api` runs the API server and the runner, which is the API server of a
+    /// split deployment: it reaches the artifact server through
+    /// `--compiler-host`/`--compiler-port`.
+    ///
+    /// EXAMPLES: `all`, `api`, `compiler`, `artifact-server`,
+    /// `compiler,artifact-server`.
+    #[arg(
+        long,
+        env = "FELDERA_SERVICES",
+        default_value = "all",
+        value_delimiter = ',',
+        value_enum
+    )]
+    pub services: Vec<ServiceRole>,
+
     /// Enable experimental platform features.
     ///
     /// These features are not yet stable and may change or be removed in the future.
@@ -448,6 +479,9 @@ impl CommonConfig {
 
     /// Converts all paths in the `self` to absolute paths.
     pub fn canonicalize(mut self) -> AnyResult<Self> {
+        if let Err(error) = self.validate_services() {
+            anyhow::bail!(error);
+        }
         self.ensure_testing_https_cert_key()?;
         let _ = self.https_config();
         if let Some(https_tls_cert_path) = self.https_tls_cert_path {
@@ -689,6 +723,7 @@ impl CommonConfig {
             runner_port: 8089,
             platform_version: "v0".to_string(),
             http_workers: 1,
+            services: vec![ServiceRole::All],
             unstable_features: None,
             enable_https: false,
             https_tls_cert_path: None,
@@ -949,6 +984,75 @@ impl ServerCertVerifier for SkipHostnameVerification {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.supported_verify_schemes()
+    }
+}
+
+/// One of the services inside the pipeline manager process.
+///
+/// See [`CommonConfig::services`] for what each role runs.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceRole {
+    /// Every service: API server, runner, compiler and artifact server.
+    All,
+    /// API server and runner.
+    Api,
+    /// SQL and Rust compilation tasks.
+    Compiler,
+    /// Artifact HTTP server and its janitor.
+    ArtifactServer,
+}
+
+impl std::fmt::Display for ServiceRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ServiceRole::All => write!(f, "all"),
+            ServiceRole::Api => write!(f, "api"),
+            ServiceRole::Compiler => write!(f, "compiler"),
+            ServiceRole::ArtifactServer => write!(f, "artifact-server"),
+        }
+    }
+}
+
+impl CommonConfig {
+    /// Whether this process runs the API server and the runner.
+    pub fn runs_api(&self) -> bool {
+        self.services
+            .iter()
+            .any(|role| matches!(role, ServiceRole::All | ServiceRole::Api))
+    }
+
+    /// Whether this process runs the SQL and Rust compilation tasks.
+    pub fn runs_compilation(&self) -> bool {
+        self.services
+            .iter()
+            .any(|role| matches!(role, ServiceRole::All | ServiceRole::Compiler))
+    }
+
+    /// Whether this process runs the artifact HTTP server.
+    ///
+    /// A compiling process uploads through the artifact server rather than
+    /// serving it itself, so `compiler` alone does not imply this: the upload
+    /// path already goes through `--compiler-host`, and reusing it keeps the
+    /// compilation tasks identical whether they run beside the server or
+    /// across the cluster from it.
+    pub fn runs_artifact_server(&self) -> bool {
+        self.services
+            .iter()
+            .any(|role| matches!(role, ServiceRole::All | ServiceRole::ArtifactServer))
+    }
+
+    /// Validates the service selection, returning a message naming what is
+    /// wrong rather than letting the process start and do nothing.
+    pub fn validate_services(&self) -> Result<(), String> {
+        if self.runs_compilation() && !self.runs_artifact_server() {
+            return Err(
+                "the compiler uploads its artifacts to an artifact server, but none is \
+                 selected: add `artifact-server` to --services"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2151,5 +2255,60 @@ mod tests {
             config.kubernetes_runner_metrics_namespace.as_deref(),
             Some("monitoring")
         );
+    }
+
+    /// An invocation without the flag runs every service, which is what a
+    /// single-container deployment relies on.
+    #[test]
+    fn services_default_to_all() {
+        let config = CommonConfig::try_parse_from(["test"]).unwrap();
+        assert_eq!(config.services, vec![ServiceRole::All]);
+        assert!(config.runs_api());
+        assert!(config.runs_compilation());
+        assert!(config.runs_artifact_server());
+    }
+
+    /// The split deployment passes exactly the roles it wants, separated by
+    /// commas, and only those roles turn on.
+    #[test]
+    fn services_select_roles() {
+        let api_only = CommonConfig::try_parse_from(["test", "--services", "api"]).unwrap();
+        assert!(api_only.runs_api());
+        assert!(!api_only.runs_compilation());
+        assert!(!api_only.runs_artifact_server());
+
+        let split = CommonConfig::try_parse_from(["test", "--services", "compiler,artifact-server"])
+            .unwrap();
+        assert_eq!(
+            split.services,
+            vec![ServiceRole::Compiler, ServiceRole::ArtifactServer]
+        );
+        assert!(!split.runs_api());
+        assert!(split.runs_compilation());
+        assert!(split.runs_artifact_server());
+    }
+
+    /// Compiling without serving artifacts is refused: the compilation tasks
+    /// upload their output to an artifact server, and a process that is the
+    /// only one selected would upload to nobody and fail every compilation
+    /// with a connection error instead of saying what is wrong.
+    #[test]
+    fn compiler_without_artifact_server_is_refused() {
+        let config = CommonConfig::try_parse_from(["test", "--services", "compiler"]).unwrap();
+        let error = config.validate_services().unwrap_err();
+        assert!(
+            error.contains("artifact-server"),
+            "the message names the missing role: {error}"
+        );
+
+        let config = CommonConfig::try_parse_from(["test", "--services", "all"]).unwrap();
+        assert!(config.validate_services().is_ok());
+    }
+
+    /// An unknown service name is a parse error, not a silently empty set.
+    #[test]
+    fn unknown_service_is_rejected() {
+        let error = CommonConfig::try_parse_from(["test", "--services", "apiserver"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     }
 }

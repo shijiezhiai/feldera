@@ -9,8 +9,8 @@ manager / compiler / runner 三张镜像并推送到制品库。母文档见
 
 | 镜像 | Dockerfile | 内容 | 用途 |
 |---|---|---|---|
-| `feldera-manager` | `deploy/Dockerfile.manager` | pipeline-manager 二进制（`--features feldera-enterprise`）+ sql2dbsp jar + web console + rust 工具链 + 源码树 | 平台控制面；in-process compiler 编译 pipeline |
-| `feldera-compiler` | `deploy/Dockerfile.compiler` | JDK21 + Maven + cargo + mold + librdkafka(AWS-LC) 工具链 | P1-018 远程编译服务载体；v1 仅工具链 |
+| `feldera-manager` | `deploy/Dockerfile.manager` | pipeline-manager 二进制（`--features feldera-enterprise`）+ sql2dbsp jar + web console + rust 工具链 + 源码树 + 离线 cargo 缓存 | `--services=all` 时是整套平台；`--services=api` 时是分离部署的控制面 |
+| `feldera-compiler` | `deploy/Dockerfile.compiler`（基于上一行的 manager 镜像） | 与 manager 镜像同一份内容 | `--services=compiler,artifact-server`：P1-018 的编译服务与制品存储 |
 | `feldera-runner` | `deploy/Dockerfile.runner` | ubuntu:24.04 + librdkafka(AWS-LC) + 运行时动态库 | 生成的 pipeline 程序运行镜像 |
 
 三者均基于 `ubuntu:24.04`（镜像自带 `ubuntu` 用户 uid 1000），当前仅

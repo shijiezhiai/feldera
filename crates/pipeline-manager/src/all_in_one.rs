@@ -1,7 +1,7 @@
 //! Runs the api-server, compiler and runner services in one process.
 use crate::api::main::ApiDoc;
 use crate::cluster_monitor::{LocalResourcesPoller, cluster_monitor};
-use crate::compiler::main::{compiler_main, compiler_precompile};
+use crate::compiler::main::{artifact_server_main, compiler_main, compilation_tasks_main, compiler_precompile};
 #[cfg(feature = "postgresql_embedded")]
 use crate::config::PgEmbedConfig;
 use crate::config::{
@@ -99,54 +99,88 @@ where
     db.run_migrations().await?;
     let db = Arc::new(Mutex::new(db));
 
-    let db_clone = db.clone();
-    let common_config_clone = common_config.clone();
-    let compiler_config_clone = compiler_config.clone();
-
     // Running multiple compiler workers on the same machine is not yet supported
     // due to the HTTP server ran by compiler_main & cleanup status files.
     // For now, we run a single compiler worker in the pipeline manager.
     let worker_id = 0;
     let total_workers = 1;
-    let _compiler = tokio::spawn(async move {
-        compiler_main(
-            common_config_clone,
-            compiler_config_clone,
-            db_clone,
-            worker_id,
-            total_workers,
-            // The pipeline-manager does not have automatic restart if it fails, as such
-            // it cannot exit when target is cleared to have any precomputed precompilation
-            // reapplied.
-            false,
-        )
-        .await
-        .expect("Compiler server main failed");
-    });
 
-    // Spawn local runner
-    let db_clone = db.clone();
-    let common_config_clone = common_config.clone();
-    let _local_runner = tokio::spawn(async move {
-        runner_main::<E>(db_clone, common_config_clone, executor_config).await;
-    });
+    // A process that both compiles and serves artifacts runs them together:
+    // that is the single-container deployment, and the two share one working
+    // directory anyway. A process that compiles without serving uploads to
+    // `--compiler-host`, and one that serves without compiling is the durable
+    // artifact store behind that host.
+    if common_config.runs_compilation() && common_config.runs_artifact_server() {
+        let db_clone = db.clone();
+        let common_config_clone = common_config.clone();
+        let compiler_config_clone = compiler_config.clone();
+        let _compiler = tokio::spawn(async move {
+            compiler_main(
+                common_config_clone,
+                compiler_config_clone,
+                db_clone,
+                worker_id,
+                total_workers,
+                // The pipeline-manager does not have automatic restart if it fails, as such
+                // it cannot exit when target is cleared to have any precomputed precompilation
+                // reapplied.
+                false,
+            )
+            .await
+            .expect("Compiler server main failed");
+        });
+    } else if common_config.runs_compilation() {
+        let db_clone = db.clone();
+        let common_config_clone = common_config.clone();
+        let compiler_config_clone = compiler_config.clone();
+        let _compiler = tokio::spawn(async move {
+            compilation_tasks_main(
+                common_config_clone,
+                compiler_config_clone,
+                db_clone,
+                worker_id,
+                total_workers,
+                false,
+            )
+            .await
+            .expect("Compiler compilation tasks failed");
+        });
+    } else if common_config.runs_artifact_server() {
+        let db_clone = db.clone();
+        let common_config_clone = common_config.clone();
+        let compiler_config_clone = compiler_config.clone();
+        let _artifact_server = tokio::spawn(async move {
+            artifact_server_main(common_config_clone, compiler_config_clone, db_clone)
+                .await
+                .expect("Artifact server main failed");
+        });
+    }
 
-    // Spawn cluster monitor
-    let common_config_clone = common_config.clone();
-    let db_clone = db.clone();
-    tokio::spawn(async move {
-        cluster_monitor(db_clone, common_config_clone, LocalResourcesPoller {}).await;
-    });
+    if common_config.runs_api() {
+        // Spawn local runner
+        let db_clone = db.clone();
+        let common_config_clone = common_config.clone();
+        let _local_runner = tokio::spawn(async move {
+            runner_main::<E>(db_clone, common_config_clone, executor_config).await;
+        });
 
-    // Spawn events cleaner
-    let db_clone = db.clone();
-    let common_config_clone = common_config.clone();
-    tokio::spawn(async move {
-        events_cleaner(db_clone, common_config_clone).await;
-    });
+        // Spawn cluster monitor
+        let common_config_clone = common_config.clone();
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            cluster_monitor(db_clone, common_config_clone, LocalResourcesPoller {}).await;
+        });
+
+        // Spawn events cleaner
+        let db_clone = db.clone();
+        let common_config_clone = common_config.clone();
+        tokio::spawn(async move {
+            events_cleaner(db_clone, common_config_clone).await;
+        });
+    }
 
     // Spawn the orphan reaper, which has no meaning without a cluster to scan.
-    if let Some(config) = reaper_config {
+    if let Some(config) = reaper_config.filter(|_| common_config.runs_api()) {
         let delete = config.kubernetes_runner_reap_orphans;
         let db_clone = db.clone();
         // Failing to build the client is not fatal: the runner itself reports
@@ -164,6 +198,19 @@ where
                 );
             }
         }
+    }
+
+    if !common_config.runs_api() {
+        // Nothing else can block this process: the compiler, the artifact
+        // server and the runner all run as tasks that log and exit when they
+        // fail, and a process that exits takes them down with it. Waiting
+        // forever here keeps the process alive for the sake of the HTTP
+        // surfaces it does serve.
+        info!(
+            "Running services {:?}: the API server is not among them, waiting indefinitely",
+            common_config.services
+        );
+        std::future::pending::<()>().await;
     }
 
     // The api-server blocks forever

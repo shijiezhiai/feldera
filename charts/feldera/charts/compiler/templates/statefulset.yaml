@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   serviceName: {{ include "compiler.fullname" . }}
-  replicas: {{ .Values.parallelCompilation.replicas | default 1 }}
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "compiler.name" . }}
@@ -23,14 +23,59 @@ spec:
         - name: compiler
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          # P1-005 skeleton: idle until the manager -> compiler HTTP remote
-          # compile path is wired in P1-018.
-          command: ["sleep", "infinity"]
+          # P1-018: the compiler pod compiles and stores artifacts; the API
+          # server pod has neither the source tree nor the cargo cache and
+          # reaches this one over HTTP at `compilerServiceHost`.
+          #
+          # `artifact-server` alone runs the store without compiling, which is
+          # the shape to scale out later: N stateless compilers uploading to
+          # one durable store (the enterprise compiler-autoscaling topology
+          # `artifact_server_main` was written for).
+          env:
+            - name: FELDERA_SERVICES
+              value: {{ if .Values.compileInThisPod }}"compiler,artifact-server"{{ else }}"artifact-server"{{ end }}
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-db-insecure-secret
+                  key: .user
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-db-insecure-secret
+                  key: .password
+          # The image ENTRYPOINT already carries --bind-address,
+          # --sql-compiler-path, --compilation-cargo-lock-path,
+          # --dbsp-override-path and --demos-dir; only the per-deployment
+          # arguments are passed here.
+          args:
+            - "--db-connection-string=postgres://$(DB_USER):$(DB_PASSWORD)@{{ .Release.Name }}-db:{{ .Values.postgresPort | default 5432 }}/feldera"
+            - "--compilation-profile={{ .Values.compilationProfile }}"
+          ports:
+            - name: compiler
+              containerPort: 8085
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8085
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8085
+            initialDelaySeconds: 30
+            periodSeconds: 15
           volumeMounts:
             - name: workspace
               mountPath: /home/ubuntu/.feldera/compiler
+      # The claim is handed to the pod as root:root but the image runs as
+      # `ubuntu` (uid 1000); fsGroup gives that user write access, which the
+      # compiler needs to create its working directory inside the claim.
+      securityContext:
+        fsGroup: 1000
       volumes:
         - name: workspace
           persistentVolumeClaim:
