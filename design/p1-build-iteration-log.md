@@ -391,3 +391,27 @@ provision 时把镜像里的 `crates/` 复制到 compiler pod 里现编。所以
 `GET /v0/pipelines/{name}` 的 `deployment_runtime_status` 与 `storage_status_details` 里），
 探测一个 404 且用 `2>/dev/null || true` 兜住，会让脚本安静地空转到超时。②`format=json`
 单行结果返回的是**对象本身**不是数组（`{"c": 1000}`），按 `[0]` 取会 IndexError。
+
+## P1-017：删除与回收
+
+单测 `runner::` 113 passed（新增 `runner::reaper` 11 个 + `kubernetes_runner` 2 个）。
+kind 上 `scripts/e2e-k8s-reaper.sh` 全绿（报告模式 4 步 + 删除模式实测），文档见
+`design/p1-017-delete-and-reclaim.md`。
+
+三轮 e2e 才过，每轮暴露一个单测碰不到的问题：
+
+1. **`metadata.name` 不接受前缀**。第一版用
+   `metadata.name>=pipeline-,metadata.name<pipeline-.` 想在服务端筛掉无关对象，
+   真实 API server 直接 400 `invalid selector`——该字段只认 `= == !=`。
+   表现是所有 kind 都变成 "unable to list"，扫描一条都没找到，日志里六条 WARN
+   看起来像权限问题。修法：整个 namespace 拉回来在 manager 侧筛。补了
+   `lists_without_a_field_selector` 钉住，防止后人"优化"回去。
+2. **`tracing` 的字段名是 `pipeline-id` 不是 `pipeline_id`**，脚本事后 grep
+   `pipeline_id=` 永远不匹配。
+3. **重启不会清掉旧 pod 的日志**。`kubectl logs deploy/...` 读到的是新旧 pod 的合并视图，
+   于是第二次扫描前的旧报告被当成"这次又报了它"，把正确的 skip 判成 FAIL。
+   脚本改成只看重启后新建的那个 pod。
+
+另有一个部署层面的坑：`--kubernetes-runner-reap-orphans=true` 会报
+`unexpected value 'true'`,clap 的布尔 flag 只接受裸写 `--kubernetes-runner-reap-orphans`
+（或者用 env `FELDERA_KUBERNETES_RUNNER_REAP_ORPHANS=true`，config 里两个都声明了）。
