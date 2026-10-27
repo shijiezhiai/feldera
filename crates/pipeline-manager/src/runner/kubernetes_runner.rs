@@ -165,6 +165,21 @@ fn storage_claim_name(pipeline_id: PipelineId) -> String {
     format!("{}-storage", resource_base(pipeline_id))
 }
 
+/// Annotation marking a claim a deletion deliberately kept.
+///
+/// A kept claim is the only object a deletion leaves behind, so it has to say
+/// so: an operator who later finds it needs to know it was not an accident,
+/// which pipeline it belongs to (the pipeline row is gone by then), and which
+/// option kept it. Without the annotation the reaper would also collect it,
+/// because nothing else distinguishes it from the leftover of a crash.
+pub const RETENTION_ANNOTATION: &str = "feldera.com/storage-retention";
+
+/// Value of [`RETENTION_ANNOTATION`] for a claim kept by an explicit deletion.
+pub const RETENTION_KEPT_ON_DELETE: &str = "kept-on-pipeline-delete";
+
+/// Annotation recording the pipeline a kept claim belonged to.
+pub const RETAINED_PIPELINE_ANNOTATION: &str = "feldera.com/retained-pipeline-id";
+
 /// Name of the single pod a `StatefulSet` with one replica creates.
 fn pod_name(pipeline_id: PipelineId) -> String {
     format!("{}-0", resource_base(pipeline_id))
@@ -972,7 +987,9 @@ pub struct KubernetesRunner {
 /// A kubeconfig path wins over in-cluster credentials so that a manager running
 /// outside the cluster (a developer machine against `kind`) works with the usual
 /// `--kubernetes-runner-kubeconfig` pointer.
-async fn build_kubernetes_client(config: &KubernetesRunnerConfig) -> Result<Client, ManagerError> {
+pub(crate) async fn build_kubernetes_client(
+    config: &KubernetesRunnerConfig,
+) -> Result<Client, ManagerError> {
     let kubeconfig_path = config
         .kubernetes_runner_kubeconfig
         .as_deref()
@@ -1012,6 +1029,42 @@ async fn build_kubernetes_client(config: &KubernetesRunnerConfig) -> Result<Clie
 }
 
 impl KubernetesRunner {
+    /// Marks the pipeline's claim as deliberately kept.
+    ///
+    /// Runs before the rest of the deletion, so a deletion that fails partway
+    /// still leaves the claim identifiable. A missing claim is not an error:
+    /// a pipeline deleted before it ever provisioned has none.
+    async fn mark_storage_claim_retained(&self, client: &Client, namespace: &str) {
+        let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+        let name = storage_claim_name(self.pipeline_id);
+        let patch = serde_json::json!({
+            "metadata": {"annotations": {
+                RETENTION_ANNOTATION: RETENTION_KEPT_ON_DELETE,
+                RETAINED_PIPELINE_ANNOTATION: self.pipeline_id.to_string(),
+            }},
+        });
+        match claims
+            .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => info!(
+                name,
+                "retaining storage claim: the pipeline's data stays in the cluster"
+            ),
+            Err(error) if is_not_found(&error) => {}
+            // The deletion still proceeds. Keeping the claim is the safe
+            // outcome and it happens whether or not the annotation lands, so
+            // failing the deletion over the annotation would turn a cosmetic
+            // loss into an operator-visible failure. The warning names the
+            // claim so it can be annotated by hand.
+            Err(error) => warn!(
+                name,
+                "unable to mark the retained storage claim; it is kept but not annotated: \
+                 {error}"
+            ),
+        }
+    }
+
     /// Builds the Kubernetes API client from the configured credentials.
     ///
     /// A kubeconfig path wins over in-cluster credentials so that a manager
@@ -1638,8 +1691,11 @@ impl PipelineExecutor for KubernetesRunner {
         let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
         let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
         let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
+        if self.config.kubernetes_runner_retain_storage_claims {
+            self.mark_storage_claim_retained(&client, &namespace).await;
+        }
         let policies: Api<NetworkPolicy> = Api::namespaced(client, &namespace);
-        let deletions: [(&str, String); 6] = [
+        let mut deletions: Vec<(&str, String)> = vec![
             ("StatefulSet", resource_base(self.pipeline_id)),
             ("Service", resource_base(self.pipeline_id)),
             // Deleting a Service that was never created is a 404, which the
@@ -1648,11 +1704,13 @@ impl PipelineExecutor for KubernetesRunner {
             ("Service", metrics_service_name(self.pipeline_id)),
             ("NetworkPolicy", resource_base(self.pipeline_id)),
             ("Secret", config_secret_name(self.pipeline_id)),
-            (
+        ];
+        if !self.config.kubernetes_runner_retain_storage_claims {
+            deletions.push((
                 "PersistentVolumeClaim",
                 storage_claim_name(self.pipeline_id),
-            ),
-        ];
+            ));
+        }
         for (kind, name) in deletions {
             let result = match kind {
                 "StatefulSet" => statefulsets
@@ -1689,6 +1747,7 @@ impl PipelineExecutor for KubernetesRunner {
         }
         Ok(())
     }
+
 }
 
 /// Whether an HTTP status from the pipeline's `/status` endpoint means the
@@ -2616,6 +2675,8 @@ mod tests {
                 kubernetes_runner_upper_storage_mb: 128_000,
                 kubernetes_runner_metrics_service: false,
                 kubernetes_runner_metrics_namespace: None,
+                kubernetes_runner_reap_orphans: false,
+                kubernetes_runner_retain_storage_claims: false,
             },
             client: reqwest::Client::new(),
             logs_sender: logs_sender(),
@@ -2719,7 +2780,7 @@ mod tests {
         use super::*;
         use bytes::Bytes;
         use http::{Method, Request, Response, StatusCode};
-        use http_body_util::Full;
+        use http_body_util::{BodyExt, Full};
         use kube::client::Body as KubeBody;
         use std::sync::{Arc, Mutex};
         use tower::service_fn;
@@ -2734,6 +2795,8 @@ mod tests {
             pub namespace_exists: Arc<Mutex<bool>>,
             /// The template ConfigMap's JSON, or `None` when it does not exist.
             pub configmap: Arc<Mutex<Option<serde_json::Value>>>,
+            /// The bodies of the requests, in order.
+            pub bodies: Arc<Mutex<Vec<String>>>,
         }
 
         impl FakeCluster {
@@ -2754,6 +2817,16 @@ mod tests {
                     .filter(|(m, path)| m == method && path.ends_with(suffix))
                     .count()
             }
+
+            /// The body of the first request of `method`, if any.
+            pub fn body_of(&self, method: &str) -> Option<String> {
+                self.bodies
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|body| body.starts_with(method))
+                    .map(|body| body[method.len()..].to_string())
+            }
         }
 
         pub fn client(cluster: FakeCluster) -> Client {
@@ -2767,6 +2840,21 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((method.to_string(), path.clone()));
+                    // Only a patch has a body worth asserting on, and reading
+                    // it is the only way to see what the manager asked the API
+                    // server to record.
+                    if method == Method::PATCH {
+                        let request = request;
+                        let bytes = request.into_body().collect().await.map(|body| {
+                            body.to_bytes()
+                        });
+                        if let Ok(bytes) = bytes {
+                            cluster.bodies.lock().unwrap().push(format!(
+                                "{method}{}",
+                                String::from_utf8_lossy(&bytes)
+                            ));
+                        }
+                    }
                     Ok::<_, std::convert::Infallible>(respond(&cluster, &method, &path))
                 }
             });
@@ -2914,6 +3002,8 @@ mod tests {
             kubernetes_runner_upper_storage_mb: 128_000,
             kubernetes_runner_metrics_service: false,
             kubernetes_runner_metrics_namespace: None,
+            kubernetes_runner_reap_orphans: false,
+            kubernetes_runner_retain_storage_claims: false,
         }
     }
 
@@ -3190,6 +3280,59 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// Retaining the claim keeps a deletion from destroying the pipeline's
+    /// state, and says so on the claim the deletion leaves behind.
+    #[tokio::test]
+    async fn clear_retains_the_storage_claim_when_configured() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        runner.config.kubernetes_runner_retain_storage_claims = true;
+
+        runner.clear(&json!({})).await.expect("clearing succeeds");
+
+        assert_eq!(
+            cluster.count(
+                "DELETE",
+                "/persistentvolumeclaims/pipeline-00000000-0000-0000-0000-000000000000-storage"
+            ),
+            0,
+            "a retained claim must survive the deletion that keeps it"
+        );
+        // Everything else still goes, or the retention becomes a leak.
+        for path in [
+            "/statefulsets/pipeline-00000000-0000-0000-0000-000000000000",
+            "/services/pipeline-00000000-0000-0000-0000-000000000000",
+            "/secrets/pipeline-00000000-0000-0000-0000-000000000000-config",
+        ] {
+            assert_eq!(cluster.count("DELETE", path), 1, "{path} was not deleted");
+        }
+        assert_eq!(
+            cluster.count(
+                "PATCH",
+                "/persistentvolumeclaims/pipeline-00000000-0000-0000-0000-000000000000-storage"
+            ),
+            1,
+            "a kept claim must be annotated, or nobody can tell why it is there"
+        );
+        let patch = cluster.body_of("PATCH").expect("the retention patch");
+        assert!(
+            patch.contains(RETENTION_KEPT_ON_DELETE),
+            "the patch does not record the reason: {patch}"
+        );
+        assert!(
+            patch.contains(&Uuid::nil().to_string()),
+            "the patch does not record which pipeline the claim belonged to: {patch}"
+        );
+    }
+
+    /// A marked claim carries the annotation the reaper reads, and the unmarked
+    /// one does not: the two deletions differ only in this flag.
+    #[test]
+    fn the_retention_annotation_is_the_one_the_reaper_reads() {
+        assert_eq!(RETENTION_ANNOTATION, "feldera.com/storage-retention");
+        assert_eq!(RETAINED_PIPELINE_ANNOTATION, "feldera.com/retained-pipeline-id");
     }
 
     #[tokio::test]

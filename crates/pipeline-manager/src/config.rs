@@ -1816,6 +1816,36 @@ pub struct KubernetesRunnerConfig {
     #[serde(default)]
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_METRICS_NAMESPACE")]
     pub kubernetes_runner_metrics_namespace: Option<String>,
+
+    /// Delete pipeline objects found without a pipeline, instead of reporting
+    /// them.
+    ///
+    /// The reaper runs every six hours and reports objects whose pipeline is
+    /// gone from the database: a manager killed between deleting the row and
+    /// deleting the objects leaves them behind, and nothing else collects
+    /// them. Reporting is the default because a wrong identification here
+    /// destroys a live pipeline's checkpointed state; turn this on once the
+    /// reports have been seen to be accurate.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_REAP_ORPHANS")]
+    pub kubernetes_runner_reap_orphans: bool,
+
+    /// Keep a deleted pipeline's storage claim instead of deleting it.
+    ///
+    /// A claim holds the pipeline's checkpointed state, and deleting a
+    /// pipeline is otherwise irreversible: without this, a pipeline deleted by
+    /// mistake takes hours of ingested data with it. With it, the claim stays
+    /// in the namespace, annotated `feldera.com/storage-retention:
+    /// kept-on-pipeline-delete` and `feldera.com/retained-pipeline-id`, and can
+    /// be reclaimed later once an operator has decided it is not needed. The
+    /// annotation also keeps the orphan reaper from collecting it.
+    ///
+    /// Off by default because a platform that never deletes claims grows
+    /// without bound; a deployment that turns it on needs a retention policy
+    /// for the claims it leaves behind.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_RETAIN_STORAGE_CLAIMS")]
+    pub kubernetes_runner_retain_storage_claims: bool,
 }
 
 /// Default for `--kubernetes-runner-lower-memory-mb`.

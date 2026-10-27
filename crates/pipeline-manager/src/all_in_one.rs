@@ -33,10 +33,16 @@ pub fn augment_args(cli: Command) -> Command {
 }
 
 /// Runs the services until the api-server stops, or performs `--dump-openapi` or `--precompile`.
+///
+/// `reaper_config` is `Some` only for the Kubernetes runner: it starts the
+/// background scan that reclaims cluster objects whose pipeline no longer
+/// exists. The local runner has no cluster to scan, and passing `None` keeps
+/// it from parsing Kubernetes arguments it does not use.
 pub async fn run<E: PipelineExecutor + 'static>(
     matches: &ArgMatches,
     license_check: Arc<RwLock<Option<LicenseCheck>>>,
     runner_config: impl FnOnce(LocalRunnerConfig) -> E::Config,
+    reaper_config: Option<KubernetesRunnerConfig>,
 ) -> anyhow::Result<()>
 where
     E::Config: Send + 'static,
@@ -138,6 +144,27 @@ where
     tokio::spawn(async move {
         events_cleaner(db_clone, common_config_clone).await;
     });
+
+    // Spawn the orphan reaper, which has no meaning without a cluster to scan.
+    if let Some(config) = reaper_config {
+        let delete = config.kubernetes_runner_reap_orphans;
+        let db_clone = db.clone();
+        // Failing to build the client is not fatal: the runner itself reports
+        // the same configuration problem when the first pipeline is
+        // provisioned, and a platform with no pipelines still serves the API.
+        match crate::runner::reaper::client(&config).await {
+            Ok(client) => {
+                tokio::spawn(async move {
+                    crate::runner::reaper::run(db_clone, config, client, delete).await;
+                });
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Orphan reaper disabled: unable to reach the Kubernetes API: {error}"
+                );
+            }
+        }
+    }
 
     // The api-server blocks forever
     crate::api::main::run(db, common_config, api_config, license_check)

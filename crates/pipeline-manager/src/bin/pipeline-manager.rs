@@ -40,7 +40,8 @@ fn main() -> anyhow::Result<()> {
             let license_check = Arc::new(RwLock::new(None));
             match runner_kind_from_env().map_err(anyhow::Error::msg)? {
                 RunnerKind::Local => {
-                    all_in_one::run::<LocalRunner>(&matches, license_check, |config| config).await
+                    all_in_one::run::<LocalRunner>(&matches, license_check, |config| config, None)
+                        .await
                 }
                 RunnerKind::Kubernetes => {
                     let config = KubernetesRunnerConfig::from_arg_matches(&matches)
@@ -53,9 +54,15 @@ fn main() -> anyhow::Result<()> {
                         config.kubernetes_runner_allow_kubernetes_env_prefix,
                     );
                     let config = config.canonicalize()?;
-                    all_in_one::run::<KubernetesRunner>(&matches, license_check, move |_local| {
-                        config
-                    })
+                    // The reaper scans the same cluster the runner writes to,
+                    // so it takes its own copy of the configuration.
+                    let reaper_config = config.clone();
+                    all_in_one::run::<KubernetesRunner>(
+                        &matches,
+                        license_check,
+                        move |_local| config,
+                        Some(reaper_config),
+                    )
                     .await
                 }
             }

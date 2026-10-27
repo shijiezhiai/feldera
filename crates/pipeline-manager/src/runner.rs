@@ -6,4 +6,5 @@ pub mod main;
 pub mod pipeline_automata;
 pub mod pipeline_executor;
 pub mod pipeline_logs;
+pub mod reaper;
 pub mod selection;
