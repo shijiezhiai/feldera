@@ -44,6 +44,7 @@ use crate::config::{CommonConfig, KubernetesRunnerConfig};
 use crate::db::types::pipeline::{
     PipelineId, bootstrap_policy_to_string, runtime_desired_status_to_string,
 };
+use crate::db::types::tenant::TenantId;
 use crate::db::types::program::ProgramInfo;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
@@ -77,6 +78,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
 use kube::api::{Api, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{Level, info, warn};
@@ -321,6 +323,130 @@ impl ResourceLimits {
             .or(resources.storage_mb_min)
             .unwrap_or(self.storage_mb_default);
         self.clamp_storage(requested)
+    }
+}
+
+/// The namespace one tenant's pipelines are provisioned in.
+///
+/// Tenants share the platform's namespace by default. Giving a tenant its own
+/// namespace is what lets the platform scope quotas, network policy and RBAC
+/// to one tenant instead of to everyone who shares the namespace.
+#[derive(Debug, Clone)]
+pub struct TenantNamespace {
+    /// Tenant the mapping was looked up for.
+    pub tenant_id: TenantId,
+    /// Namespace its pipelines go in.
+    pub namespace: String,
+}
+
+impl TenantNamespace {
+    /// Looks up the tenant in the `tenant=<uuid>:<namespace>` mapping.
+    ///
+    /// An entry that cannot be parsed is skipped with a warning rather than
+    /// failing start-up: one malformed entry must not keep every other
+    /// tenant's pipelines from being provisioned, and a skipped entry merely
+    /// falls back to the shared namespace, which is where those pipelines went
+    /// before the mapping existed.
+    fn from_config(
+        config: &KubernetesRunnerConfig,
+        tenant_id: &TenantId,
+    ) -> Option<Self> {
+        for entry in &config.kubernetes_runner_tenant_namespaces {
+            let Some((tenant, namespace)) = entry.split_once(':') else {
+                warn!(
+                    entry,
+                    "ignoring a tenant namespace that is not of the form tenant=<uuid>:<namespace>"
+                );
+                continue;
+            };
+            let Some(tenant) = tenant.strip_prefix("tenant=") else {
+                warn!(
+                    entry,
+                    "ignoring a tenant namespace without a 'tenant=' prefix"
+                );
+                continue;
+            };
+            if namespace.is_empty() {
+                warn!(entry, "ignoring a tenant namespace with an empty namespace");
+                continue;
+            }
+            match Uuid::from_str(tenant) {
+                Ok(uuid) if TenantId(uuid) == *tenant_id => {
+                    return Some(Self {
+                        tenant_id: *tenant_id,
+                        namespace: namespace.to_string(),
+                    })
+                }
+                Ok(_) => continue,
+                Err(error) => {
+                    warn!(
+                        entry,
+                        "ignoring a tenant namespace whose tenant is not a UUID: {error}"
+                    );
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Which storage classes a pipeline may be provisioned onto.
+///
+/// The class decides where a pipeline's checkpointed state lives, and with it
+/// whether a node draining loses that state. A cluster commonly has several
+/// classes — one network-replicated, one local-path — so leaving the choice
+/// open to the pipeline is what lets a pipeline land on the one that cannot
+/// survive an eviction.
+#[derive(Debug, Clone, Default)]
+pub struct StorageClassPolicy {
+    /// Classes a pipeline may name. Ignored unless `enabled`.
+    allowed: Vec<String>,
+    /// Whether the list applies at all.
+    enabled: bool,
+    /// Class given to a pipeline that names none.
+    default: Option<String>,
+}
+
+impl StorageClassPolicy {
+    /// Reads the policy from the runner configuration.
+    pub fn from_config(config: &KubernetesRunnerConfig) -> Self {
+        Self {
+            allowed: config.kubernetes_runner_storage_classes.clone(),
+            enabled: config.kubernetes_runner_enable_storage_classes,
+            default: config.kubernetes_runner_storage_class.clone(),
+        }
+    }
+
+    /// The class a pipeline gets, or the reason it may not have any.
+    ///
+    /// A pipeline that names no class gets the configured default, if there is
+    /// one, and otherwise the cluster's own default — which is the one case in
+    /// which the policy cannot choose, because naming a class the cluster does
+    /// not have would fail provisioning outright.
+    pub fn resolve(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, ManagerError> {
+        let selected = requested
+            .map(|name| name.to_string())
+            .or_else(|| self.default.clone());
+
+        if !self.enabled {
+            return Ok(selected);
+        }
+
+        match selected {
+            // No class at all means the cluster default applies. The allowlist
+            // cannot rule on a name it was not given, and refusing would leave
+            // the pipeline unprovisionable for naming nothing, which is the
+            // request of every pipeline that does not care about the class.
+            None => Ok(None),
+            Some(name) if self.allowed.iter().any(|allowed| allowed == &name) => Ok(Some(name)),
+            Some(name) => Err(ManagerError::from(RunnerError::StorageClassNotAllowed {
+                storage_class: name,
+                allowed: self.allowed.clone(),
+            })),
+        }
     }
 }
 
@@ -977,6 +1103,11 @@ pub struct KubernetesRunner {
     /// The platform's resource range, read from the chart values through the
     /// manager configuration.
     limits: ResourceLimits,
+    /// The class this pipeline's claim was resolved onto. Resolved once, when
+    /// the runner is constructed, so every object of one deployment agrees.
+    storage_class: Option<String>,
+    /// The namespace this pipeline's tenant maps to, when it has one.
+    tenant_namespace: Option<TenantNamespace>,
     /// Lazily initialized API client: it validates the credentials before any
     /// resource is touched, and its construction is fallible.
     kubernetes: Option<Client>,
@@ -1081,10 +1212,22 @@ impl KubernetesRunner {
 
     /// Namespace the pipeline's objects live in.
     ///
-    /// The runtime configuration may request a namespace per pipeline; when it
-    /// does not, the runner-wide namespace is used.
+    /// An explicit per-pipeline namespace wins. Otherwise the tenant's
+    /// namespace applies, from the `tenant=<uuid>:<namespace>` mapping, and a
+    /// tenant without a mapping uses the runner-wide namespace.
+    ///
+    /// A per-pipeline namespace is honoured as given rather than checked
+    /// against the tenant mapping: the mapping states where a tenant's
+    /// pipelines go by default, and an explicit request has always been the way
+    /// to place one pipeline elsewhere. Refusing it would break the existing
+    /// pipelines that already rely on it.
     fn namespace(&self, runtime_config: &serde_json::Value) -> String {
         discover_namespace_from_runtime_config_json(runtime_config)
+            .or_else(|| {
+                self.tenant_namespace
+                    .as_ref()
+                    .map(|mapping| mapping.namespace.clone())
+            })
             .unwrap_or_else(|| self.config.kubernetes_runner_namespace.clone())
     }
 
@@ -1139,7 +1282,7 @@ impl KubernetesRunner {
             .map(|storage_config| StorageRequest {
                 mount_path: storage_config.path.clone(),
                 size_mb: self.limits.storage_for(config),
-                storage_class: config.global.resources.storage_class.clone(),
+                storage_class: self.storage_class.clone(),
             });
         RenderInput {
             pipeline_id: self.pipeline_id,
@@ -1215,11 +1358,15 @@ impl KubernetesRunner {
     }
 
     /// Fetches the pod, treating "not found" as `None`.
-    async fn get_pod(&self, namespace: &str) -> Result<Option<Pod>, ManagerError> {
-        let client = match &self.kubernetes {
-            Some(client) => client.clone(),
-            None => return Ok(None),
-        };
+    ///
+    /// A pod that cannot be read and a pod that does not exist are different
+    /// answers, and the difference decides whether the caller stops a running
+    /// pipeline. Building the client here rather than returning early when none
+    /// is cached keeps them apart: an instance that has just been promoted has
+    /// no cached client yet, and reporting its pipelines' pods as absent would
+    /// stop every pipeline the previous leader was running.
+    async fn get_pod(&mut self, namespace: &str) -> Result<Option<Pod>, ManagerError> {
+        let client = self.kubernetes_client().await?;
         let pods: Api<Pod> = Api::namespaced(client, namespace);
         match pods.get(&pod_name(self.pipeline_id)).await {
             Ok(pod) => Ok(Some(pod)),
@@ -1319,12 +1466,14 @@ impl PipelineExecutor for KubernetesRunner {
 
     fn new(
         pipeline_id: PipelineId,
+        tenant_id: TenantId,
         common_config: CommonConfig,
         config: Self::Config,
         client: reqwest::Client,
         logs_sender: LogsSender,
     ) -> Self {
         let limits = ResourceLimits::from_config(&config);
+        let tenant_namespace = TenantNamespace::from_config(&config, &tenant_id);
         Self {
             pipeline_id,
             common_config,
@@ -1333,6 +1482,12 @@ impl PipelineExecutor for KubernetesRunner {
             logs_sender,
             logs_task: None,
             limits,
+            // A pipeline whose class the policy rejects fails at provisioning,
+            // where the error reaches the user, rather than here: the
+            // constructor returns no `Result`, and the request it would reject
+            // is the pipeline configuration's, which the automaton re-reads.
+            storage_class: None,
+            tenant_namespace,
             kubernetes: None,
         }
     }
@@ -1461,6 +1616,18 @@ impl PipelineExecutor for KubernetesRunner {
         let client = self.kubernetes_client().await?;
         let namespace = self.namespace(runtime_config);
 
+        // Resolve the storage class before anything is created: a class the
+        // policy does not allow is a configuration mistake, and discovering it
+        // after the claim exists would leave that claim behind.
+        let storage_class = StorageClassPolicy::from_config(&self.config).resolve(
+            deployment_config
+                .global
+                .resources
+                .storage_class
+                .as_deref(),
+        )?;
+        self.storage_class = storage_class;
+
         // Merge the program information into the deployment configuration, the
         // same way the local runner merges the downloaded program info file.
         // The automaton hands over the stored program information, which carries
@@ -1536,9 +1703,7 @@ impl PipelineExecutor for KubernetesRunner {
                         .as_ref()
                         .map(|storage| storage.mount_path.as_str())
                         .unwrap_or(""),
-                    storage_class_name: config
-                        .global
-                        .resources
+                    storage_class_name: self
                         .storage_class
                         .as_deref()
                         .unwrap_or(""),
@@ -2057,6 +2222,8 @@ mod tests {
             logs_sender: logs_sender(),
             logs_task: None,
             limits: ResourceLimits::default(),
+            storage_class: None,
+            tenant_namespace: None,
             kubernetes: None,
         };
 
@@ -2654,6 +2821,237 @@ mod tests {
         assert!(env.iter().any(|var| var.name == "POD_NAME"));
     }
 
+    /// The allowlist rejects a class the platform does not provision on, and
+    /// says which classes it does, so the message can be acted on.
+    #[test]
+    fn a_storage_class_outside_the_allowlist_is_rejected() {
+        let policy = StorageClassPolicy {
+            allowed: vec!["fast".to_string(), "standard".to_string()],
+            enabled: true,
+            default: None,
+        };
+        assert_eq!(
+            policy.resolve(Some("fast")).unwrap(),
+            Some("fast".to_string())
+        );
+        let error = policy
+            .resolve(Some("local-path"))
+            .expect_err("an unlisted class must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("local-path") && message.contains("fast"),
+            "the error must name the rejected class and the allowed ones: {message}"
+        );
+    }
+
+    /// A pipeline that names no class gets the configured default, and the
+    /// default itself is subject to the allowlist: a default the allowlist
+    /// rejects would otherwise provision every pipeline onto a class the
+    /// platform does not offer.
+    #[test]
+    fn the_default_storage_class_goes_through_the_allowlist() {
+        let policy = StorageClassPolicy {
+            allowed: vec!["fast".to_string()],
+            enabled: true,
+            default: Some("fast".to_string()),
+        };
+        assert_eq!(policy.resolve(None).unwrap(), Some("fast".to_string()));
+
+        let rejecting = StorageClassPolicy {
+            allowed: vec!["fast".to_string()],
+            enabled: true,
+            default: Some("local-path".to_string()),
+        };
+        assert!(
+            rejecting.resolve(None).is_err(),
+            "a default that is not allowed must fail rather than provision"
+        );
+    }
+
+    /// With the allowlist off, whatever the pipeline asked for is used, so an
+    /// existing deployment keeps its classes when the policy is not enabled.
+    #[test]
+    fn a_disabled_allowlist_passes_the_requested_class_through() {
+        let policy = StorageClassPolicy {
+            allowed: vec!["fast".to_string()],
+            enabled: false,
+            default: Some("standard".to_string()),
+        };
+        assert_eq!(
+            policy.resolve(Some("local-path")).unwrap(),
+            Some("local-path".to_string())
+        );
+        assert_eq!(
+            policy.resolve(None).unwrap(),
+            Some("standard".to_string())
+        );
+    }
+
+    /// An enabled allowlist with no entries refuses every named class: an
+    /// empty list is a configuration mistake, and the safe reading of "these
+    /// classes are allowed" with nothing listed is "none".
+    #[test]
+    fn an_enabled_empty_allowlist_refuses_every_class() {
+        let policy = StorageClassPolicy {
+            allowed: Vec::new(),
+            enabled: true,
+            default: None,
+        };
+        assert_eq!(policy.resolve(None).unwrap(), None);
+        assert!(policy.resolve(Some("fast")).is_err());
+    }
+
+    /// Provisioning a pipeline whose class the allowlist rejects fails before
+    /// any object is created, so a rejected class leaves no claim behind.
+    #[tokio::test]
+    async fn provision_rejects_a_disallowed_storage_class_before_creating_anything() {
+        let cluster = fake_api::FakeCluster::default();
+        let mut runner = fake_runner(&cluster);
+        runner.config.kubernetes_runner_enable_storage_classes = true;
+        runner.config.kubernetes_runner_storage_classes = vec!["fast".to_string()];
+        let config = pipeline_config(
+            ResourceConfig {
+                storage_class: Some("local-path".to_string()),
+                ..ResourceConfig::default()
+            },
+            &[],
+        );
+
+        let error = runner
+            .provision(
+                RuntimeDesiredStatus::Paused,
+                None,
+                &Uuid::max(),
+                &config,
+                &program_info(),
+                "http://api-server:8085/binary/00000000-0000-0000-0000-000000000000/1/checksum/integrity",
+                "http://api-server:8085/program_info/00000000-0000-0000-0000-000000000000/1/checksum",
+                Version(1),
+                &json!({}),
+                false,
+            )
+            .await
+            .expect_err("a class outside the allowlist must fail provisioning");
+        assert!(
+            error.to_string().contains("local-path"),
+            "the error must name the class the pipeline asked for: {error}"
+        );
+        assert_eq!(
+            cluster.count("POST", ""),
+            0,
+            "nothing may be created when the storage class is rejected"
+        );
+    }
+
+    /// The class the policy resolves is the one the claim and the template
+    /// placeholder both carry, so one deployment never mixes two classes.
+    #[tokio::test]
+    async fn the_resolved_storage_class_reaches_the_claim() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        runner.config.kubernetes_runner_enable_storage_classes = true;
+        runner.config.kubernetes_runner_storage_classes = vec!["fast".to_string()];
+        let mut config = pipeline_config(
+            ResourceConfig {
+                storage_class: Some("fast".to_string()),
+                ..ResourceConfig::default()
+            },
+            &[],
+        );
+        // A claim is only rendered for a pipeline that keeps state on a volume.
+        config.storage_config = Some(StorageConfig {
+            path: "/storage".to_string(),
+            cache: Default::default(),
+        });
+        runner
+            .provision(
+                RuntimeDesiredStatus::Paused,
+                None,
+                &Uuid::max(),
+                &config,
+                &program_info(),
+                "http://api-server:8085/binary/00000000-0000-0000-0000-000000000000/1/checksum/integrity",
+                "http://api-server:8085/program_info/00000000-0000-0000-0000-000000000000/1/checksum",
+                Version(1),
+                &json!({}),
+                false,
+            )
+            .await
+            .expect("the allowed class must provision");
+
+        assert_eq!(runner.storage_class.as_deref(), Some("fast"));
+        let input = runner.render(
+            Uuid::max(),
+            "feldera",
+            "example/pipeline:1".to_string(),
+            &config,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(
+            input
+                .render()
+                .storage_claim
+                .and_then(|claim| claim.spec)
+                .and_then(|spec| spec.storage_class_name),
+            Some("fast".to_string())
+        );
+    }
+
+    /// A tenant with an entry gets a namespace of its own.
+    #[test]
+    fn a_tenant_namespace_is_looked_up_by_tenant_id() {
+        let tenant = TenantId(Uuid::nil());
+        let config = KubernetesRunnerConfig {
+            kubernetes_runner_tenant_namespaces: vec![
+                format!("tenant={}:tenant-a", Uuid::max()),
+                format!("tenant={}:tenant-b", tenant.0),
+            ],
+            ..runner_config()
+        };
+        let mapping = TenantNamespace::from_config(&config, &tenant)
+            .expect("the tenant has an entry of its own");
+        assert_eq!(mapping.namespace, "tenant-b");
+    }
+
+    /// A tenant with no entry has no mapping, and its pipelines stay in the
+    /// shared namespace.
+    #[test]
+    fn a_tenant_without_a_namespace_has_no_mapping() {
+        let config = KubernetesRunnerConfig {
+            kubernetes_runner_tenant_namespaces: vec![format!(
+                "tenant={}:tenant-a",
+                Uuid::max()
+            )],
+            ..runner_config()
+        };
+        assert!(TenantNamespace::from_config(&config, &TenantId(Uuid::nil())).is_none());
+    }
+
+    /// A malformed entry is skipped instead of failing every tenant's
+    /// provisioning, and the entries after it are still read.
+    #[test]
+    fn a_malformed_tenant_namespace_entry_is_skipped() {
+        let tenant = TenantId(Uuid::nil());
+        let config = KubernetesRunnerConfig {
+            kubernetes_runner_tenant_namespaces: vec![
+                "not-a-mapping".to_string(),
+                "no-prefix:tenant-x".to_string(),
+                format!("tenant=not-a-uuid:tenant-y"),
+                format!("tenant={}:", tenant.0),
+                format!("tenant={}:tenant-z", tenant.0),
+            ],
+            ..runner_config()
+        };
+        let mapping = TenantNamespace::from_config(&config, &tenant)
+            .expect("the one well-formed entry must still be found");
+        assert_eq!(mapping.namespace, "tenant-z");
+    }
+
+    /// A per-pipeline namespace still wins over the tenant mapping, because
+    /// that is how a pipeline is placed somewhere else on purpose.
     #[test]
     fn namespace_from_runtime_config_wins() {
         let runner = KubernetesRunner {
@@ -2677,11 +3075,17 @@ mod tests {
                 kubernetes_runner_metrics_namespace: None,
                 kubernetes_runner_reap_orphans: false,
                 kubernetes_runner_retain_storage_claims: false,
+                kubernetes_runner_enable_storage_classes: false,
+                kubernetes_runner_storage_classes: Vec::new(),
+                kubernetes_runner_storage_class: None,
+                kubernetes_runner_tenant_namespaces: Vec::new(),
             },
             client: reqwest::Client::new(),
             logs_sender: logs_sender(),
             logs_task: None,
             limits: ResourceLimits::default(),
+            storage_class: None,
+            tenant_namespace: None,
             kubernetes: None,
         };
         assert_eq!(runner.namespace(&json!({})), "feldera");
@@ -2692,6 +3096,35 @@ mod tests {
         assert_eq!(
             runner.location("tenant-a"),
             "pipeline-00000000-0000-0000-0000-000000000000.tenant-a.svc.cluster.local:8080"
+        );
+    }
+
+    /// The tenant's namespace applies when the pipeline names none, and an
+    /// explicit per-pipeline namespace still overrides it.
+    #[test]
+    fn the_tenant_namespace_applies_when_the_pipeline_names_none() {
+        let runner = KubernetesRunner {
+            tenant_namespace: Some(TenantNamespace {
+                tenant_id: TenantId(Uuid::nil()),
+                namespace: "tenant-b".to_string(),
+            }),
+            ..KubernetesRunner {
+                pipeline_id: PipelineId(Uuid::nil()),
+                common_config: CommonConfig::test_config(),
+                config: runner_config(),
+                client: reqwest::Client::new(),
+                logs_sender: logs_sender(),
+                logs_task: None,
+                limits: ResourceLimits::default(),
+                storage_class: None,
+                tenant_namespace: None,
+                kubernetes: None,
+            }
+        };
+        assert_eq!(runner.namespace(&json!({})), "tenant-b");
+        assert_eq!(
+            runner.namespace(&json!({"resources": {"namespace": "elsewhere"}})),
+            "elsewhere"
         );
     }
 
@@ -3004,6 +3437,10 @@ mod tests {
             kubernetes_runner_metrics_namespace: None,
             kubernetes_runner_reap_orphans: false,
             kubernetes_runner_retain_storage_claims: false,
+            kubernetes_runner_enable_storage_classes: false,
+            kubernetes_runner_storage_classes: Vec::new(),
+            kubernetes_runner_storage_class: None,
+            kubernetes_runner_tenant_namespaces: Vec::new(),
         }
     }
 
@@ -3024,6 +3461,8 @@ mod tests {
             logs_sender: logs_sender(),
             logs_task: None,
             limits: ResourceLimits::default(),
+            storage_class: None,
+            tenant_namespace: None,
             kubernetes: Some(fake_api::client(cluster.clone())),
         }
     }
@@ -3235,6 +3674,53 @@ mod tests {
         // in a unit test: it reports the failure instead of panicking.
         assert!(details["status_error"].is_string());
         assert_eq!(details["http_status"], serde_json::Value::Null);
+    }
+
+    /// A runner that has not built its client yet is the state of every
+    /// automaton that a promoted instance spawns: the previous leader held the
+    /// client, and the pipelines it was running are still up.
+    ///
+    /// Reporting their pods as missing would transition each one to stopping,
+    /// so an unbuildable client has to surface as the configuration error it
+    /// is. In a unit test there is no kubeconfig and no cluster, which is
+    /// exactly what a misconfigured deployment looks like.
+    #[tokio::test]
+    async fn check_without_a_client_reports_the_configuration_error() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        runner.kubernetes = None;
+
+        let error = runner
+            .check(&json!({}))
+            .await
+            .expect_err("a client that cannot be built is an error");
+        let message = error.to_string();
+        assert!(
+            !message.contains("does not exist"),
+            "an unbuildable client must not be reported as a missing pod: {message}"
+        );
+        assert!(
+            message.contains("kubernetes") || message.contains("Kubernetes"),
+            "the error should name the Kubernetes configuration: {message}"
+        );
+    }
+
+    /// The same state reached through `is_provisioned`, which is the other
+    /// reader that decides a pipeline's fate from the pod's existence.
+    #[tokio::test]
+    async fn is_provisioned_without_a_client_reports_the_configuration_error() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        runner.kubernetes = None;
+
+        let error = match runner.is_provisioned(&json!({})).await {
+            Ok(status) => panic!("a client that cannot be built is an error, got {status:?}"),
+            Err(error) => error,
+        };
+        assert!(
+            !error.to_string().contains("does not exist"),
+            "an unbuildable client must not be reported as a missing pod: {error}"
+        );
     }
 
     #[tokio::test]

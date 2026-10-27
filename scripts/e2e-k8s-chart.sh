@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+#
+# P1-019 acceptance, part 1: the chart's rendered values are a reviewed record.
+#
+# The Helm chart is the interface between an operator and the platform: a value
+# that is misspelled is silently ignored, and a value that is rendered into the
+# wrong flag starts a manager that behaves unlike the one that was asked for.
+# Both are invisible in `helm lint`, so this test renders the chart and compares
+# it with a recorded output. A change to the template then shows up as a diff to
+# review rather than as a surprise in a cluster.
+#
+# The recorded file is charts/feldera/tests/golden/default.yaml. Regenerate it
+# deliberately with GOLDEN_UPDATE=1 and read the diff:
+#
+#   GOLDEN_UPDATE=1 scripts/e2e-k8s-chart.sh
+#
+# The second half exercises the values.schema.json rejections the P1-019 work
+# added: a values file the platform cannot honour must fail at render time.
+set -euo pipefail
+
+CHART="${CHART:-charts/feldera}"
+GOLDEN="${GOLDEN:-charts/feldera/tests/golden/default.yaml}"
+RELEASE="${RELEASE:-feldera}"
+NAMESPACE="${NAMESPACE:-feldera}"
+
+step() { printf '\n-- %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+info() { printf '   %s\n' "$*"; }
+
+command -v helm >/dev/null || fail "helm is not on PATH"
+
+# The database password is generated when it is not given, which is what keeps
+# an upgrade from locking the manager out of a running Postgres. A generated
+# value would make every render differ, so the golden comparison pins it: the
+# recorded output is about which objects and fields the chart produces, not
+# about a secret that is random by design.
+render() {
+  helm template "$RELEASE" "$CHART" -n "$NAMESPACE" \
+    --set controlplane.postgresPassword=golden-render "$@"
+}
+
+step "render the default values"
+rendered="$(render)"
+[ -n "$rendered" ] || fail "the chart rendered nothing"
+
+if [ "${GOLDEN_UPDATE:-0}" = "1" ]; then
+  mkdir -p "$(dirname "$GOLDEN")"
+  printf '%s\n' "$rendered" >"$GOLDEN"
+  info "recorded $(printf '%s\n' "$rendered" | grep -c '' ) lines in $GOLDEN"
+  exit 0
+fi
+
+[ -f "$GOLDEN" ] || fail "no recorded output at $GOLDEN; run with GOLDEN_UPDATE=1"
+if ! diff -u "$GOLDEN" <(printf '%s\n' "$rendered") >/tmp/p1-019-golden.diff; then
+  cat /tmp/p1-019-golden.diff >&2
+  fail "the rendered chart differs from $GOLDEN; review the diff, then record it with GOLDEN_UPDATE=1"
+fi
+info "the rendered chart matches $GOLDEN"
+
+step "leader election is off at one replica"
+if printf '%s\n' "$rendered" | grep -q FELDERA_LEADER_ELECTION; then
+  fail "a single replica must not pay for an election it has nothing to elect against"
+fi
+if printf '%s\n' "$rendered" | grep -q podAntiAffinity; then
+  fail "a single replica has nothing to spread"
+fi
+info "no election and no anti-affinity at replicaCount=1"
+
+step "two replicas elect a leader and are spread over nodes"
+ha="$(render --set controlplane.replicaCount=2)"
+printf '%s\n' "$ha" | grep -q 'FELDERA_LEADER_ELECTION' \
+  || fail "two replicas without an election would each reconcile every pipeline"
+printf '%s\n' "$ha" | grep -q 'preferredDuringSchedulingIgnoredDuringExecution' \
+  || fail "two replicas must be spread over nodes when there are several"
+
+# `required` is the production setting: it must reach the manifest when asked
+# for, because an operator relying on it is relying on a refused schedule
+# rather than on a hint the scheduler may ignore.
+strict="$(render --set controlplane.replicaCount=2 --set controlplane.apiServerAntiAffinity=required)"
+printf '%s\n' "$strict" | grep -q 'requiredDuringSchedulingIgnoredDuringExecution' \
+  || fail "apiServerAntiAffinity=required did not reach the manifest"
+
+# And it must be possible to turn off, or a single-node cluster can hang a
+# rollout with one Pending replica.
+off="$(render --set controlplane.replicaCount=2 --set controlplane.apiServerAntiAffinity=none)"
+if printf '%s\n' "$off" | grep -q 'podAntiAffinity'; then
+  fail "apiServerAntiAffinity=none still rendered a rule"
+fi
+printf '%s\n' "$ha" | grep -q 'replicas: 2' || fail "the replica count did not reach the Deployment"
+info "replicaCount=2 renders the election env and an anti-affinity"
+
+step "the storage class policy reaches the manager's flags"
+policy="$(render \
+  --set controlplane.kubernetesRunner.enableStorageClassNamesSupported=true \
+  --set 'controlplane.kubernetesRunner.storageClassNamesSupported={fast,standard}' \
+  --set-string 'controlplane.kubernetesRunner.tenantNamespaces.11111111-1111-1111-1111-111111111111=tenant-a')"
+printf '%s\n' "$policy" | grep -q -- '--kubernetes-runner-enable-storage-classes' \
+  || fail "the allowlist switch did not reach the manager"
+printf '%s\n' "$policy" | grep -q -- '--kubernetes-runner-storage-classes=fast,standard' \
+  || fail "the allowed classes did not reach the manager"
+printf '%s\n' "$policy" | grep -q -- '--kubernetes-runner-tenant-namespaces=tenant=11111111-1111-1111-1111-111111111111:tenant-a' \
+  || fail "the tenant namespace did not reach the manager"
+info "the allowlist and the tenant namespace arrive as flags"
+
+step "values the platform cannot honour are rejected"
+rejects() {
+  local description="$1"
+  shift
+  if render "$@" >/dev/null 2>&1; then
+    fail "the schema accepted $description"
+  fi
+  info "rejected: $description"
+}
+rejects "zero API server replicas" --set controlplane.replicaCount=0
+rejects "an empty storage class name" \
+  --set 'controlplane.kubernetesRunner.storageClassNamesSupported={}'
+rejects "a tenant mapped to an empty namespace" --set-string \
+  'controlplane.kubernetesRunner.tenantNamespaces.11111111-1111-1111-1111-111111111111='
+rejects "an anti-affinity mode the chart does not have" \
+  --set controlplane.apiServerAntiAffinity=sometimes
+
+printf '\nPASS: the chart renders as recorded and rejects unhonourable values\n'

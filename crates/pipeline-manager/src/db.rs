@@ -1,4 +1,5 @@
 pub mod error;
+pub mod leader_election;
 pub mod listen_table;
 pub mod operations;
 #[cfg(feature = "postgresql_embedded")]

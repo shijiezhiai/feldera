@@ -2291,6 +2291,7 @@ mod test {
 
         fn new(
             _pipeline_id: PipelineId,
+            _tenant_id: crate::db::types::tenant::TenantId,
             _common_config: CommonConfig,
             _config: Self::Config,
             _client: reqwest::Client,
@@ -2678,6 +2679,7 @@ mod test {
                 pipeline_monitor_events_retention: 720,
                 disable_cluster_monitor_resources: false,
                 allow_rust_udfs: true,
+                leader_election: false,
             },
             pipeline_id,
             Some("test-pipeline".to_string()),

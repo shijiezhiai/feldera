@@ -9,7 +9,22 @@ image:
   tag: "v0.357.0-20-g7a5128651-bili.1"
   pullPolicy: IfNotPresent
 
+# API server replicas. Above one, leader election decides which instance
+# reconciles pipelines: the others serve the API and answer log requests with
+# 503 until they take over. Leave it at one on a single-node cluster, where a
+# second replica costs a pod and adds no availability.
 replicaCount: 1
+
+# How the API server replicas are kept apart, once there is more than one.
+#
+#   preferred - spread over nodes when the cluster has more than one, and fall
+#               back to co-locating when it does not (the default)
+#   required  - refuse to co-locate, leaving a replica Pending on a cluster
+#               with too few nodes; the production setting
+#   none      - no rule; for clusters that spread the replicas another way
+#
+# At one replica none of these apply: there is nothing to keep apart.
+apiServerAntiAffinity: preferred
 
 # Interface-compatible no-op fields (OSS manager has no license gate).
 felderaAccountId: ""
@@ -65,7 +80,19 @@ kubernetesRunner:
   upperLimitStorageMegabyte: 128000
   lowerLimitEphemeralStorageMegabyte: 500
   upperLimitEphemeralStorageMegabyte: 2000
+  # Class the platform provisions pipeline state on. Null means the cluster's
+  # default class.
   storageClassName: null
+  # P1-019: refuse a pipeline that asks for a class outside this list, so a
+  # pipeline cannot land its state on a class that cannot survive an eviction.
+  # An empty list with the switch on refuses every named class, which is
+  # deliberate: "these are the classes we allow" with none listed allows none.
+  enableStorageClassNamesSupported: false
+  storageClassNamesSupported: []
+  # P1-019: namespace per tenant, written as "<tenant-uuid>: <namespace>".
+  # Every namespace must exist before it is listed here: the manager's role is
+  # namespaced and cannot create one.
+  tenantNamespaces: {}
   connectorKubernetesSecrets:
     enableAllowlist: false
     allowlist: []

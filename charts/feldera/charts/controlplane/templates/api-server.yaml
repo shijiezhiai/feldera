@@ -25,6 +25,39 @@ spec:
         app.kubernetes.io/component: api-server
     spec:
       serviceAccountName: {{ include "controlplane.fullname" . }}
+      {{- if and (gt (int .Values.replicaCount) 1) (ne .Values.apiServerAntiAffinity "none") }}
+      # Spread the replicas over nodes: two replicas on one node fail together,
+      # so co-locating them adds no availability and would cost the leader.
+      #
+      # `required` is the setting for production: it makes a cluster with too
+      # few nodes fail loudly instead of quietly co-locating. `preferred` is
+      # the default because it still spreads when several nodes exist, and it
+      # keeps a single-node development cluster — where two replicas exercise
+      # the election rather than the scheduler — from deadlocking with one pod
+      # Pending. Neither is a no-op, so `none` exists for the case where an
+      # operator spreads the replicas some other way.
+      affinity:
+        podAntiAffinity:
+          {{- if eq .Values.apiServerAntiAffinity "required" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: {{ include "controlplane.name" . }}
+                  app.kubernetes.io/instance: {{ .Release.Name }}
+                  app.kubernetes.io/component: api-server
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ include "controlplane.name" . }}
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                    app.kubernetes.io/component: api-server
+          {{- end }}
+      {{- end }}
       containers:
         - name: api-server
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -43,6 +76,14 @@ spec:
               value: "api"
             - name: COMPILER_HOST
               value: {{ .Values.compilerServiceHost | default (printf "%s-compiler.%s.svc.cluster.local" .Release.Name .Release.Namespace) | quote }}
+            {{- end }}
+            {{- if gt (int .Values.replicaCount) 1 }}
+            # Above one replica, elect exactly one instance to reconcile
+            # pipelines. Without this every replica would provision, start and
+            # stop every pipeline, and each would tear down the other's
+            # deployment.
+            - name: FELDERA_LEADER_ELECTION
+              value: "true"
             {{- end }}
             {{- if not .Values.postgresExternal }}
             - name: DB_USER
@@ -79,6 +120,20 @@ spec:
             - "--kubernetes-runner-pipeline-executor-image={{ .Values.kubernetesRunner.image.registry }}/{{ .Values.kubernetesRunner.image.repository }}:{{ .Values.kubernetesRunner.image.tag }}"
             {{- if .Values.kubernetesRunner.enablePerPipelineNamespace }}
             - "--kubernetes-runner-per-pipeline-namespace"
+            {{- end }}
+            # P1-019: storage class policy. The allowlist only takes effect with
+            # the switch on, and every tenant namespace must already exist.
+            {{- if .Values.kubernetesRunner.enableStorageClassNamesSupported }}
+            - "--kubernetes-runner-enable-storage-classes"
+            {{- with .Values.kubernetesRunner.storageClassNamesSupported }}
+            - "--kubernetes-runner-storage-classes={{ join "," . }}"
+            {{- end }}
+            {{- end }}
+            {{- with .Values.kubernetesRunner.storageClassName }}
+            - "--kubernetes-runner-storage-class={{ . }}"
+            {{- end }}
+            {{- with .Values.kubernetesRunner.tenantNamespaces }}
+            - "--kubernetes-runner-tenant-namespaces={{ range $tenant, $namespace := . }}tenant={{ $tenant }}:{{ $namespace }},{{ end }}"
             {{- end }}
             {{- if .Values.kubernetesRunner.allowCustomPipelineTemplate }}
             - "--kubernetes-runner-allow-kubernetes-env-prefix"

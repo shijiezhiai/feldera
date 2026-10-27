@@ -1,0 +1,389 @@
+---
+# Source: feldera/charts/compiler/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: feldera-compiler
+  labels:
+    app.kubernetes.io/name: compiler
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+---
+# Source: feldera/charts/controlplane/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: feldera-controlplane
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+---
+# Source: feldera/charts/controlplane/templates/db-insecure-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: feldera-db-insecure-secret
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+type: Opaque
+stringData:
+  .user: "feldera"
+  .password: "golden-render"
+---
+# Source: feldera/charts/compiler/templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: feldera-compiler
+  labels:
+    app.kubernetes.io/name: compiler
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+# Source: feldera/charts/controlplane/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: feldera-controlplane-runner
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Source: feldera/charts/controlplane/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: feldera-controlplane-runner
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: feldera-controlplane-runner
+subjects:
+  - kind: ServiceAccount
+    name: feldera-controlplane
+    namespace: feldera
+---
+# Source: feldera/charts/compiler/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: feldera-compiler
+  labels:
+    app.kubernetes.io/name: compiler
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: compiler
+    app.kubernetes.io/instance: feldera
+  ports:
+    - name: compiler
+      port: 8085
+      targetPort: 8085
+---
+# Source: feldera/charts/controlplane/templates/api-server-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: feldera-controlplane-api-server
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/component: api-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    # Pipeline pods download their program binary from the compiler service that
+    # runs inside the manager pod; without this port the pipeline cannot start.
+    - name: compiler
+      port: 8085
+      targetPort: 8085
+---
+# Source: feldera/charts/controlplane/templates/db-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: feldera-db
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/instance: feldera
+  ports:
+    - name: postgres
+      port: 5431
+      targetPort: 5432
+---
+# Source: feldera/charts/controlplane/templates/api-server.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feldera-controlplane-api-server
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/component: api-server
+  annotations:
+    deployment-time: 
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: controlplane
+      app.kubernetes.io/instance: feldera
+      app.kubernetes.io/component: api-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: controlplane
+        app.kubernetes.io/instance: feldera
+        app.kubernetes.io/component: api-server
+    spec:
+      serviceAccountName: feldera-controlplane
+      containers:
+        - name: api-server
+          image: "localhost:5001/feldera-manager:v0.357.0-20-g7a5128651-bili.1"
+          imagePullPolicy: IfNotPresent
+          env:
+            # The Kubernetes runner provisions each pipeline as its own pod
+            # (see docs/design/adr-k8s-runner.md). Pipelines fetch their program
+            # binary from the compiler service in this same pod, so the compiler
+            # host must be the in-cluster address, never 127.0.0.1.
+            - name: FELDERA_RUNNER
+              value: "kubernetes"
+            # P1-018: the artifacts live in the compiler StatefulSet, not in
+            # this pod, so this process serves the API and the runner only.
+            - name: FELDERA_SERVICES
+              value: "api"
+            - name: COMPILER_HOST
+              value: "feldera-compiler.feldera.svc.cluster.local"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: feldera-db-insecure-secret
+                  key: .user
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: feldera-db-insecure-secret
+                  key: .password
+          # The image ENTRYPOINT already carries --bind-address, --sql-compiler-path,
+          # --compilation-cargo-lock-path, --dbsp-override-path and --demos-dir
+          # (deploy/Dockerfile.manager); only the DB connection differs per deploy.
+          args:
+            - "--db-connection-string=postgres://$(DB_USER):$(DB_PASSWORD)@feldera-db:5431/feldera"
+            - "--compiler-host=$(COMPILER_HOST)"
+            - "--kubernetes-runner-namespace=feldera"
+            - "--kubernetes-runner-pipeline-executor-image=localhost:5001/feldera-runner:v0.357.0-20-g7a5128651-bili.1"
+            # P1-019: storage class policy. The allowlist only takes effect with
+            # the switch on, and every tenant namespace must already exist.
+            # Resource range of the platform; the runner clamps every pipeline
+            # request into it (P1-011).
+            - "--kubernetes-runner-lower-memory-mb=100"
+            - "--kubernetes-runner-upper-memory-mb=32000"
+            - "--kubernetes-runner-default-storage-mb=30000"
+            - "--kubernetes-runner-upper-storage-mb=128000"
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+---
+# Source: feldera/charts/compiler/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: feldera-compiler
+  labels:
+    app.kubernetes.io/name: compiler
+    app.kubernetes.io/instance: feldera
+spec:
+  serviceName: feldera-compiler
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: compiler
+      app.kubernetes.io/instance: feldera
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: compiler
+        app.kubernetes.io/instance: feldera
+    spec:
+      serviceAccountName: feldera-compiler
+      containers:
+        - name: compiler
+          image: "localhost:5001/feldera-compiler:v0.357.0-20-g7a5128651-bili.1"
+          imagePullPolicy: IfNotPresent
+          # P1-018: the compiler pod compiles and stores artifacts; the API
+          # server pod has neither the source tree nor the cargo cache and
+          # reaches this one over HTTP at `compilerServiceHost`.
+          #
+          # `artifact-server` alone runs the store without compiling, which is
+          # the shape to scale out later: N stateless compilers uploading to
+          # one durable store (the enterprise compiler-autoscaling topology
+          # `artifact_server_main` was written for).
+          env:
+            - name: FELDERA_SERVICES
+              value: "compiler,artifact-server"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: feldera-db-insecure-secret
+                  key: .user
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: feldera-db-insecure-secret
+                  key: .password
+          # The image ENTRYPOINT already carries --bind-address,
+          # --sql-compiler-path, --compilation-cargo-lock-path,
+          # --dbsp-override-path and --demos-dir; only the per-deployment
+          # arguments are passed here.
+          args:
+            - "--db-connection-string=postgres://$(DB_USER):$(DB_PASSWORD)@feldera-db:5431/feldera"
+            - "--compilation-profile=optimized"
+          ports:
+            - name: compiler
+              containerPort: 8085
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8085
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8085
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/ubuntu/.feldera/compiler
+      # The claim is handed to the pod as root:root but the image runs as
+      # `ubuntu` (uid 1000); fsGroup gives that user write access, which the
+      # compiler needs to create its working directory inside the claim.
+      securityContext:
+        fsGroup: 1000
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: feldera-compiler
+---
+# Source: feldera/charts/controlplane/templates/db.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: feldera-db
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+spec:
+  serviceName: feldera-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/instance: feldera
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/instance: feldera
+    spec:
+      serviceAccountName: feldera-controlplane
+      containers:
+        - name: postgres
+          image: "postgres:17-alpine"
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: feldera-db-insecure-secret
+                  key: .user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: feldera-db-insecure-secret
+                  key: .password
+            - name: POSTGRES_DB
+              value: feldera
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}

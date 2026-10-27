@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Feldera platform chart values",
+  "description": "Rejects a values file the platform cannot honour, so a mistake fails at render time instead of after a pipeline has been provisioned onto the wrong storage class.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "controlplane": {
+      "type": "object",
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "API server replicas. Above one, leader election picks the reconciler."
+        },
+        "postgresPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "kubernetesRunner": {
+          "type": "object",
+          "properties": {
+            "enableStorageClassNamesSupported": {
+              "type": "boolean"
+            },
+            "storageClassNamesSupported": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Classes a pipeline may name. An empty list with the switch on refuses every named class."
+            },
+            "storageClassName": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Class given to a pipeline that names none; null uses the cluster default."
+            },
+            "tenantNamespaces": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Tenant UUID to namespace. Each namespace must already exist."
+            },
+            "lowerLimitMemoryMegabyte": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "upperLimitMemoryMegabyte": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "defaultStorageMegabyte": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "upperLimitStorageMegabyte": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "apiServerAntiAffinity": {
+          "type": "string",
+          "enum": [
+            "preferred",
+            "required",
+            "none"
+          ],
+          "description": "How API server replicas are kept apart above one replica."
+        }
+      }
+    }
+  }
+}

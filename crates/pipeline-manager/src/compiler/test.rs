@@ -56,6 +56,7 @@ impl CompilerTest {
             pipeline_monitor_events_retention: 720,
             disable_cluster_monitor_resources: false,
             allow_rust_udfs: true,
+            leader_election: false,
         };
         let compiler_config = CompilerConfig {
             sql_compiler_path:
