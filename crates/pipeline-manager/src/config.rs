@@ -421,6 +421,27 @@ pub struct CommonConfig {
         env = "FELDERA_DISABLE_CLUSTER_MONITOR_RESOURCES"
     )]
     pub disable_cluster_monitor_resources: bool,
+
+    /// Elect one API server to reconcile pipelines, when several run.
+    ///
+    /// The reconciliation loop assumes it is the only instance: it provisions,
+    /// starts and stops every pipeline. Two instances running it against one
+    /// database therefore fight over every pipeline, each overwriting the
+    /// other's deployment id. With this on, one instance holds a Postgres
+    /// advisory lock and reconciles while the others serve the API without
+    /// reconciling, and they take over within seconds when the leader's
+    /// connection goes away.
+    ///
+    /// Off by default, because it costs an extra database connection and a
+    /// single API server has nothing to elect against. Set it when
+    /// `replicaCount` in the chart is above one: without it, a second replica
+    /// breaks every pipeline rather than adding availability.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "FELDERA_LEADER_ELECTION"
+    )]
+    pub leader_election: bool,
 }
 
 impl CommonConfig {
@@ -731,6 +752,7 @@ impl CommonConfig {
             private_ca_cert_path: None,
             pipeline_monitor_events_retention: 720,
             disable_cluster_monitor_resources: false,
+            leader_election: false,
         }
     }
 }
@@ -1847,6 +1869,65 @@ pub struct KubernetesRunnerConfig {
     #[serde(default)]
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_ALLOW_KUBERNETES_ENV_PREFIX")]
     pub kubernetes_runner_allow_kubernetes_env_prefix: bool,
+
+    /// Reject pipeline storage classes not named in
+    /// `--kubernetes-runner-storage-classes`.
+    ///
+    /// A storage class determines the disk a pipeline's state is written to,
+    /// and with it the durability and the IOPS the pipeline can count on. Left
+    /// unrestricted, a pipeline may name any class the cluster happens to have,
+    /// including one backed by a single node's local disk, where a pod eviction
+    /// means losing the state.
+    ///
+    /// Off by default. On, the runner refuses a pipeline that names a class
+    /// outside the list before creating the claim, instead of provisioning it
+    /// and leaving the operator to discover the volume by inspecting it.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_ENABLE_STORAGE_CLASSES")]
+    pub kubernetes_runner_enable_storage_classes: bool,
+
+    /// Storage classes a pipeline may ask for, when the allowlist is enabled.
+    ///
+    /// Ignored unless `--kubernetes-runner-enable-storage-classes` is set. An
+    /// empty list with the allowlist enabled admits no class at all, which is
+    /// deliberate: a permissive fallback would make turning the switch on look
+    /// like it had an effect it does not have.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_STORAGE_CLASSES",
+        value_delimiter = ','
+    )]
+    pub kubernetes_runner_storage_classes: Vec<String>,
+
+    /// Storage class a pipeline gets when it names none.
+    ///
+    /// Unset leaves the claim without a `storageClassName`, so the cluster's
+    /// default class applies. When set it must be inside the allowlist, if the
+    /// allowlist is enabled: a default that the allowlist rejects would make
+    /// every pipeline without an explicit class fail to provision.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_STORAGE_CLASS")]
+    pub kubernetes_runner_storage_class: Option<String>,
+
+    /// Kubernetes namespace that a tenant's pipelines are provisioned in.
+    ///
+    /// Given once per tenant as `tenant=<uuid>:<namespace>`; repeat the flag
+    /// for several tenants. A tenant with no entry uses
+    /// `--kubernetes-runner-namespace`.
+    ///
+    /// The namespace must already exist. The manager's role is namespaced, so
+    /// it cannot create one, and a missing namespace therefore fails
+    /// provisioning with an error naming it rather than silently falling back
+    /// to the shared namespace: a fallback would put two tenants' pipelines in
+    /// one namespace, which is the isolation this setting exists to provide.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_TENANT_NAMESPACES",
+        value_delimiter = ','
+    )]
+    pub kubernetes_runner_tenant_namespaces: Vec<String>,
 
     /// Smallest pipeline memory the platform provisions, in MB.
     ///

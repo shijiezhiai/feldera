@@ -1,6 +1,7 @@
 use crate::api::error::ApiError;
 use crate::api::util::parse_url_parameter;
 use crate::config::CommonConfig;
+use crate::db::leader_election::LeadershipHandle;
 use crate::db::listen_table::{Operation, PIPELINE_NOTIFY_CHANNEL_CAPACITY};
 use crate::db::probe::DbProbe;
 use crate::db::storage::Storage;
@@ -168,6 +169,7 @@ fn apply_resume_position(
 #[get("/logs/{pipeline_id}")]
 async fn get_logs(
     data: web::Data<Arc<Mutex<PipelinesState>>>,
+    leadership: web::Data<LeadershipHandle>,
     query: web::Query<LogsQuery>,
     req: HttpRequest,
 ) -> Result<impl Responder, ManagerError> {
@@ -197,8 +199,23 @@ async fn get_logs(
     // Take a handle to the logs thread and release the pipelines lock before waiting on it.
     // The reconciliation loop takes the same lock, so holding it across the wait below would
     // stall pipeline discovery for as long as the logs thread takes to answer.
+    // A standby runs no automaton, so it holds no log buffer for any pipeline.
+    // Answering "not found" would be wrong — the pipeline exists — and would
+    // teach a client to give up on a pipeline that a retry, after failover,
+    // would have followed. The status code says "try again, possibly
+    // elsewhere" instead.
     let follow_request_sender = match data.lock().await.get(&pipeline_id) {
-        None => return Ok(HttpResponse::NotFound().finish()),
+        None if leadership.is_leader() => return Ok(HttpResponse::NotFound().finish()),
+        None => {
+            return Ok(HttpResponse::ServiceUnavailable()
+                .content_type("text/plain; charset=utf-8")
+                .body(format!(
+                    "This pipeline is not running on this API server instance, which is \
+                     standing by. Its logs are available from the instance that reconciles \
+                     pipelines; retry against another instance or after failover. Pipeline: \
+                     {pipeline_id}"
+                )));
+        }
         Some((_, _, follow_request_sender)) => follow_request_sender.clone(),
     };
 
@@ -241,6 +258,14 @@ async fn get_logs(
 
 /// Main to start the runner, which consists of starting an HTTP(S) server and
 /// a reconciliation loop which matches pipelines with runner automatons.
+///
+/// `leadership` is the result of the API server election. The HTTP surface is
+/// served whatever the role is — a standby answers `/healthz` so a Service
+/// routes to it — but the reconciliation loop only acts while this process is
+/// the leader, and stops acting the moment it is not. Two instances that both
+/// act would provision and stop every pipeline twice; see
+/// [`crate::db::leader_election`] for why that corrupts a pipeline instead of
+/// merely duplicating work.
 pub async fn runner_main<E: PipelineExecutor + 'static>(
     // Database handle
     db: Arc<Mutex<StoragePostgres>>,
@@ -248,6 +273,8 @@ pub async fn runner_main<E: PipelineExecutor + 'static>(
     common_config: CommonConfig,
     // Pipeline executor configuration
     config: E::Config,
+    // Which instance reconciles pipelines
+    leadership: LeadershipHandle,
 ) {
     // Mapping of the present pipelines to how to reach them:
     // - A notification mechanism for the automata to act quickly on change
@@ -257,10 +284,12 @@ pub async fn runner_main<E: PipelineExecutor + 'static>(
     // Setup HTTP(S) server
     let data_healthz = web::Data::new(DbProbe::new(db.clone()).await);
     let data_logs = web::Data::new(pipelines.clone());
+    let data_leadership = web::Data::new(leadership.clone());
     let server = HttpServer::new(move || {
         actix_web::App::new()
             .app_data(data_healthz.clone())
             .app_data(data_logs.clone())
+            .app_data(data_leadership.clone())
             .service(get_healthz)
             .service(get_logs)
     })
@@ -304,7 +333,7 @@ pub async fn runner_main<E: PipelineExecutor + 'static>(
     let client = common_config.reqwest_client().await;
 
     // Launch the reconciliation loop
-    reconcile::<E>(db, client, pipelines, common_config, config).await;
+    reconcile::<E>(db, client, pipelines, common_config, config, leadership).await;
 }
 
 /// For each of the rows in the pipeline table, the runner spawns an automaton, also referred to as
@@ -326,6 +355,7 @@ async fn reconcile<E: PipelineExecutor + 'static>(
     pipelines: Arc<Mutex<PipelinesState>>,
     common_config: CommonConfig,
     config: E::Config,
+    leadership: LeadershipHandle,
 ) {
     // Listen to the pipeline table in order to be able to send quick notification to the pipeline
     // runner that something changed in the pipeline, and it might need to take action
@@ -372,10 +402,36 @@ async fn reconcile<E: PipelineExecutor + 'static>(
     // Periodically check for new pipelines and start runners for them, followed by checking whether
     // any existing runners have terminated
     let mut db_error_previously = false;
+    let mut leadership = leadership;
     loop {
+        // Only the leader reconciles. A standby runs no automaton, and an
+        // instance that has just been demoted stops the ones it was running:
+        // an instance that kept acting after losing the lock would fight the
+        // instance that took over, and every pipeline would be provisioned and
+        // stopped twice.
+        if !leadership.is_leader() {
+            stop_automatons(&pipelines).await;
+            info!("Runner main: standing by until this instance becomes leader");
+            if leadership.changed().await.is_none() {
+                info!(
+                    "Runner main: the leadership election ended; no further reconciliation will happen"
+                );
+                return;
+            }
+            // Whatever the new role is, the top of the loop decides again.
+            continue;
+        }
+
         // Discover new pipelines and delete finished ones at an interval, or it can also be
-        // preempted via the listening mechanism
-        let _ = timeout(PIPELINE_DISCOVERY_INTERVAL, main_notifier.notified()).await;
+        // preempted via the listening mechanism or by losing the lock.
+        tokio::select! {
+            _ = timeout(PIPELINE_DISCOVERY_INTERVAL, main_notifier.notified()) => {}
+            _ = leadership.changed() => {
+                // Losing the lock stops the automatons at the top of the loop
+                // before any further action is taken.
+                continue;
+            }
+        }
 
         // Retrieve the full list of pipeline identifiers, and start a pipeline runner for each one
         // which is not yet in the state
@@ -401,6 +457,7 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                             let logs_sender = LogsSender::new(logs_sender);
                             let pipeline_handle = E::new(
                                 pipeline_id,
+                                tenant_id,
                                 common_config.clone(),
                                 config.clone(),
                                 client.clone(),
@@ -462,6 +519,32 @@ async fn reconcile<E: PipelineExecutor + 'static>(
             }
         }
     }
+}
+
+/// Stops every pipeline automaton this instance runs and forgets them.
+///
+/// Called when the instance stops being the leader. The tasks are aborted
+/// rather than asked to stop: an automaton in the middle of a Kubernetes call
+/// has no clean point at which to yield, and the rules of the automaton are
+/// written for a single driver — the next leader rediscovers each pipeline and
+/// drives it from its row, which is the same path a manager restart takes.
+async fn stop_automatons(pipelines: &Arc<Mutex<PipelinesState>>) {
+    let mut pipelines = pipelines.lock().await;
+    if pipelines.is_empty() {
+        return;
+    }
+    info!(
+        "Runner main: stopping {} pipeline automaton(s) because this instance is no longer the leader",
+        pipelines.len()
+    );
+    for (pipeline_id, (join_handle, _, _)) in pipelines.iter() {
+        // Aborting is safe with respect to the database: an automaton's writes
+        // are single-statement updates, so a task killed between two of them
+        // leaves a row that the next leader reads as it stands.
+        join_handle.abort();
+        tracing::debug!(pipeline_id = %pipeline_id, "Runner main: stopped a pipeline automaton");
+    }
+    pipelines.clear();
 }
 
 #[cfg(test)]
@@ -560,6 +643,40 @@ mod test {
             .expect("follower channel was closed")
     }
 
+    /// A handle that reports itself as the leader.
+    ///
+    /// The log handler is the one the server runs, and a server only follows
+    /// logs while it is the leader, so the tests that exercise following hand
+    /// it a leader.
+    fn leader() -> crate::db::leader_election::LeadershipHandle {
+        use crate::db::leader_election::Leadership;
+        use std::sync::atomic::AtomicBool;
+        let (_sender, receiver) = tokio::sync::watch::channel(Leadership::Leader);
+        crate::db::leader_election::LeadershipHandle::for_test(
+            receiver,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    /// A handle that reports itself as a standby.
+    fn standby() -> crate::db::leader_election::LeadershipHandle {
+        use crate::db::leader_election::Leadership;
+        use std::sync::atomic::AtomicBool;
+        let (_sender, receiver) = tokio::sync::watch::channel(Leadership::Standby);
+        crate::db::leader_election::LeadershipHandle::for_test(
+            receiver,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// A pipeline state with no automatons, for a request that only needs the
+    /// handler to consult it.
+    fn empty_pipelines() -> Arc<Mutex<PipelinesState>> {
+        Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
     async fn logs_fixture(lines: &[&str]) -> LogsFixture {
         let pipeline_id = PipelineId(Uuid::now_v7());
         let (follow_sender, follow_receiver) = channel::<FollowRequest>(10);
@@ -625,6 +742,7 @@ mod test {
         let app = actix_test::init_service(
             App::new()
                 .app_data(web::Data::new(fixture.pipelines.clone()))
+                .app_data(web::Data::new(leader()))
                 .service(get_logs),
         )
         .await;
@@ -708,6 +826,7 @@ mod test {
         let server = ::actix_test::start(move || {
             App::new()
                 .app_data(web::Data::new(pipelines.clone()))
+                .app_data(web::Data::new(leader()))
                 .service(get_logs)
         });
 
@@ -855,6 +974,57 @@ mod test {
         );
     }
 
+    /// A standby answers a log request with 503, not 404.
+    ///
+    /// The pipeline exists; its log stream is in the memory of the instance
+    /// that reconciles it. Answering "not found" would teach a client that the
+    /// pipeline is gone, when retrying against the leader — or after failover —
+    /// would have followed it.
+    #[tokio::test]
+    async fn a_standby_answers_a_log_request_with_service_unavailable() {
+        let pipeline_id = PipelineId(Uuid::now_v7());
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(empty_pipelines()))
+                .app_data(web::Data::new(standby()))
+                .service(get_logs),
+        )
+        .await;
+        let response = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::get()
+                .uri(&format!("/logs/{pipeline_id}"))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A leader that holds no buffer for a pipeline answers 404: from the
+    /// leader's point of view the pipeline is not running, and no other
+    /// instance knows better.
+    #[tokio::test]
+    async fn a_leader_answers_an_unknown_pipeline_with_not_found() {
+        let pipeline_id = PipelineId(Uuid::now_v7());
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(empty_pipelines()))
+                .app_data(web::Data::new(leader()))
+                .service(get_logs),
+        )
+        .await;
+        let response = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::get()
+                .uri(&format!("/logs/{pipeline_id}"))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     /// A follower the logs thread drops is answered without a position, and a caller that
     /// receives none starts its log over.
     #[tokio::test]
@@ -875,6 +1045,7 @@ mod test {
         let app = actix_test::init_service(
             App::new()
                 .app_data(web::Data::new(pipelines))
+                .app_data(web::Data::new(leader()))
                 .service(get_logs),
         )
         .await;

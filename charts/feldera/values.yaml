@@ -9,6 +9,13 @@ controlplane:
     tag: "v0.357.0-20-g7a5128651-bili.1"
     pullPolicy: IfNotPresent
   replicaCount: 1
+  # P1-019: which storage classes pipelines may use. An empty list with the
+  # switch on refuses every named class.
+  kubernetesRunner:
+    enableStorageClassNamesSupported: false
+    storageClassNamesSupported: []
+    storageClassName: null
+    tenantNamespaces: {}
   postgresExternal: false
   postgresVersion: "17-alpine"
   postgresImageRepository: "postgres"

@@ -6,6 +6,7 @@ use crate::config::{CommonConfig, LocalRunnerConfig};
 use crate::db::types::pipeline::{
     PipelineId, bootstrap_policy_to_string, runtime_desired_status_to_string,
 };
+use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use crate::error::{ManagerError, source_error};
 use crate::pipeline_env::validate_pipeline_env;
@@ -1043,6 +1044,7 @@ impl PipelineExecutor for LocalRunner {
 
     fn new(
         pipeline_id: PipelineId,
+        _tenant_id: TenantId,
         common_config: CommonConfig,
         config: Self::Config,
         client: reqwest::Client,

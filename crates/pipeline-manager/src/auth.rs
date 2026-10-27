@@ -2450,6 +2450,7 @@ mod test {
             private_ca_cert_path: None,
             pipeline_monitor_events_retention: 720,
             disable_cluster_monitor_resources: false,
+            leader_election: false,
         };
 
         let manager_config = default_manager_test_config();

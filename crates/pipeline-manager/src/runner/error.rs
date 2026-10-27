@@ -74,6 +74,11 @@ pub enum RunnerError {
     RunnerConfigError {
         error: String,
     },
+    /// A pipeline asked for a storage class the platform does not provision on.
+    StorageClassNotAllowed {
+        storage_class: String,
+        allowed: Vec<String>,
+    },
     Gen2BinaryNotConfigured,
     Gen2BinaryNotFound {
         path: String,
@@ -176,6 +181,7 @@ impl DetailedError for RunnerError {
             RunnerError::RunnerStopError { .. } => Cow::from("RunnerStopError"),
             RunnerError::RunnerClearError { .. } => Cow::from("RunnerClearError"),
             RunnerError::RunnerConfigError { .. } => Cow::from("RunnerConfigError"),
+            RunnerError::StorageClassNotAllowed { .. } => Cow::from("StorageClassNotAllowed"),
             RunnerError::Gen2BinaryNotConfigured => Cow::from("Gen2BinaryNotConfigured"),
             RunnerError::Gen2BinaryNotFound { .. } => Cow::from("Gen2BinaryNotFound"),
             RunnerError::RunnerInteractionUnreachable { .. } => {
@@ -355,6 +361,21 @@ impl Display for RunnerError {
             Self::RunnerConfigError { error } => {
                 write!(f, "Pipeline runner configuration error: {error}")
             }
+            Self::StorageClassNotAllowed {
+                storage_class,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "The platform does not provision pipelines on the storage class \
+                     '{storage_class}'. Allowed: {}.",
+                    if allowed.is_empty() {
+                        "none".to_string()
+                    } else {
+                        allowed.join(", ")
+                    }
+                )
+            }
             Self::Gen2BinaryNotConfigured => {
                 write!(
                     f,
@@ -495,6 +516,9 @@ impl ResponseError for RunnerError {
             Self::RunnerStopError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerClearError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerConfigError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            // The caller asked for a class the deployment does not offer, which
+            // is a bad request rather than a server fault.
+            Self::StorageClassNotAllowed { .. } => StatusCode::BAD_REQUEST,
             Self::Gen2BinaryNotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Gen2BinaryNotFound { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerInteractionUnreachable { .. } => StatusCode::SERVICE_UNAVAILABLE,

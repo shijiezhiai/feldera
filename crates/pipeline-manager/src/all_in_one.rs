@@ -157,11 +157,27 @@ where
     }
 
     if common_config.runs_api() {
+        // Elect one instance to reconcile the pipelines. Only that instance
+        // spawns automatons; the others serve the API from the same database
+        // and take over when the leader's lock is released. With a single
+        // instance the election is off and this is the leader at once.
+        let leadership = crate::db::leader_election::start_election(
+            common_config.leader_election,
+            db.clone(),
+        );
+
         // Spawn local runner
         let db_clone = db.clone();
         let common_config_clone = common_config.clone();
+        let leadership_clone = leadership.clone();
         let _local_runner = tokio::spawn(async move {
-            runner_main::<E>(db_clone, common_config_clone, executor_config).await;
+            runner_main::<E>(
+                db_clone,
+                common_config_clone,
+                executor_config,
+                leadership_clone,
+            )
+            .await;
         });
 
         // Spawn cluster monitor

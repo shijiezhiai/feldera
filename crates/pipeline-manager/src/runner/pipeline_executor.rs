@@ -1,5 +1,6 @@
 use crate::config::CommonConfig;
 use crate::db::types::pipeline::PipelineId;
+use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use crate::runner::pipeline_logs::LogsSender;
@@ -9,6 +10,8 @@ use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
 use std::time::Duration;
 use uuid::Uuid;
 
+/// What `provision` and `is_provisioned` report about a pipeline's resources.
+#[derive(Debug)]
 pub enum ProvisionStatus {
     /// Pipeline resources are still being provisioned.
     Ongoing { details: serde_json::Value },
@@ -30,8 +33,15 @@ pub trait PipelineExecutor: Sync + Send {
     const DEFAULT_PROVISIONING_TIMEOUT: Duration;
 
     /// Constructs a new runner for the provided pipeline and starts rejection logging.
+    ///
+    /// `tenant_id` is the tenant the pipeline belongs to. A platform that
+    /// provisions tenants in separate namespaces needs it before provisioning
+    /// starts, and the per-pipeline namespace is chosen from the tenant's
+    /// mapping, so it is handed to the runner rather than read from the
+    /// pipeline row on every call.
     fn new(
         pipeline_id: PipelineId,
+        tenant_id: TenantId,
         common_config: CommonConfig,
         config: Self::Config,
         client: reqwest::Client,
