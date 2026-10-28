@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cca1cbb33a185936e14f4fee21054287551be58e4501864c839d5c3c9b36bb89 # shrinks to [Fault(StopUnreachable), Start]
+cc eee89d8e6fe115aa30143c75f159cd62bd97c7afb0c3c3286469375f88b318af # shrinks to [Fault(NeverProvisioned), Start, Tick, Tick, Start]
+cc 0178e4ad655982a97e8c9443520796de41dfa8aed50a6e4f6f777eb8c0d8481e # shrinks to [Start, Fault(ProvisionConflict), Start]

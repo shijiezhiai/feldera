@@ -190,6 +190,12 @@ pub fn validate_resources_status_transition(
         | (StorageStatus::InUse, ResourcesStatus::Provisioning, ResourcesStatus::Stopping)
         | (StorageStatus::InUse, ResourcesStatus::Provisioned, ResourcesStatus::Stopping)
         | (StorageStatus::Cleared | StorageStatus::InUse, ResourcesStatus::Stopping, ResourcesStatus::Stopped)
+        // A stop that failed has to record why it is retrying without leaving
+        // `Stopping`. Without this the automaton's retry write is rejected and
+        // the operator never learns the reason: the pipeline sits in `Stopping`
+        // with a stale (or missing) error while the runner retries in a
+        // backoff loop.
+        | (StorageStatus::InUse, ResourcesStatus::Stopping, ResourcesStatus::Stopping)
     ) {
         Ok(())
     } else if matches!(
@@ -255,6 +261,85 @@ pub fn validate_resources_desired_status_transition(
                 return Err(DBError::CannotStartWithCompilationError);
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{ResourcesDesiredStatus, ResourcesStatus, validate_resources_status_transition};
+    use crate::db::types::storage::StorageStatus;
+
+    /// A stop that failed must be able to record why it is retrying and stay in
+    /// `Stopping`. Rejecting the write leaves the operator with no reason on a
+    /// pipeline that the runner is still trying to shut down.
+    #[test]
+    fn a_failed_stop_can_record_its_reason_while_staying_in_stopping() {
+        validate_resources_status_transition(
+            StorageStatus::InUse,
+            ResourcesStatus::Stopping,
+            ResourcesStatus::Stopping,
+        )
+        .expect("staying in Stopping must be allowed so the retry reason can be written");
+    }
+
+    /// The rules that keep the state machine honest must not have loosened. These
+    /// are the transitions an automaton bug would try to make, and each must stay
+    /// rejected rather than being absorbed by the new arm.
+    #[test]
+    fn transitions_that_skip_a_state_are_still_rejected() {
+        for (current, new) in [
+            // Provisioning cannot jump straight to Provisioned without the
+            // `provision()` call, and Stopped cannot jump to Provisioned either.
+            (ResourcesStatus::Stopped, ResourcesStatus::Provisioned),
+            (ResourcesStatus::Provisioning, ResourcesStatus::Stopped),
+            // A provisioned pipeline must stop before it can be deprovisioned.
+            (ResourcesStatus::Provisioned, ResourcesStatus::Stopped),
+            // Storage that was never claimed cannot host a running pipeline.
+            (ResourcesStatus::Provisioned, ResourcesStatus::Provisioning),
+        ] {
+            assert!(
+                validate_resources_status_transition(StorageStatus::InUse, current, new).is_err(),
+                "{current:?} -> {new:?} must be rejected"
+            );
+        }
+    }
+
+    /// A stopped pipeline with cleared storage can still be started again: the
+    /// new arm must not accidentally forbid it.
+    #[test]
+    fn a_cleared_pipeline_can_still_start() {
+        validate_resources_status_transition(
+            StorageStatus::Cleared,
+            ResourcesStatus::Stopped,
+            ResourcesStatus::Provisioning,
+        )
+        .expect("a pipeline with cleared storage can be started");
+    }
+
+    /// `Stopping -> Stopping` is now allowed, but stopping is still always
+    /// possible whatever the current state, which is what lets the API interrupt
+    /// a stuck pipeline.
+    #[test]
+    fn stopping_is_still_always_possible() {
+        use super::validate_resources_desired_status_transition;
+        use crate::db::types::program::ProgramStatus;
+
+        for status in [
+            ResourcesStatus::Stopped,
+            ResourcesStatus::Provisioning,
+            ResourcesStatus::Provisioned,
+            ResourcesStatus::Stopping,
+        ] {
+            validate_resources_desired_status_transition(
+                StorageStatus::InUse,
+                status,
+                ResourcesDesiredStatus::Provisioned,
+                ProgramStatus::Success,
+                None,
+                ResourcesDesiredStatus::Stopped,
+            )
+            .unwrap_or_else(|e| panic!("stopping a {status:?} pipeline must be allowed: {e:?}"));
         }
     }
 }
