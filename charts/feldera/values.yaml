@@ -26,6 +26,24 @@ controlplane:
   felderaDatabaseSecretRef: ""
   httpsSecretRef: null
   logJson: false
+  # P1-021: OIDC sign-in for the web console. The manager reads the client id
+  # and issuer from the environment and refuses to start without them, so
+  # `enabled: true` with an empty issuer fails at pod start, not at login.
+  auth:
+    enabled: false
+    provider: aws-cognito
+    clientId: ""
+    issuer: ""
+    cognitoLoginUrl: ""
+    cognitoLogoutUrl: ""
+  # Platform owners, comma-joined into FELDERA_OWNERS. Each entry matches a
+  # provider-verified email, a bare OIDC subject, or "<issuer> <subject>".
+  owners: []
+  authorization:
+    individualTenant: null
+    issuerTenant: null
+    authorizedGroups: null
+    authAudience: null
   controlPlane:
     env: []
     deploymentTimeAnnotation: true

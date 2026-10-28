@@ -133,6 +133,9 @@ auth:
   issuer: ""
   cognitoLoginUrl: ""
   cognitoLogoutUrl: ""
+# Platform owners, comma-joined into FELDERA_OWNERS. Each entry matches a
+# provider-verified email, a bare OIDC subject, or "<issuer> <subject>".
+owners: []
 authorization:
   individualTenant: null
   issuerTenant: null
