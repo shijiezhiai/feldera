@@ -1014,8 +1014,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         // `FtRequiresStorage` even though its volume was mounted and idle. The
         // user keeps the last word, so this fills the gap and never overrides a
         // backend the pipeline configuration already names.
-        if deployment_config.global.storage.is_none()
-            && runtime_config.fault_tolerance.is_enabled()
+        if deployment_config.global.storage.is_none() && runtime_config.fault_tolerance.is_enabled()
         {
             deployment_config.global.storage = self.pipeline_handle.generate_storage_options();
         }
@@ -1932,9 +1931,11 @@ mod test {
         ProgramInfo, ProgramStatus, RustCompilationInfo, SqlCompilationInfo,
     };
     use crate::db::types::resources_status::ResourcesStatus;
+    use crate::db::types::storage::StorageStatus;
     use crate::db::types::version::Version;
     use crate::error::ManagerError;
     use crate::logging;
+    use crate::runner::error::RunnerError;
     use crate::runner::main::MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS;
     use crate::runner::pipeline_automata::PipelineAutomaton;
     use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
@@ -1954,8 +1955,124 @@ mod test {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate, http};
 
+    /// What the mock executor should do on its next call, so a test can put the
+    /// automaton into a state a real cluster produces but that a happy-path mock
+    /// never reaches: a pod that vanished, a watch that dropped, a stop that
+    /// failed, provisioning that never finishes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        /// `check()` reports the pod is gone (an evicted pod, a deleted
+        /// StatefulSet, a namespace that is being torn down).
+        CheckPodGone,
+        /// `check()` cannot reach the cluster at all (API server unreachable,
+        /// watch dropped, expired credentials).
+        CheckUnreachable,
+        /// `provision()` fails, e.g. a 409 when the object already exists.
+        ProvisionConflict,
+        /// `is_provisioned()` stays in progress forever, so the automaton must
+        /// time out rather than wait.
+        NeverProvisioned,
+        /// `stop()` fails and must be retried on the next cycle.
+        StopUnreachable,
+        /// `clear()` fails and must be retried on the next cycle.
+        ClearUnreachable,
+    }
+
+    /// A fault schedule shared with the automaton.
+    ///
+    /// Each queue belongs to one call site. A single shared queue would be wrong:
+    /// the automaton calls several executor methods per cycle, so a fault meant
+    /// for `check()` would be consumed by whichever method happened to run first.
+    /// Every queue is checked against `delivered` so a test can assert its fault
+    /// was really delivered instead of silently skipped.
+    #[derive(Clone, Default)]
+    struct FaultSchedule {
+        provision: Arc<std::sync::Mutex<std::collections::VecDeque<Fault>>>,
+        check: Arc<std::sync::Mutex<std::collections::VecDeque<Fault>>>,
+        stop: Arc<std::sync::Mutex<std::collections::VecDeque<Fault>>>,
+        clear: Arc<std::sync::Mutex<std::collections::VecDeque<Fault>>>,
+        /// Faults that must keep happening every cycle rather than once. A
+        /// provisioning attempt that never finishes has to answer the same way
+        /// on every poll, otherwise the next poll reports success and no timeout
+        /// is ever reached.
+        sticky: Arc<std::sync::Mutex<Vec<Fault>>>,
+        delivered: Arc<std::sync::Mutex<Vec<Fault>>>,
+    }
+
+    impl FaultSchedule {
+        fn with(faults: Vec<Fault>) -> Self {
+            let schedule = Self::default();
+            for fault in faults {
+                match fault {
+                    Fault::ProvisionConflict => schedule.provision.lock().unwrap().push_back(fault),
+                    Fault::NeverProvisioned => schedule.sticky.lock().unwrap().push(fault),
+                    Fault::CheckPodGone | Fault::CheckUnreachable => {
+                        schedule.check.lock().unwrap().push_back(fault)
+                    }
+                    Fault::StopUnreachable => schedule.stop.lock().unwrap().push_back(fault),
+                    Fault::ClearUnreachable => schedule.clear.lock().unwrap().push_back(fault),
+                }
+            }
+            schedule
+        }
+
+        fn take(
+            queue: &Arc<std::sync::Mutex<std::collections::VecDeque<Fault>>>,
+            delivered: &Arc<std::sync::Mutex<Vec<Fault>>>,
+        ) -> Option<Fault> {
+            let fault = queue.lock().unwrap().pop_front();
+            if let Some(fault) = fault {
+                delivered.lock().unwrap().push(fault);
+            }
+            fault
+        }
+
+        fn take_provision(&self) -> Option<Fault> {
+            Self::take(&self.provision, &self.delivered)
+        }
+        fn take_check(&self) -> Option<Fault> {
+            Self::take(&self.check, &self.delivered)
+        }
+        fn take_stop(&self) -> Option<Fault> {
+            Self::take(&self.stop, &self.delivered)
+        }
+        fn take_clear(&self) -> Option<Fault> {
+            Self::take(&self.clear, &self.delivered)
+        }
+
+        /// Injects a fault after the automaton has already reached the state the
+        /// test wants to perturb. Faults given to `with()` are queued from the
+        /// first cycle, which is too early for a test that has to drive the
+        /// automaton to `Running` first.
+        fn inject(&self, fault: Fault) {
+            match fault {
+                Fault::ProvisionConflict => self.provision.lock().unwrap().push_back(fault),
+                Fault::NeverProvisioned => self.sticky.lock().unwrap().push(fault),
+                Fault::CheckPodGone | Fault::CheckUnreachable => {
+                    self.check.lock().unwrap().push_back(fault)
+                }
+                Fault::StopUnreachable => self.stop.lock().unwrap().push_back(fault),
+                Fault::ClearUnreachable => self.clear.lock().unwrap().push_back(fault),
+            }
+        }
+
+        /// Whether a sticky fault is in effect.
+        fn is_sticky(&self, fault: Fault) -> bool {
+            self.sticky.lock().unwrap().contains(&fault)
+        }
+
+        fn record_delivery(&self, fault: Fault) {
+            self.delivered.lock().unwrap().push(fault);
+        }
+
+        fn delivered(&self) -> Vec<Fault> {
+            self.delivered.lock().unwrap().clone()
+        }
+    }
+
     struct MockRunner {
         deployment_location: String,
+        faults: FaultSchedule,
     }
 
     #[async_trait]
@@ -2002,6 +2119,12 @@ mod test {
             _: &serde_json::Value,
             _is_gen2: bool,
         ) -> Result<(), ManagerError> {
+            if self.faults.take_provision() == Some(Fault::ProvisionConflict) {
+                return Err(RunnerError::RunnerProvisionError {
+                    error: "the object already exists (409)".to_string(),
+                }
+                .into());
+            }
             Ok(())
         }
 
@@ -2009,6 +2132,12 @@ mod test {
             &mut self,
             _runtime_config: &serde_json::Value,
         ) -> Result<ProvisionStatus, ManagerError> {
+            if self.faults.is_sticky(Fault::NeverProvisioned) {
+                self.faults.record_delivery(Fault::NeverProvisioned);
+                return Ok(ProvisionStatus::Ongoing {
+                    details: json!("still scheduling"),
+                });
+            }
             Ok(ProvisionStatus::Provisioned {
                 location: self.deployment_location.clone(),
                 details: json!(""),
@@ -2019,14 +2148,36 @@ mod test {
             &mut self,
             _runtime_config: &serde_json::Value,
         ) -> Result<serde_json::Value, ManagerError> {
-            Ok(json!(""))
+            match self.faults.take_check() {
+                Some(Fault::CheckPodGone) => Err(RunnerError::RunnerCheckError {
+                    error: "the pipeline pod does not exist in namespace \'feldera\'".to_string(),
+                }
+                .into()),
+                Some(Fault::CheckUnreachable) => Err(RunnerError::RunnerCheckError {
+                    error: "the cluster could not be reached: connection refused".to_string(),
+                }
+                .into()),
+                _ => Ok(json!("")),
+            }
         }
 
         async fn stop(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
+            if self.faults.take_stop() == Some(Fault::StopUnreachable) {
+                return Err(RunnerError::RunnerStopError {
+                    error: "the cluster could not be reached: connection refused".to_string(),
+                }
+                .into());
+            }
             Ok(())
         }
 
         async fn clear(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
+            if self.faults.take_clear() == Some(Fault::ClearUnreachable) {
+                return Err(RunnerError::RunnerClearError {
+                    error: "the cluster could not be reached: connection refused".to_string(),
+                }
+                .into());
+            }
             Ok(())
         }
     }
@@ -2038,7 +2189,14 @@ mod test {
     }
 
     impl AutomatonTest {
-        async fn desire_start(&self, initial: RuntimeDesiredStatus) {
+        /// Sets the desired status to provisioned. Returns the rejection reason
+        /// instead of panicking: the API refuses to start a pipeline that is
+        /// still stopping, and a property test must model that the user gets an
+        /// error rather than assume every desired-status change takes effect.
+        async fn try_desire_start(
+            &self,
+            initial: RuntimeDesiredStatus,
+        ) -> Result<(), crate::db::error::DBError> {
             let automaton = &self.automaton;
             let pipeline = self
                 .db
@@ -2058,7 +2216,11 @@ mod test {
                     true,
                 )
                 .await
-                .unwrap();
+                .map(|_| ())
+        }
+
+        async fn desire_start(&self, initial: RuntimeDesiredStatus) {
+            self.try_desire_start(initial).await.unwrap();
         }
 
         async fn desire_stopped(&self) {
@@ -2130,11 +2292,12 @@ mod test {
         }
     }
 
-    async fn setup(
+    async fn setup_with_faults(
         db: Arc<Mutex<StoragePostgres>>,
         deployment_location: String,
         runtime_config: serde_json::Value,
         program_config: serde_json::Value,
+        faults: FaultSchedule,
     ) -> AutomatonTest {
         // Create a pipeline and a corresponding automaton
         let tenant_id = TenantRecord::default().id;
@@ -2263,6 +2426,7 @@ mod test {
             client,
             MockRunner {
                 deployment_location,
+                faults: faults.clone(),
             },
             Duration::from_secs(1),
             follow_request_receiver,
@@ -2276,6 +2440,7 @@ mod test {
         }
     }
 
+    #[derive(Clone)]
     struct MockEndpoint {
         http_method: String,
         path: String,
@@ -2333,6 +2498,15 @@ mod test {
         runtime_config: serde_json::Value,
         program_config: serde_json::Value,
     ) -> SetupResult {
+        setup_complete_with_faults(runtime_config, program_config, FaultSchedule::default()).await
+    }
+
+    /// A complete automaton whose executor injects the given faults, in order.
+    async fn setup_complete_with_faults(
+        runtime_config: serde_json::Value,
+        program_config: serde_json::Value,
+        faults: FaultSchedule,
+    ) -> SetupResult {
         logging::init_logging("foo".into());
         let (db, temp_dir) = crate::db::test::setup_pg().await;
         let db = Arc::new(Mutex::new(db));
@@ -2342,7 +2516,7 @@ mod test {
         (
             mock_server,
             temp_dir,
-            setup(db.clone(), addr, runtime_config, program_config).await,
+            setup_with_faults(db.clone(), addr, runtime_config, program_config, faults).await,
         )
     }
 
@@ -2561,5 +2735,401 @@ mod test {
         // Remains Stopped as program is still Pending
         assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
 
+    }
+
+    /// Drives the automaton from `Stopped` to `Provisioned` with a runtime status
+    /// of `Running`, which is the state every fault test below starts from.
+    async fn drive_to_running(
+        server: &mut MockServer,
+        test: &mut AutomatonTest,
+    ) -> Vec<MockEndpoint> {
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(
+            server,
+            vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))],
+        )
+        .await;
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick().await; // artifact check -> Provisioning
+        test.tick().await; // provision()
+        test.tick().await; // is_provisioned() -> Provisioned
+
+        let endpoints = vec![MockEndpoint::new("GET", "/status", 200, json!("Running"))];
+        mock_endpoints(server, endpoints.clone()).await;
+        test.tick().await; // observe -> Running
+        assert_eq!(test.resources_status().await, ResourcesStatus::Provisioned);
+        assert_eq!(test.runtime_status().await, Some(RuntimeStatus::Running));
+        endpoints
+    }
+
+    /// A pod that vanished is reported as a fatal check error: the pipeline goes
+    /// to `Stopping` carrying the error, and the next cycle completes the stop.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn a_vanished_pod_stops_the_pipeline_and_records_the_error() {
+        let faults = FaultSchedule::default();
+        let (mut server, _temp, mut test) = setup_complete_with_faults(
+            json!({}), json!({ "profile": "unoptimized", "cache": false }), faults.clone(),
+        ).await;
+        drive_to_running(&mut server, &mut test).await;
+        faults.inject(Fault::CheckPodGone);
+
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopping);
+        assert_eq!(test.runtime_status().await, None);
+        let error = test.deployment_error().await.expect("the error is recorded");
+        assert!(
+            error.message.contains("does not exist"),
+            "the operator must see why it stopped, got: {}",
+            error.message
+        );
+        assert_eq!(error.error_code, "RunnerCheckError");
+
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+        assert_eq!(faults.delivered(), vec![Fault::CheckPodGone]);
+    }
+
+    /// An unreachable cluster is a check error too. This pins the current answer
+    /// (stop the pipeline, record the reason) and doubles as the record of the
+    /// open question in the ADR: a transient API-server outage is treated the
+    /// same as a pod that is really gone.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn an_unreachable_cluster_is_a_check_error() {
+        let faults = FaultSchedule::default();
+        let (mut server, _temp, mut test) = setup_complete_with_faults(
+            json!({}), json!({ "profile": "unoptimized", "cache": false }), faults.clone(),
+        ).await;
+        drive_to_running(&mut server, &mut test).await;
+        faults.inject(Fault::CheckUnreachable);
+
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopping);
+        let error = test.deployment_error().await.expect("the error is recorded");
+        assert_eq!(error.error_code, "RunnerCheckError");
+        assert!(error.message.contains("could not be reached"), "got: {}", error.message);
+
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+        assert_eq!(faults.delivered(), vec![Fault::CheckUnreachable]);
+    }
+
+    /// A 409 while provisioning (the object is already there) stops the pipeline
+    /// with the reason instead of retrying forever.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn a_provision_conflict_stops_the_pipeline() {
+        let faults = FaultSchedule::with(vec![Fault::ProvisionConflict]);
+        let (mut server, _temp, mut test) = setup_complete_with_faults(
+            json!({}), json!({ "profile": "unoptimized", "cache": false }), faults.clone(),
+        ).await;
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(&mut server, vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))]).await;
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick().await; // -> Provisioning
+        test.tick().await; // provision() fails
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopping);
+        let error = test.deployment_error().await.expect("the error is recorded");
+        assert_eq!(error.error_code, "RunnerProvisionError");
+        assert!(error.message.contains("409"), "got: {}", error.message);
+
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+        assert_eq!(faults.delivered(), vec![Fault::ProvisionConflict]);
+    }
+
+    /// Provisioning that never finishes must be cut off by the timeout rather
+    /// than waiting forever, and the pipeline must end up Stopped with a timeout
+    /// error the operator can act on.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn provisioning_that_never_finishes_times_out() {
+        let faults = FaultSchedule::with(vec![Fault::NeverProvisioned]);
+        let (mut server, _temp, mut test) = setup_complete_with_faults(
+            json!({}), json!({ "profile": "unoptimized", "cache": false }), faults.clone(),
+        ).await;
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(&mut server, vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))]).await;
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick().await; // -> Provisioning
+        test.tick().await; // provision() succeeds
+        assert_eq!(test.resources_status().await, ResourcesStatus::Provisioning);
+
+        // The timeout is rounded to whole seconds and compared strictly
+        // (`elapsed > timeout`), so the poll must land past the 1s mark that the
+        // mock's `DEFAULT_PROVISIONING_TIMEOUT` collapses to.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopping);
+        let error = test.deployment_error().await.expect("the error is recorded");
+        assert_eq!(error.error_code, "AutomatonProvisioningTimeout");
+
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+        assert!(!faults.delivered().is_empty());
+    }
+
+    /// A stop that fails is retried on the next cycle and does not strand the
+    /// pipeline in `Stopping` forever.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn a_failed_stop_is_retried() {
+        let faults = FaultSchedule::with(vec![Fault::StopUnreachable]);
+        let (mut server, _temp, mut test) = setup_complete_with_faults(
+            json!({}), json!({ "profile": "unoptimized", "cache": false }), faults.clone(),
+        ).await;
+        drive_to_running(&mut server, &mut test).await;
+
+        test.desire_stopped().await;
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopping);
+        assert_eq!(test.runtime_status().await, None);
+
+        // First stop attempt fails: it stays Stopping, which is the retry.
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopping);
+
+        // Second attempt succeeds.
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+        assert_eq!(faults.delivered(), vec![Fault::StopUnreachable]);
+    }
+
+    /// A clear that fails is retried until it succeeds, and storage only becomes
+    /// `Cleared` after the clear actually succeeded.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn a_failed_clear_is_retried() {
+        let faults = FaultSchedule::with(vec![Fault::ClearUnreachable]);
+        let (mut server, _temp, mut test) = setup_complete_with_faults(
+            json!({}), json!({ "profile": "unoptimized", "cache": false }), faults.clone(),
+        ).await;
+        drive_to_running(&mut server, &mut test).await;
+
+        // Stop first, so storage is no longer in use.
+        test.desire_stopped().await;
+        test.tick().await; // -> Stopping
+        test.tick().await; // -> Stopped
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+
+        // Ask for the storage to be cleared.
+        let pipeline = test.db.lock().await
+            .get_pipeline_by_id(test.automaton.tenant_id, test.automaton.pipeline_id)
+            .await.unwrap();
+        test.db.lock().await
+            .transit_storage_status_to_clearing_if_not_cleared(
+                test.automaton.tenant_id, &pipeline.name,
+            )
+            .await.unwrap();
+
+        test.tick().await; // clear() fails -> stays Clearing
+        assert_eq!(storage_status(&test).await, StorageStatus::Clearing);
+
+        test.tick().await; // clear() succeeds
+        assert_eq!(storage_status(&test).await, StorageStatus::Cleared);
+        assert_eq!(faults.delivered(), vec![Fault::ClearUnreachable]);
+    }
+
+    async fn storage_status(test: &AutomatonTest) -> StorageStatus {
+        test.db
+            .lock()
+            .await
+            .get_pipeline_by_id(test.automaton.tenant_id, test.automaton.pipeline_id)
+            .await
+            .unwrap()
+            .storage_status
+    }
+
+    /// An event a user or the cluster can produce between two cycles.
+    #[derive(Debug, Clone, Copy)]
+    enum Event {
+        Start,
+        Stop,
+        /// A pod vanished, a watch dropped, a 409, a stuck scheduler: the fault
+        /// the automaton must absorb on its next cycle.
+        Fault(Fault),
+        /// Nothing happens; the automaton gets a cycle to make progress.
+        Tick,
+    }
+
+    /// The random event sequences are short on purpose: a 20-event sequence
+    /// already reaches every state the automaton has, and each cycle costs a
+    /// database round trip.
+    fn event_sequence() -> impl proptest::strategy::Strategy<Value = Vec<Event>> {
+        proptest::collection::vec(
+            proptest::sample::select(vec![
+                Event::Start,
+                Event::Stop,
+                Event::Tick,
+                Event::Tick,
+                Event::Fault(Fault::CheckPodGone),
+                Event::Fault(Fault::CheckUnreachable),
+                Event::Fault(Fault::ProvisionConflict),
+                Event::Fault(Fault::NeverProvisioned),
+                Event::Fault(Fault::StopUnreachable),
+            ]),
+            1..20,
+        )
+    }
+
+    /// The automaton must survive any sequence of user actions and infrastructure
+    /// faults, and must always settle back to a state an operator can act on.
+    ///
+    /// Three properties are checked after every event, not just at the end,
+    /// because a violation in the middle is what strands a pipeline:
+    ///
+    /// 1. **It reaches `Stopped`.** A pipeline that is not desired is always
+    ///    eventually deprovisioned: a fault delays that but never prevents it.
+    ///    This is the property that catches a retry loop that never retries.
+    /// 2. **`Stopped` with no error, or with an error, never both.** The
+    ///    deployment error is the operator's only explanation; a stale one after
+    ///    a successful stop is worse than none.
+    /// 3. **Runtime status is only present between `Provisioned` and `Stopping`.**
+    ///    A runtime status on a `Stopped` pipeline means the control plane claims
+    ///    a process that is not there.
+    #[test]
+    fn any_event_sequence_settles_on_a_state_an_operator_can_act_on() {
+        use proptest::prelude::*;
+
+        let mut config = proptest::test_runner::Config::default();
+        config.cases = 48;
+        config.source_file = Some("src/runner/pipeline_automata.rs");
+        let mut runner = proptest::test_runner::TestRunner::new(config);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runner
+            .run(&event_sequence(), |events| {
+                runtime.block_on(async {
+                    let faults = FaultSchedule::default();
+                    let (mut server, _temp, mut test) = setup_complete_with_faults(
+                        json!({}),
+                        json!({ "profile": "unoptimized", "cache": false }),
+                        faults.clone(),
+                    )
+                    .await;
+                    // Both mocks must be mounted in one call: `mock_endpoints`
+                    // resets the server first, so a second call would unmount the
+                    // artifact endpoint and no sequence would ever provision.
+                    let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+                    mock_endpoints(
+                        &mut server,
+                        vec![
+                            MockEndpoint::new("GET", &artifacts_path, 200, json!({})),
+                            MockEndpoint::new("GET", "/status", 200, json!("Running")),
+                        ],
+                    )
+                    .await;
+
+                    for event in events {
+                        match event {
+                            // A start while the pipeline is still stopping is
+                            // rejected by the API; the user sees the error and
+                            // nothing changes. Model it as a no-op.
+                            Event::Start => {
+                                let _ = test.try_desire_start(RuntimeDesiredStatus::Paused).await;
+                            }
+                            Event::Stop => test.desire_stopped().await,
+                            Event::Fault(fault) => faults.inject(fault),
+                            Event::Tick => {}
+                        }
+                        let delivered_before = faults.delivered().len();
+                        test.tick().await;
+                        let delivered_now = faults.delivered();
+                        let new_faults = &delivered_now[delivered_before..];
+
+                        let status = test.resources_status().await;
+                        let runtime_status = test.runtime_status().await;
+                        let error = test.deployment_error().await;
+
+                        // (3) runtime status lives only with resources that run.
+                        match (status, runtime_status) {
+                            (
+                                ResourcesStatus::Stopped
+                                | ResourcesStatus::Provisioning
+                                | ResourcesStatus::Stopping,
+                                Some(runtime_status),
+                            ) => {
+                                prop_assert!(
+                                    false,
+                                    "runtime status {:?} on a {:?} pipeline",
+                                    runtime_status,
+                                    status
+                                );
+                            }
+                            _ => {}
+                        }
+
+                        // (2) a stopped pipeline may carry a reason, never a stale
+                        // one alongside a successful stop: the two are mutually
+                        // exclusive by construction, so a both-or-neither
+                        // violation would show up as an error on a running
+                        // pipeline instead.
+                        if status == ResourcesStatus::Provisioned {
+                            prop_assert!(
+                                error.is_none(),
+                                "a provisioned pipeline carries an error: {:?}",
+                                error
+                            );
+                        }
+
+                        // (2b) A fault that the executor actually delivered means
+                        // the automaton consulted it and got an error back, so it
+                        // must not still believe the pipeline is running: a
+                        // pipeline reported Provisioned after being told its pod
+                        // is gone is one the control plane believes in and the
+                        // cluster does not have. Checked per cycle because a later
+                        // restart legitimately clears the state.
+                        let consulted_and_failed = new_faults.iter().any(|f| {
+                            matches!(
+                                f,
+                                Fault::CheckPodGone
+                                    | Fault::CheckUnreachable
+                                    | Fault::ProvisionConflict
+                            )
+                        });
+                        if consulted_and_failed {
+                            prop_assert!(
+                                status != ResourcesStatus::Provisioned,
+                                "the executor reported {:?} yet the pipeline stayed Provisioned",
+                                new_faults
+                            );
+                        }
+
+                        // (2c) Having consulted a fatal fault and landed in
+                        // `Stopping`, the operator must be told why. `Stopping`
+                        // with no error is a pipeline being deprovisioned for a
+                        // reason nobody can read, and it is exactly what a
+                        // rejected retry write used to produce.
+                        if consulted_and_failed && status == ResourcesStatus::Stopping {
+                            prop_assert!(
+                                error.is_some(),
+                                "the pipeline is Stopping after {:?} with no recorded error",
+                                new_faults
+                            );
+                        }
+                    }
+
+                    // (1) drain until settle, bounding the cycles so a livelock
+                    // fails instead of hanging the test.
+                    test.desire_stopped().await;
+                    for _ in 0..40 {
+                        if test.resources_status().await == ResourcesStatus::Stopped {
+                            break;
+                        }
+                        test.tick().await;
+                    }
+                    prop_assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+
+                    Ok(())
+                })
+            })
+            .unwrap();
     }
 }

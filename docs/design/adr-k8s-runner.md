@@ -144,6 +144,18 @@ P1-007 不预置未使用的配置项。
 5. **监控/事件上报格式**：`details` 取 `kubectl get events` 摘要（Reason/Message 截断 200 字符），避免 DB 膨胀。**开放**。
 6. **孤儿对象保护**：apply 幂等 + `{id}` 定名，重启可恢复；namespace 删除需先删对象（孤儿风险由 P1-014 的
    租户 ns 生命周期覆盖）。
+7. **失败的重试必须能写回 `Stopping`**（P1-020 发现，**已修复**）：`stop()` / `clear()` 失败时 automaton 走
+   `RemainStoppingUpdateDetails { error }`，即"留在 `Stopping`、记下原因、继续按退避重试"。但
+   `validate_resources_status_transition`（`crates/pipeline-manager/src/db/types/resources_status.rs:177`）
+   的白名单里没有 `(InUse, Stopping, Stopping)`，自环被拒。后果链：第一次失败因 10 秒
+   `DETAILS_UPDATE_MIN_INTERVAL` 窗口未写库、看起来正常；窗口一开那次重试写就被拒，`do_run` 返回 `Err`，
+   `run()` 按 5s→10s→30s→…→1200s 退避空转，于是 pipeline 永久停在 `Stopping` 且
+   `deployment_error` 是陈旧的（或缺的）——运营者看不到停不下来的原因。
+   决策：**允许该自环**（一行白名单 + 注释），而不是改成"先回 `Stopped` 再重试"——后者会让存储的
+   `InUse` 语义与实际脱节，且观察到 `Stopped` 的用户会以为已经清理完成。验证方式是双向 mutation：
+   撤掉该行，P1-020 的属性测试立即以最小序列 `[Fault(StopUnreachable), Start]` 失败。
+   影响面：本地 runner（`LocalRunner`）走同一条 `validate_resources_status_transition` 路径，
+   只是本地 `stop()` 极少失败所以从未暴露。
 
 ## 7. DoD 自检（评审证据）
 
