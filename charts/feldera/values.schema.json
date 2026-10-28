@@ -73,6 +73,124 @@
             "none"
           ],
           "description": "How API server replicas are kept apart above one replica."
+        },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "generic-oidc",
+                "aws-cognito",
+                "none"
+              ],
+              "description": "OIDC provider type the manager accepts tokens from."
+            },
+            "clientId": {
+              "type": "string",
+              "description": "OIDC application client id. The web console sends it in the authorization request and the manager checks it against the token."
+            },
+            "issuer": {
+              "type": "string",
+              "description": "OIDC issuer URL. Fetched through discovery before any token is accepted."
+            },
+            "cognitoLoginUrl": {
+              "type": "string"
+            },
+            "cognitoLogoutUrl": {
+              "type": "string"
+            }
+          },
+          "allOf": [
+            {
+              "comment": "Enabling authentication without a provider the manager can build turns a working deployment into a CrashLoopBackOff, so refuse it at render time.",
+              "if": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "provider": {
+                    "enum": [
+                      "generic-oidc",
+                      "aws-cognito"
+                    ]
+                  },
+                  "clientId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "issuer": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "clientId",
+                  "issuer"
+                ]
+              }
+            }
+          ]
+        },
+        "authorization": {
+          "type": "object",
+          "properties": {
+            "individualTenant": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "issuerTenant": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "authorizedGroups": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "authAudience": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            }
+          }
+        },
+        "httpsSecretRef": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "Name of a TLS secret (tls.crt / tls.key). Required for an HTTPS scheme that the console's OIDC redirect URIs can be registered against."
+        },
+        "owners": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Platform owners, never grantable at runtime. An entry matches a provider-verified email, a bare OIDC subject, or '<issuer> <subject>'."
         }
       }
     }

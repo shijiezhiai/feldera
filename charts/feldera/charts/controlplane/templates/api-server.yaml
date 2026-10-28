@@ -105,6 +105,53 @@ spec:
             - name: FELDERA_HTTPS_TLS_KEY_PATH
               value: /tls/tls.key
             {{- end }}
+            {{- if .Values.auth.enabled }}
+            {{- /* P1-021. The manager reads the client id and the issuer from
+                   the environment, not from a flag (crates/pipeline-manager/
+                   src/auth.rs, `generic_oidc_auth_config`), and panics on a
+                   provider that lacks them. The issuer is fetched before any
+                   token is accepted, so a typo here stops the manager at
+                   startup rather than at the first login. */}}
+            - name: AUTH_PROVIDER
+              value: {{ .Values.auth.provider | quote }}
+            - name: FELDERA_AUTH_CLIENT_ID
+              value: {{ .Values.auth.clientId | quote }}
+            - name: FELDERA_AUTH_ISSUER
+              value: {{ .Values.auth.issuer | quote }}
+            {{- if eq .Values.auth.provider "aws-cognito" }}
+            # Cognito answers the browser's login and logout at its hosted UI,
+            # which the manager passes through to the console verbatim.
+            - name: AWS_COGNITO_LOGIN_URL
+              value: {{ .Values.auth.cognitoLoginUrl | quote }}
+            - name: AWS_COGNITO_LOGOUT_URL
+              value: {{ .Values.auth.cognitoLogoutUrl | quote }}
+            {{- end }}
+            {{- with .Values.authorization.individualTenant }}
+            - name: FELDERA_AUTH_INDIVIDUAL_TENANT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.authorization.issuerTenant }}
+            - name: FELDERA_AUTH_ISSUER_TENANT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.authorization.authorizedGroups }}
+            # Not a gate on the token but a scope request: the manager asks the
+            # IdP for `groups` only when it is configured to check them.
+            - name: FELDERA_AUTH_AUTHORIZED_GROUPS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.authorization.authAudience }}
+            - name: FELDERA_AUTH_AUDIENCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.owners }}
+            # Deploy-time owners, never grantable at runtime. Entries match a
+            # provider-verified email, a bare subject, or "<issuer> <subject>";
+            # an unverified email is deliberately not a match.
+            - name: FELDERA_OWNERS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- end }}
           # The image ENTRYPOINT already carries --bind-address, --sql-compiler-path,
           # --compilation-cargo-lock-path, --dbsp-override-path and --demos-dir
           # (deploy/Dockerfile.manager); only the DB connection differs per deploy.
@@ -162,13 +209,24 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-          {{- if .Values.compilationCache.enabled }}
+          {{- if or .Values.compilationCache.enabled .Values.httpsSecretRef }}
           volumeMounts:
+            {{- if .Values.compilationCache.enabled }}
             # Cargo target directory of the programs compiled inside this pod.
             # A cold compile takes hours, so the claim keeps it across pod
             # recreations.
             - name: compilation-cache
               mountPath: /home/ubuntu/.feldera
+            {{- end }}
+            {{- if .Values.httpsSecretRef }}
+            # P1-021. The TLS variables above point at /tls/tls.crt and
+            # /tls/tls.key; without this mount the manager starts, tries to
+            # read the certificate, and exits (`CertificateDer::pem_file_iter
+            # ... should be read` panics in `https_server_config`).
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources.apiServer | nindent 12 }}
@@ -184,6 +242,7 @@ spec:
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 15
+      {{- if or .Values.compilationCache.enabled .Values.httpsSecretRef }}
       {{- if .Values.compilationCache.enabled }}
       # The compilation cache claim is handed to the pod as root:root, but the
       # image runs as `ubuntu` (uid 1000). fsGroup makes the kubelet give the
@@ -191,10 +250,18 @@ spec:
       # directory inside the claim.
       securityContext:
         fsGroup: 1000
+      {{- end }}
       volumes:
+        {{- if .Values.compilationCache.enabled }}
         - name: compilation-cache
           persistentVolumeClaim:
             claimName: {{ .Release.Name }}-compilation-cache
+        {{- end }}
+        {{- if .Values.httpsSecretRef }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.httpsSecretRef | quote }}
+        {{- end }}
       {{- end }}
       {{- with .Values.controlPlane.env }}
       # NOTE: controlPlane.env (pod-level env) is intentionally not injected
