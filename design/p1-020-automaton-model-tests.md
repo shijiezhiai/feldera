@@ -155,13 +155,13 @@ enum Event { Start, Stop, Fault(Fault), Tick }
 ## 7. 验收
 
 ```
-# runner 全量（并行跑会因内嵌 PG 端口竞争 flaky，必须串行）
+# runner 全量（可直接并行，见 §8 的说明；不再需要 --test-threads=1）
 CARGO_NET_OFFLINE=true cargo +1.96.1 test -p pipeline-manager \
-  --features feldera-enterprise --lib runner:: -- --test-threads=1
+  --features feldera-enterprise --lib runner::
 # → 134 passed
 
 CARGO_NET_OFFLINE=true cargo +1.96.1 test -p pipeline-manager \
-  --features feldera-enterprise --lib db::types:: -- --test-threads=1
+  --features feldera-enterprise --lib db::types::
 # → 38 passed（含本单 4 个新测试）
 ```
 
@@ -186,11 +186,10 @@ CARGO_NET_OFFLINE=true cargo +1.96.1 test -p pipeline-manager \
 
 **其他已知项：**
 
-- `runner::` 测试**并行跑必然 flaky**（`Unable to install test database: gave up
-  after several attempts`，`db/test.rs:199`）。每个测试起一个内嵌 Postgres 并抢
-  端口。这是既有问题，与本单无关（已在干净基线上复现），但会持续干扰 CI。
-- `db::test::db_impl_behaves_like_model` 在本机 **栈溢出**（SIGABRT）。同样是既有
-  问题，隐含 clean baseline 上复现过。
-- 属性测试的 `cases = 48` 是刻意偏低的值：每个 case 要起一个内嵌 Postgres，
-  48 个 case 已经要 40–60 秒。加到几百会让 `runner::` 全量跑不下去。CI 上若要
-  加强，应当先把内嵌 PG 换成共享实例。
+- ~~`runner::` 测试并行跑必然 flaky~~ —— **已修**（P1-021 前置单，见
+  `design/shared-test-postgres.md`）。内嵌 Postgres 改为整进程共享一个集群、
+  每测试一个库，`cargo test` 默认并行即可，`--test-threads=1` 不再需要。
+- `db::test::db_impl_behaves_like_model` 在本机 **栈溢出**（SIGABRT）。既有问题，
+  与共享集群无关，仍单独跳过。
+- 属性测试的 `cases = 48` 仍保留：换共享库后单个 case 更快了，但这个值本单
+  没有重新标定，留给后续按需上调。

@@ -2482,7 +2482,11 @@ mod test {
     }
 
     #[cfg(feature = "postgresql_embedded")]
-    type SetupResult = (MockServer, tempfile::TempDir, AutomatonTest);
+    type SetupResult = (
+        MockServer,
+        crate::db::test::TestDatabaseLease,
+        AutomatonTest,
+    );
     #[cfg(not(feature = "postgresql_embedded"))]
     type SetupResult = (MockServer, tokio_postgres::Config, AutomatonTest);
 

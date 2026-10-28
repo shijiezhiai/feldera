@@ -70,16 +70,255 @@ use std::time::{Duration, Instant};
 use std::vec;
 use tokio::spawn;
 use tokio::sync::{Mutex, oneshot};
-use tokio::time::sleep;
-use tracing::info;
 use uuid::Uuid;
 
 struct DbHandle {
     db: StoragePostgres,
     #[cfg(feature = "postgresql_embedded")]
-    _temp_dir: tempfile::TempDir,
+    _temp_dir: TestDatabaseLease,
     #[cfg(not(feature = "postgresql_embedded"))]
     config: tokio_postgres::Config,
+}
+
+/// One embedded Postgres server shared by every test in the process.
+///
+/// Starting a cluster per test does not work here. Each cluster allocates a
+/// System V shared memory segment, and macOS caps the host at 32 of them
+/// (`kern.sysv.shmmni`) -- a limit no test can raise. Running hundreds of tests
+/// in parallel exhausted it, after which every remaining `pg_ctl` failed with
+/// "could not start server", which reads as a broken test rather than an
+/// exhausted host resource. Capping how many clusters may run at once does not
+/// help either: the cap has to be released when a cluster *starts* shutting
+/// down, and there is no hook for that, so the suite still accumulated
+/// postmasters (measured: 17 alive with a cap of 10).
+///
+/// The fix is the same shape the non-embedded path already uses: one server for
+/// the whole process, one database per test. That costs two shared memory
+/// segments in total, keeps tests isolated from each other, and makes the leak
+/// impossible by construction. The server is stopped by an `atexit` handler
+/// rather than by a `Drop` impl, because the test binary exits on its own
+/// schedule and an orphaned postmaster is exactly what used to accumulate.
+#[cfg(feature = "postgresql_embedded")]
+mod shared_cluster {
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use tokio::sync::OnceCell;
+
+    /// Info the `atexit` handler needs; it cannot touch the async statics.
+    static EXIT_INFO: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
+
+    pub(super) struct SharedCluster {
+        /// Base URL of the `postgres` maintenance database.
+        admin_url: String,
+        /// Kept alive for the process lifetime. Dropping this stops the server,
+        /// so it must not be a local in `get()`.
+        _pg: postgresql_embedded::PostgreSQL,
+        /// Kept alive for the process lifetime: deleting it would pull the data
+        /// directory out from under the running server.
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl SharedCluster {
+        pub(super) fn admin_url(&self) -> &str {
+            &self.admin_url
+        }
+
+        /// URL of `database`, derived from the admin URL.
+        pub(super) fn url_for(&self, database: &str) -> String {
+            url_with_database(&self.admin_url, database)
+        }
+    }
+
+    /// Replaces the database name in a Postgres URL, keeping everything else.
+    ///
+    /// Split out from `SharedCluster` so it can be tested without a server: a
+    /// wrong result here would point every test at the same database and the
+    /// symptom would look like flaky cross-test interference rather than a URL
+    /// bug.
+    pub(super) fn url_with_database(admin_url: &str, database: &str) -> String {
+        // Keep any query string: it carries connection settings, and silently
+        // dropping it would change how every test connects.
+        let (base, query) = match admin_url.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (admin_url, None),
+        };
+
+        // Only look for the database separator after "scheme://"; otherwise the
+        // slash in "postgres://" is mistaken for it.
+        let authority_start = base.find("://").map(|i| i + 3).unwrap_or(0);
+        let after_scheme = &base[authority_start..];
+        let path_is_empty = !after_scheme.contains('/');
+        // A segment containing ':' is a host:port, not a database name.
+        let segment_is_authority = after_scheme
+            .rsplit_once('/')
+            .map(|(_, last)| last.contains(':'))
+            .unwrap_or(true);
+
+        let mut url = if path_is_empty || segment_is_authority {
+            format!("{base}/{database}")
+        } else {
+            match base.rsplit_once('/') {
+                Some((prefix, _)) => format!("{prefix}/{database}"),
+                None => format!("{base}/{database}"),
+            }
+        };
+        if let Some(query) = query {
+            url.push('?');
+            url.push_str(query);
+        }
+        url
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::url_with_database;
+
+        #[test]
+        fn replaces_the_database_and_keeps_the_rest_of_the_url() {
+            assert_eq!(
+                url_with_database("postgres://user:pw@127.0.0.1:5432/postgres", "test_42"),
+                "postgres://user:pw@127.0.0.1:5432/test_42"
+            );
+        }
+
+        #[test]
+        fn a_url_without_a_database_gets_one_appended() {
+            assert_eq!(
+                url_with_database("postgres://127.0.0.1:5432", "test_42"),
+                "postgres://127.0.0.1:5432/test_42"
+            );
+        }
+
+        #[test]
+        fn a_query_string_stays_with_the_database_it_belongs_to() {
+            // `postgresql_embedded` hands out URLs with parameters; dropping them
+            // would silently lose connection settings for every test.
+            assert_eq!(
+                url_with_database("postgres://h/db?sslmode=disable", "test_42"),
+                "postgres://h/test_42?sslmode=disable"
+            );
+        }
+    }
+
+    static SHARED: OnceCell<SharedCluster> = OnceCell::const_new();
+
+    extern "C" fn stop_at_exit() {
+        let Ok(guard) = EXIT_INFO.lock() else {
+            return;
+        };
+        let Some((bin_dir, data_dir)) = guard.as_ref() else {
+            return;
+        };
+        let _ = std::process::Command::new(bin_dir.join("pg_ctl"))
+            .arg("stop")
+            .arg("--pgdata")
+            .arg(data_dir)
+            .arg("--mode")
+            .arg("fast")
+            .arg("--wait")
+            .output();
+    }
+
+    pub(super) async fn get() -> &'static SharedCluster {
+        SHARED
+            .get_or_init(|| async {
+                let port = {
+                    let listener =
+                        TcpListener::bind(("127.0.0.1", 0)).expect("Failed to bind to port 0");
+                    listener
+                        .local_addr()
+                        .expect("Unable to retrieve local socket address")
+                        .port()
+                };
+
+                // `persistent` keeps the crate from wiping a directory we still
+                // own; the temp dir lives in the returned value instead.
+                let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+                let pg = crate::db::pg_setup::install(
+                    temp_dir.path().to_path_buf(),
+                    true,
+                    Some(port),
+                )
+                .await
+                .expect(
+                    "Unable to start the shared test Postgres. If the host ran out of System V \
+                         shared memory segments (macOS allows 32), stop leftover servers with \
+                         `pkill -f 'postgres -D'` and re-run.",
+                );
+
+                let exit_info = (pg.settings().binary_dir(), pg.settings().data_dir.clone());
+                {
+                    let mut guard = EXIT_INFO.lock().unwrap_or_else(|e| e.into_inner());
+                    *guard = Some(exit_info);
+                }
+                // SAFETY: the handler only reads a `Mutex<Option<(PathBuf, PathBuf)>>`
+                // and shells out to `pg_ctl`; it touches no async state and cannot
+                // run before the static above is initialised.
+                unsafe {
+                    libc::atexit(stop_at_exit);
+                }
+
+                SharedCluster {
+                    admin_url: pg.settings().url("postgres"),
+                    _pg: pg,
+                    _temp_dir: temp_dir,
+                }
+            })
+            .await
+    }
+}
+
+/// A test's own database inside the shared cluster.
+///
+/// Dropping it drops the database. The server itself outlives it, so there is no
+/// per-test process to leak.
+#[cfg(feature = "postgresql_embedded")]
+pub(crate) struct TestDatabaseLease {
+    database: Option<String>,
+    admin_url: String,
+}
+
+#[cfg(feature = "postgresql_embedded")]
+impl Drop for TestDatabaseLease {
+    fn drop(&mut self) {
+        let Some(database) = self.database.take() else {
+            return;
+        };
+        let admin_url = self.admin_url.clone();
+        // `Drop` cannot await, and blocking here would stall the test runtime, so
+        // the cleanup runs on a plain thread with its own runtime. It is
+        // best-effort: the database is unique per test, so a failure to drop it
+        // costs disk in a temp directory that goes away with the process.
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async move {
+                let db_config = crate::config::DatabaseConfig::new(admin_url, None);
+                let Ok((client, connection)) = db_config
+                    .tokio_postgres_config()
+                    .expect("Failed to build admin config")
+                    .connect(tokio_postgres::NoTls)
+                    .await
+                else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let _ = client
+                    .execute(
+                        format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)").as_str(),
+                        &[],
+                    )
+                    .await;
+            });
+        });
+    }
 }
 
 impl Drop for DbHandle {
@@ -89,11 +328,23 @@ impl Drop for DbHandle {
         // shut down postgres). Otherwise, postgres logs an error that the
         // directory is already gone during shutdown which could be
         // confusing for a developer.
-        if let Some(pg) = self.db.pg_inst.as_mut() {
-            let _r = async {
-                pg.stop().await.unwrap();
-            };
-        }
+        //
+        // `Drop` cannot await, so the previous code built a `pg.stop()` future
+        // and dropped it unawaited: the explicit stop never ran and the server
+        // was only shut down by `PostgreSQL::drop` (which shells out to
+        // `pg_ctl stop` and ignores the result). That is too late and too
+        // unreliable -- a test that panics or an assertion that unwinds still
+        // reaches this `Drop`, but a process that dies mid-test does not, and
+        // every leaked cluster holds one SysV shared memory segment. macOS
+        // allows 32 of them (`kern.sysv.shmmni`), after which every later
+        // `pg_ctl` fails with "could not start server" and the whole suite
+        // fails for a reason unrelated to the code under test. Stop the server
+        // synchronously here and hand out at most
+        // `MAX_CONCURRENT_EMBEDDED_DATABASES` clusters at a time, so an
+        // interrupted run can never accumulate past the limit.
+        // Nothing to stop: the server is shared for the whole process and is
+        // shut down by an `atexit` handler. Only this test's database goes away,
+        // which `TestDatabaseLease::drop` takes care of.
     }
 
     #[cfg(not(feature = "postgresql_embedded"))]
@@ -156,57 +407,49 @@ async fn test_setup() -> DbHandle {
 }
 
 #[cfg(feature = "postgresql_embedded")]
-pub(crate) async fn setup_pg() -> (StoragePostgres, tempfile::TempDir) {
+pub(crate) async fn setup_pg() -> (StoragePostgres, TestDatabaseLease) {
     use crate::config::DatabaseConfig;
-    use std::net::TcpListener;
 
-    // Connecting to the database goes through `rustls`, which panics when no process-wide
-    // crypto provider is installed. Install it here rather than in each test: without it a
-    // test panics *after* its embedded server has started, and the panic leaks that server.
-    // Enough leaked servers exhaust the host's shared memory and every later `pg_ctl` fails
-    // with "could not start server", which reads as an unrelated problem.
+    // Connecting to the database goes through `rustls`, which panics when no
+    // process-wide crypto provider is installed. Install it here rather than in
+    // each test, so the failure is not mistaken for a database problem.
     crate::ensure_default_crypto_provider();
 
-    // Install the test database in a temporary directory and bound to a free port
-    let mut attempt = 1;
-    let (_temp_dir, pg) = loop {
-        // Find a free port
-        let port = {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Failed to bind to port 0");
-            listener
-                .local_addr()
-                .map(|l| l.port())
-                .expect("Unable to retrieve local socket address")
-        };
+    let cluster = shared_cluster::get().await;
+    // A UUID avoids depending on `rand`'s prelude import in this file; Postgres
+    // identifiers cannot start with a digit, hence the `test_` prefix.
+    let database = format!("test_{}", Uuid::now_v7().simple());
 
-        // Wait a small amount of time for the port to be unbound again
-        sleep(Duration::from_millis(10)).await;
+    {
+        let admin_config = DatabaseConfig::new(cluster.admin_url().to_string(), None);
+        let (client, connection) = admin_config
+            .tokio_postgres_config()
+            .expect("Failed to build admin config")
+            .connect(tokio_postgres::NoTls)
+            .await
+            .expect("Failure connecting to the shared test Postgres");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .execute(format!("CREATE DATABASE {database}").as_str(), &[])
+            .await
+            .expect("Failure creating the test database");
+    }
 
-        // Attempt Postgres installation on that port
-        let _temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = _temp_dir.path();
-        match crate::db::pg_setup::install(temp_path.into(), false, Some(port)).await {
-            Ok(pg) => break (_temp_dir, pg),
-            Err(e) => {
-                info!(
-                    "Unable to install test database on port {port} ({} attempts left) -- port might have become occupied in the meanwhile. Original error: {e}",
-                    10 - attempt
-                );
-                sleep(Duration::from_millis(100)).await;
-            }
-        }
-        if attempt >= 10 {
-            panic!("Unable to install test database: gave up after several attempts");
-        }
-        attempt += 1;
-    };
-    let db_uri = pg.settings().url("postgres").clone();
-    let db_config = DatabaseConfig::new(db_uri, None);
-    let conn = StoragePostgres::initialize(&db_config, Some(pg))
+    let db_config = DatabaseConfig::new(cluster.url_for(&database), None);
+    let conn = StoragePostgres::initialize(&db_config, None)
         .await
-        .unwrap();
-    conn.run_migrations().await.unwrap();
-    (conn, _temp_dir)
+        .expect("Failure initializing the test database");
+    conn.run_migrations()
+        .await
+        .expect("Failure running migrations on the test database");
+
+    let lease = TestDatabaseLease {
+        database: Some(database),
+        admin_url: cluster.admin_url().to_string(),
+    };
+    (conn, lease)
 }
 
 #[cfg(not(feature = "postgresql_embedded"))]
