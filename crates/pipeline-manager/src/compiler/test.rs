@@ -24,7 +24,7 @@ pub(crate) struct CompilerTest {
     pub(crate) rust_workdir: PathBuf,
     _compiler_tempdir: TempDir,
     #[cfg(feature = "postgresql_embedded")]
-    _db_tempdir: TempDir,
+    _db_tempdir: crate::db::test::TestDatabaseLease,
 }
 
 impl CompilerTest {
