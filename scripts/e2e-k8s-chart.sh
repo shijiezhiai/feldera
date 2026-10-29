@@ -102,6 +102,69 @@ printf '%s\n' "$policy" | grep -q -- '--kubernetes-runner-tenant-namespaces=tena
   || fail "the tenant namespace did not reach the manager"
 info "the allowlist and the tenant namespace arrive as flags"
 
+step "the tenant quota map reaches the manager"
+quota="$(render \
+  --set-string 'controlplane.kubernetesRunner.tenantQuotas.11111111-1111-1111-1111-111111111111=tenant-a: requests.cpu=16\,requests.memory=32Gi' \
+  --set-string 'controlplane.kubernetesRunner.tenantQuotas.22222222-2222-2222-2222-222222222222=tenant-b: persistentvolumeclaims=8')"
+# The entries are joined with ';' because the comma separates a quota's own
+# keys: a comma-joined pair of entries would parse as one tenant with the other
+# tenant's keys folded into its quota.
+printf '%s\n' "$quota" | grep -q 'FELDERA_KUBERNETES_RUNNER_TENANT_QUOTAS' \
+  || fail "the tenant quota map did not reach the manager"
+entry="$(printf '%s\n' "$quota" | grep -A 1 'FELDERA_KUBERNETES_RUNNER_TENANT_QUOTAS' | tail -1)"
+printf '%s\n' "$entry" | grep -q 'tenant=11111111-1111-1111-1111-111111111111:tenant-a: requests.cpu=16\,requests.memory=32Gi' \
+  || fail "a tenant quota lost its spec: $entry"
+printf '%s\n' "$entry" | grep -q ';tenant=22222222-2222-2222-2222-222222222222:tenant-b:' \
+  || fail "the entries were not joined with ';': $entry"
+info "each tenant's quota arrives as one entry"
+
+# The namespace grant is cluster-scoped, so it must be absent unless asked for.
+# The runner's own ClusterRole is different: it is aggregated rather than a
+# grant of its own, and it renders whenever the runner is on.
+if printf '%s\n' "$quota" | grep -q -- '-tenant-namespaces'; then
+  fail "the cluster-scoped namespace grant appeared without tenantNamespaceAutomation"
+fi
+printf '%s\n' "$quota" | grep -q 'TENANT_NAMESPACE_AUTOMATION' \
+  && fail "namespace automation reached the manager without being asked for"
+automated="$(render \
+  --set controlplane.kubernetesRunner.tenantNamespaceAutomation=true \
+  --set-string 'controlplane.kubernetesRunner.tenantQuotas.11111111-1111-1111-1111-111111111111=tenant-a: requests.cpu=16')"
+for expected in 'kind: ClusterRole' 'tenant-namespaces' 'FELDERA_KUBERNETES_RUNNER_TENANT_NAMESPACE_AUTOMATION' \
+  'manager-service-account' 'tenant-cluster-role'; do
+  printf '%s\n' "$automated" | grep -q -- "$expected" \
+    || fail "automation on did not render $expected"
+done
+printf '%s\n' "$automated" | grep -q 'resources: \["namespaces"\]' \
+  || fail "the ClusterRole does not grant namespaces"
+info "automation on renders the ClusterRole, and off does not"
+
+step "the runner Role and its ClusterRole twin match"
+# The runner Role and its ClusterRole twin must grant the same thing. The API
+# server aggregates only ClusterRoles, so the namespaced Role cannot be the
+# source: the rules are two copies, and a permission added to one and not the
+# other either breaks the release namespace or every tenant namespace.
+rules_under() {
+  local kind="$1" name_suffix="$2"
+  awk -v kind="${kind}" -v suffix="${name_suffix}" '
+    /^kind: /   { k = $2 }
+    /^  name: / { n = $2 }
+    /^---$/     { k = ""; n = ""; next }
+    k == kind && n ~ suffix && /^  - apiGroups|^    resources|^    verbs/ { print }
+  '
+}
+runner_role="$(render | rules_under Role '-runner$')"
+runner_cluster="$(render | rules_under ClusterRole '-pipeline-runner$')"
+if [ -z "${runner_role}" ] || [ -z "${runner_cluster}" ]; then
+  fail "the runner RBAC did not render where the test expected it"
+fi
+if [ "${runner_role}" != "${runner_cluster}" ]; then
+  diff <(printf '%s\n' "${runner_role}") <(printf '%s\n' "${runner_cluster}") >&2 || true
+  fail "the runner Role and the pipeline-runner ClusterRole grant different things"
+fi
+info "the runner Role and its ClusterRole twin grant the same rules"
+
+# The namespace grant is cluster-scoped, so it must be absent unless asked for.
+
 step "values the platform cannot honour are rejected"
 rejects() {
   local description="$1"
@@ -118,5 +181,8 @@ rejects "a tenant mapped to an empty namespace" --set-string \
   'controlplane.kubernetesRunner.tenantNamespaces.11111111-1111-1111-1111-111111111111='
 rejects "an anti-affinity mode the chart does not have" \
   --set controlplane.apiServerAntiAffinity=sometimes
+
+rejects "namespace automation without a tenant quota to keep in step" \
+  --set controlplane.kubernetesRunner.tenantNamespaceAutomation=true
 
 printf '\nPASS: the chart renders as recorded and rejects unhonourable values\n'

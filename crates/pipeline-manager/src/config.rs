@@ -1834,6 +1834,29 @@ pub struct KubernetesRunnerConfig {
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_MANAGER_NAMESPACE")]
     pub kubernetes_runner_manager_namespace: Option<String>,
 
+    /// Service account the manager itself runs as.
+    ///
+    /// The platform binds the runner's permissions into each tenant namespace it
+    /// creates (P1-022). It needs to name itself as the subject of that binding,
+    /// and the Kubernetes API offers no way to ask "who am I?" that includes the
+    /// namespace, so an operator states it here. When unset, the binding is not
+    /// written and the operator is told to write it, which is the case for a
+    /// manager running outside the cluster.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_MANAGER_SERVICE_ACCOUNT")]
+    pub kubernetes_runner_manager_service_account: Option<String>,
+
+    /// ClusterRole whose rules a newly created tenant namespace should grant the
+    /// manager.
+    ///
+    /// The chart renders this aggregation ClusterRole (P1-022); a manager that
+    /// creates a tenant namespace also has to bind it there, or the pipelines in
+    /// that namespace cannot be provisioned. When unset, the binding is not
+    /// written and the operator is told to write it by hand.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_TENANT_CLUSTER_ROLE")]
+    pub kubernetes_runner_tenant_cluster_role: Option<String>,
+
     /// ConfigMap that holds a custom StatefulSet template for pipeline pods.
     ///
     /// When unset, the runner renders the built-in StatefulSet. When set, the
@@ -2031,6 +2054,51 @@ pub struct KubernetesRunnerConfig {
     #[serde(default)]
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_RETAIN_STORAGE_CLAIMS")]
     pub kubernetes_runner_retain_storage_claims: bool,
+
+    /// Quotas a tenant's namespace carries, and the tenant namespaces the
+    /// platform keeps in step with them.
+    ///
+    /// Given once per tenant as
+    /// `tenant=<uuid-or-name>:<namespace>:<key>=<value>,...`; repeat the flag
+    /// for several tenants, or join several with `;`. Inside one entry the
+    /// comma separates keys, so it cannot also separate entries. The keys are the `ResourceQuota` resource names
+    /// (`requests.cpu`, `requests.memory`, `limits.cpu`, `limits.memory`,
+    /// `persistentvolumeclaims`, `requests.storage`) and the `LimitRange`
+    /// defaults (`default.cpu`, `default.memory`, `defaultRequest.cpu`,
+    /// `defaultRequest.memory`, `max.cpu`, `max.memory`).
+    ///
+    /// This supersedes `--kubernetes-runner-tenant-namespaces` for the tenants
+    /// it names: a tenant listed here gets its namespace from this entry, so
+    /// the two settings cannot disagree about where a tenant's pipelines go.
+    /// A tenant in neither uses the runner-wide namespace.
+    ///
+    /// The quota counts what is in the namespace, so it bounds a tenant only
+    /// when that tenant's pipelines are alone in its namespace. With
+    /// `--kubernetes-runner-per-pipeline-namespace` every pipeline has its own
+    /// namespace and no quota applies to a tenant's total.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_TENANT_QUOTAS",
+        value_delimiter = ';'
+    )]
+    pub kubernetes_runner_tenant_quotas: Vec<String>,
+
+    /// Let the platform create, label and delete tenant namespaces.
+    ///
+    /// Off by default because it needs a cluster-scoped grant: the runner's
+    /// `Role` is namespaced and cannot create a namespace. Turn it on together
+    /// with the chart's `controlplane.tenantNamespaceAutomation`, which grants
+    /// exactly the namespace, quota and limit-range verbs and nothing else.
+    ///
+    /// Off, every namespace named by `--kubernetes-runner-tenant-quotas` must
+    /// already exist; the API server checks that at start-up and logs the ones
+    /// that do not. Deleting a tenant then leaves its namespace in place.
+    /// Creating a tenant with a quota entry while this is off fails with an
+    /// error naming the namespace.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_TENANT_NAMESPACE_AUTOMATION")]
+    pub kubernetes_runner_tenant_namespace_automation: bool,
 }
 
 /// Default for `--kubernetes-runner-lower-memory-mb`.

@@ -77,6 +77,22 @@ spec:
             - name: COMPILER_HOST
               value: {{ .Values.compilerServiceHost | default (printf "%s-compiler.%s.svc.cluster.local" .Release.Name .Release.Namespace) | quote }}
             {{- end }}
+            {{- if .Values.kubernetesRunner.tenantQuotas }}
+            {{- /* P1-022. Each entry is checked at start-up; a tenant in the
+                   map gets its namespace, quota and limit range before any of
+                   its pipelines exist. Entries are joined with ';' because the
+                   comma separates the quota's own keys. */}}
+            {{- $entries := list }}
+            {{- range $tenant, $spec := .Values.kubernetesRunner.tenantQuotas }}
+            {{- $entries = append $entries (printf "tenant=%s:%s" $tenant (trim $spec)) }}
+            {{- end }}
+            - name: FELDERA_KUBERNETES_RUNNER_TENANT_QUOTAS
+              value: {{ join ";" $entries | quote }}
+            {{- end }}
+            {{- if .Values.kubernetesRunner.tenantNamespaceAutomation }}
+            - name: FELDERA_KUBERNETES_RUNNER_TENANT_NAMESPACE_AUTOMATION
+              value: "true"
+            {{- end }}
             {{- if gt (int .Values.replicaCount) 1 }}
             # Above one replica, elect exactly one instance to reconcile
             # pipelines. Without this every replica would provision, start and
@@ -181,6 +197,13 @@ spec:
             {{- end }}
             {{- with .Values.kubernetesRunner.tenantNamespaces }}
             - "--kubernetes-runner-tenant-namespaces={{ range $tenant, $namespace := . }}tenant={{ $tenant }}:{{ $namespace }},{{ end }}"
+            {{- end }}
+            {{- if .Values.kubernetesRunner.tenantNamespaceAutomation }}
+            # P1-022: the platform creates tenant namespaces, so it has to bind
+            # its own permissions in them. Both values name objects this chart
+            # renders; the manager cannot read either from the cluster.
+            - "--kubernetes-runner-manager-service-account={{ include "controlplane.fullname" . }}"
+            - "--kubernetes-runner-tenant-cluster-role={{ include "controlplane.fullname" . }}-pipeline-runner"
             {{- end }}
             {{- if .Values.kubernetesRunner.allowCustomPipelineTemplate }}
             - "--kubernetes-runner-allow-kubernetes-env-prefix"

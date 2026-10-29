@@ -93,6 +93,25 @@ kubernetesRunner:
   # Every namespace must exist before it is listed here: the manager's role is
   # namespaced and cannot create one.
   tenantNamespaces: {}
+  # P1-022: what a tenant's namespace may hold, written as
+  # "<tenant-uuid>: <namespace>: <key>=<value>,...". A tenant listed here takes
+  # its namespace from this entry, and the API server keeps that namespace, its
+  # ResourceQuota and its LimitRange in step with the tenant.
+  #
+  # The keys are the quota's resource names (requests.cpu, requests.memory,
+  # limits.cpu, limits.memory, persistentvolumeclaims, requests.storage) and the
+  # LimitRange defaults (default.cpu, default.memory, defaultRequest.cpu,
+  # defaultRequest.memory, max.cpu, max.memory).
+  #
+  #   tenantQuotas:
+  #     "0193d7c2-...": "acme: requests.cpu=16,requests.memory=32Gi,limits.cpu=4"
+  tenantQuotas: {}
+  # P1-022: let the API server create, label and delete tenant namespaces.
+  # Needs a cluster-scoped grant, which the runner's namespaced Role cannot
+  # give: this switch adds exactly a ClusterRole over namespaces, quotas and
+  # limit ranges. Off, every namespace in tenantQuotas must exist already and
+  # deleting a tenant leaves its namespace behind.
+  tenantNamespaceAutomation: false
   connectorKubernetesSecrets:
     enableAllowlist: false
     allowlist: []

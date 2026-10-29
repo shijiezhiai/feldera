@@ -375,6 +375,20 @@ pub(crate) async fn delete_tenant(
 ) -> Result<HttpResponse, ManagerError> {
     let tenant_id = parse_tenant_id(&req)?;
     state.db.lock().await.delete_tenant(tenant_id).await?;
+    // The tenant's pipelines are gone by now; its namespace holds their claims
+    // and service, and with automation on this is what reclaims them.
+    if let Some(namespaces) = &state.tenant_namespaces
+        && let Err(error) = namespaces.release(tenant_id.0).await
+    {
+        // The tenant is gone, so its namespace holds pipelines that no longer
+        // exist in the database. Reporting the failure keeps it from looking
+        // reclaimed; the orphan scan finds whatever is left.
+        return Err(ManagerError::from(
+            crate::runner::error::RunnerError::RunnerStopError {
+                error: format!("unable to remove the deleted tenant's namespace: {error}"),
+            },
+        ));
+    }
     info!("Deleted tenant {tenant_id}");
     Ok(HttpResponse::Ok().finish())
 }
@@ -468,6 +482,40 @@ pub(crate) async fn create_tenant(
         .await
         .get_or_create_tenant(Uuid::now_v7(), &body.name, &provider)
         .await?;
+    // The namespace, and the quota in it, exist before any pipeline may be
+    // created in it: a tenant whose namespace is missing would otherwise have
+    // its first pipelines land in the shared namespace while the chart claims
+    // a quota bounds them.
+    if created && let Some(namespaces) = &state.tenant_namespaces {
+        if let Err(error) = namespaces.admit(tenant.id.0).await {
+            // The tenant exists in the database but has no namespace, so it
+            // cannot be used; deleting it here would make the response an
+            // error about a tenant that does not exist. Rolling back keeps the
+            // two in step, and the caller may retry once the cause is fixed.
+            state
+                .db
+                .lock()
+                .await
+                .delete_tenant(tenant.id)
+                .await
+                .map_err(|rollback| {
+                    ManagerError::from(crate::runner::error::RunnerError::RunnerProvisionError {
+                        error: format!(
+                            "{error}; and the tenant '{}' could not be removed again: {rollback}",
+                            tenant.name
+                        ),
+                    })
+                })?;
+            return Err(ManagerError::from(
+                crate::runner::error::RunnerError::RunnerProvisionError {
+                    error: format!(
+                        "unable to give tenant '{}' its namespace: {error}",
+                        tenant.name
+                    ),
+                },
+            ));
+        }
+    }
     let mut response = if created {
         info!(
             "Created tenant '{}' ({}, provider: {provider})",

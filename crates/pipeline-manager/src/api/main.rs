@@ -4,6 +4,7 @@ use crate::api::support_data_collector::SupportDataCollector;
 use crate::auth::{IssuerJwkCache, JwkCache};
 use crate::config::{ApiServerConfig, BasePath, CommonConfig};
 use crate::db::probe::DbProbe;
+use crate::db::storage::Storage;
 use crate::db::storage_postgres::StoragePostgres;
 use crate::error::ManagerError;
 use crate::license::LicenseCheck;
@@ -1071,6 +1072,57 @@ pub(crate) struct ServerState {
     probe: Arc<Mutex<DbProbe>>,
     pub demos: Vec<Demo>,
     pub license_check: Arc<RwLock<Option<LicenseCheck>>>,
+    /// Keeps tenant namespaces in step with the tenants, when the platform is
+    /// configured to place tenants in namespaces of their own.
+    pub tenant_namespaces: Option<crate::runner::tenant_namespace::TenantNamespaces>,
+}
+
+/// Reads the tenant namespace map, resolving tenant names through the
+/// database.
+///
+/// A failure here is logged and leaves the platform without automation: a
+/// cluster that cannot be reached at start-up must not keep the API server from
+/// serving the pipelines that already exist.
+async fn tenant_namespaces(
+    db: &Arc<Mutex<StoragePostgres>>,
+    config: Option<crate::config::KubernetesRunnerConfig>,
+) -> Option<crate::runner::tenant_namespace::TenantNamespaces> {
+    let config = config?;
+    if config.kubernetes_runner_tenant_quotas.is_empty() {
+        return None;
+    }
+    // Resolve names against the tenants that exist now: the map is read once,
+    // so a tenant created later is named by its id in the chart.
+    let names = {
+        let db = db.lock().await;
+        match db.list_tenants().await {
+            Ok(tenants) => tenants
+                .into_iter()
+                .map(|tenant| (tenant.name, tenant.id.0))
+                .collect::<std::collections::HashMap<_, _>>(),
+            Err(error) => {
+                error!(
+                    "Tenant namespace automation disabled: unable to list tenants: {error}"
+                );
+                return None;
+            }
+        }
+    };
+    match crate::runner::tenant_namespace::TenantNamespaces::from_config(&config, |name| {
+        names.get(name).copied()
+    })
+    .await
+    {
+        Ok(Some(service)) => {
+            service.verify_at_startup().await;
+            Some(service)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            error!("Tenant namespace automation disabled: {error}");
+            None
+        }
+    }
 }
 
 impl ServerState {
@@ -1079,11 +1131,13 @@ impl ServerState {
         config: ApiServerConfig,
         db: Arc<Mutex<StoragePostgres>>,
         license_check: Arc<RwLock<Option<LicenseCheck>>>,
+        tenant_namespace_config: Option<crate::config::KubernetesRunnerConfig>,
     ) -> AnyResult<Self> {
         let runner = RunnerInteraction::new(common_config.clone(), db.clone());
         let db_copy = db.clone();
         let demos = read_demos_from_directories(&config.demos_dir);
         let oidc_root_certs = common_config.configured_root_certificates().await?;
+        let tenant_namespaces = tenant_namespaces(&db, tenant_namespace_config).await;
         Ok(Self {
             db,
             runner,
@@ -1097,6 +1151,7 @@ impl ServerState {
             probe: DbProbe::new(db_copy).await,
             demos,
             license_check,
+            tenant_namespaces,
         })
     }
 
@@ -1105,7 +1160,7 @@ impl ServerState {
         let common_config = CommonConfig::test_config();
         let api_config = ApiServerConfig::test_config();
         let license_check = Arc::new(RwLock::new(None::<LicenseCheck>));
-        Self::new(common_config, api_config, db.clone(), license_check)
+        Self::new(common_config, api_config, db.clone(), license_check, None)
             .await
             .unwrap()
     }
@@ -1155,6 +1210,7 @@ pub async fn run(
     common_config: CommonConfig,
     api_config: ApiServerConfig,
     license_check: Arc<RwLock<Option<LicenseCheck>>>,
+    tenant_namespace_config: Option<crate::config::KubernetesRunnerConfig>,
 ) -> AnyResult<()> {
     if let Err(reason) = api_config.validate_authorization() {
         return Err(anyhow::anyhow!(reason));
@@ -1167,7 +1223,14 @@ pub async fn run(
             )
         });
     let state = WebData::new(
-        ServerState::new(common_config.clone(), api_config.clone(), db, license_check).await?,
+        ServerState::new(
+            common_config.clone(),
+            api_config.clone(),
+            db,
+            license_check,
+            tenant_namespace_config,
+        )
+        .await?,
     );
     let auth_configuration = match api_config.auth_provider {
         crate::config::AuthProviderType::None => None,
