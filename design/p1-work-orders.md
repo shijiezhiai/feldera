@@ -94,7 +94,7 @@ gantt
 
 | ID | 工单 | 人天 | 依赖 | DoD |
 |---|---|---|---|---|
-| P1-022 | 租户 ns 自动化：租户创建→namespace + ResourceQuota（cpu/mem/storage 总和）+ LimitRange 默认值，租户删除→级联回收 | 5 | 019 | 配额打满后新 pipeline 被拒且报友好错误 |
+| P1-022 | 租户 ns 自动化：租户创建→namespace + ResourceQuota（cpu/mem/storage 总和）+ LimitRange 默认值，租户删除→级联回收 | 5 | 019 | 配额打满后新 pipeline 被拒且报友好错误（e2e 45s 内给出带 K8s 原始数字与下一步建议的 RunnerProvisionError，`scripts/e2e-k8s-tenant-quota.sh`）|
 | P1-023 | RBAC 租户维度过滤：`api/rbac.rs` 中间件内加 tenant 过滤（deny-by-default 表不动语义，仅加谓词），tenant 由 OIDC claim / API key 归属推导 | 5 | 021 | 跨租户访问全 403 用例（含 API key 路径）；性能回归 <3% |
 | P1-024 | OIDC group→role 映射：映射表配置面（fda + console 管理页）+ `oidc/trust_name.rs` 基础上的 trusted-identity 配置 | 5 | 021 | 组变更下一 token 生效；viewer/read/write/admin 四级抽查 |
 | P1-025 | 连接器 secret 引用注入：pipeline 配置只允许 K8s Secret 引用（对齐官方 secret-references 特性），`kubernetesRunner.connectorKubernetesSecrets.allowlist` 白名单语义；密钥不落 PG 明文 | 5 | 009,022 | 白名单外引用被 422；PG 元数据 grep 不到密钥值 |
