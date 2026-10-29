@@ -167,6 +167,24 @@
                 "minLength": 1
               }
             },
+            "groupRoleMaps": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Identity-provider group name to the role it grants. Keys also admit the login. 'owner' is rejected by the manager at startup, since it is configuration-only.",
+              "additionalProperties": {
+                "type": "string",
+                "enum": [
+                  "read",
+                  "write",
+                  "admin"
+                ]
+              },
+              "propertyNames": {
+                "minLength": 1
+              }
+            },
             "authAudience": {
               "type": [
                 "string",

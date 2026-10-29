@@ -436,11 +436,7 @@ pub struct CommonConfig {
     /// single API server has nothing to elect against. Set it when
     /// `replicaCount` in the chart is above one: without it, a second replica
     /// breaks every pipeline rather than adding availability.
-    #[arg(
-        long,
-        default_value_t = false,
-        env = "FELDERA_LEADER_ELECTION"
-    )]
+    #[arg(long, default_value_t = false, env = "FELDERA_LEADER_ELECTION")]
     pub leader_election: bool,
 }
 
@@ -1248,6 +1244,25 @@ pub struct ApiServerConfig {
     #[arg(long, value_delimiter = ',', env = "FELDERA_AUTH_AUTHORIZED_GROUPS")]
     pub authorized_groups: Vec<String>,
 
+    /// Identity-provider groups that grant a role, as a JSON object mapping a
+    /// group name to one of `read`, `write` or `admin`. A user whose token
+    /// carries several mapped groups gets the highest of their roles; one
+    /// carrying none gets whatever it would have had without this setting
+    /// (the tenant's first-login grant or `default_role`).
+    ///
+    /// `FELDERA_AUTH_GROUP_ROLE_MAPS='{"platform-admins": "admin",
+    /// "data-engineers": "write", "analysts": "read"}'`
+    ///
+    /// A group named here also admits the user, so a group map alone is enough
+    /// to restrict the platform to mapped groups; `authorized_groups` remains
+    /// for the case where admission and role are decided by different lists.
+    ///
+    /// `owner` is refused: like `--owners`, it is configuration only, and a
+    /// token cannot claim it.
+    #[serde(default)]
+    #[arg(long, default_value = "{}", env = "FELDERA_AUTH_GROUP_ROLE_MAPS")]
+    pub group_role_maps: GroupRoleMaps,
+
     /// Expected audience claim value in OIDC Access tokens.
     /// This value must match the 'aud' claim in JWT tokens for successful authentication.
     /// For Okta custom authorization servers, this is typically the API identifier.
@@ -1418,6 +1433,68 @@ impl FromStr for OwnerTrusts {
     }
 }
 
+/// The groups that grant a role, declared at launch through
+/// `--auth-group-role-maps` / `FELDERA_AUTH_GROUP_ROLE_MAPS`.
+///
+/// A map from an identity-provider group name to the role it confers. Empty by
+/// default: without it, an identity's role comes only from the tenant's
+/// first-login grant, `default_role`, or an explicit grant through the API.
+///
+/// Ordering matters when a token carries several mapped groups, so the
+/// [`GroupRoleMaps::role_for`] result is the highest role any of them confers,
+/// never the first one found: map iteration order is not a property a security
+/// decision may depend on.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct GroupRoleMaps(pub std::collections::BTreeMap<String, Role>);
+
+impl GroupRoleMaps {
+    /// The role the token's groups confer, `None` when none of them is mapped.
+    /// The highest matching role wins, so the map's iteration order cannot
+    /// change the answer.
+    pub fn role_for(&self, groups: Option<&[String]>) -> Option<Role> {
+        let groups = groups?;
+        groups
+            .iter()
+            .filter_map(|group| self.0.get(group).copied())
+            .max()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether any group is mapped, which also means the login must ask the
+    /// provider for the `groups` claim.
+    pub fn admits_any(&self, groups: Option<&[String]>) -> bool {
+        self.role_for(groups).is_some()
+    }
+}
+
+impl FromStr for GroupRoleMaps {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let maps: std::collections::BTreeMap<String, Role> =
+            serde_json::from_str(value).map_err(|e| {
+                format!("auth group role maps must be a JSON object mapping a group to a role: {e}")
+            })?;
+        for (group, role) in &maps {
+            if group.is_empty() {
+                return Err("auth group role map group must not be empty".to_string());
+            }
+            if role.is_owner() {
+                return Err(format!(
+                    "auth group role map for group `{group}` grants `owner`, which is \
+                     configuration-only: name the identity under --owners or --owner-trusts \
+                     instead"
+                ));
+            }
+        }
+        Ok(GroupRoleMaps(maps))
+    }
+}
+
 impl ApiServerConfig {
     /// Refuse a configuration that could never mint a membership: with
     /// provisioning off and no configured owner, every login is denied and no
@@ -1434,6 +1511,14 @@ impl ApiServerConfig {
                  configured. With provisioning off, access comes only from membership rows, and \
                  without an owner no principal could ever create one. Configure an owner or \
                  re-enable --provision-on-login."
+                    .to_string(),
+            );
+        }
+        if !self.group_role_maps.is_empty() && self.auth_provider == AuthProviderType::None {
+            return Err(
+                "auth group role maps are configured but authentication is off, so no token \
+                 ever carries groups and no role could come from them. Enable a provider or \
+                 drop --auth-group-role-maps."
                     .to_string(),
             );
         }
@@ -1510,6 +1595,7 @@ impl ApiServerConfig {
             issuer_tenant: false,
             individual_tenant: true,
             authorized_groups: vec![],
+            group_role_maps: GroupRoleMaps::default(),
             auth_audience: "feldera-api".to_string(),
             owners: vec![],
             owner_trusts: OwnerTrusts::default(),
@@ -2426,8 +2512,9 @@ mod tests {
         assert!(!api_only.runs_compilation());
         assert!(!api_only.runs_artifact_server());
 
-        let split = CommonConfig::try_parse_from(["test", "--services", "compiler,artifact-server"])
-            .unwrap();
+        let split =
+            CommonConfig::try_parse_from(["test", "--services", "compiler,artifact-server"])
+                .unwrap();
         assert_eq!(
             split.services,
             vec![ServiceRole::Compiler, ServiceRole::ArtifactServer]

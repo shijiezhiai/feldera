@@ -82,10 +82,16 @@ pub async fn get_member_role(
 }
 
 /// Inserts or updates a membership row. The role must be `<= admin`
-/// (`owner` is never stored); the caller enforces the cap. `origin` and the
-/// creation timestamp record provenance and only apply to a fresh row: a
-/// conflict updates the role and keeps how and when the membership was first
-/// created.
+/// (`owner` is never stored); the caller enforces the cap.
+///
+/// A conflict updates the role, and keeps how and when the membership was
+/// first created — with one exception. An `origin` of [`MembershipOrigin::Api`]
+/// means an administrator decided this role by hand, so it takes ownership of
+/// the row from whatever set it before. That is what makes the decision stick:
+/// a membership `group_role_maps` controls is rewritten by the next login
+/// (`apply_group_role`), and an administrator who raised someone's role must
+/// not have that undone minutes later. Every other origin leaves the stored one
+/// alone, so a provisioning path cannot silently relabel a row.
 pub async fn upsert_member_role(
     txn: &Transaction<'_>,
     tenant_id: TenantId,
@@ -97,10 +103,15 @@ pub async fn upsert_member_role(
         .prepare_cached(
             // On conflict the membership already exists, so overwrite its role
             // with `EXCLUDED.role`, PostgreSQL's name for the value this
-            // statement tried to insert. Insert and update in one statement.
+            // statement tried to insert. An explicit admin grant also takes
+            // over `origin`; see this function's comment.
             "INSERT INTO tenant_membership (tenant_id, user_id, role, created_at, origin) \
              VALUES ($1, $2, $3, now(), $4) \
-             ON CONFLICT (tenant_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+             ON CONFLICT (tenant_id, user_id) DO UPDATE \
+                 SET role = EXCLUDED.role, \
+                     origin = CASE WHEN EXCLUDED.origin = 'api' \
+                                   THEN EXCLUDED.origin \
+                                   ELSE tenant_membership.origin END",
         )
         .await?;
     txn.execute(
@@ -262,6 +273,7 @@ pub async fn enroll_in_existing_tenants(
     names: &[String],
     role: Role,
     origin: MembershipOrigin,
+    group_role: Option<Role>,
 ) -> Result<(), DBError> {
     let user_id = get_or_create_user(txn, new_user_id, provider, subject, email).await?;
     let stmt = txn
@@ -274,6 +286,18 @@ pub async fn enroll_in_existing_tenants(
     for name in names {
         txn.execute(&stmt, &[name, &user_id.0, &role.as_str(), &origin.as_str()])
             .await?;
+        // A tenant this login only lists passively still gets the mapped role,
+        // so that a member of the admin group is an admin everywhere their
+        // token reaches rather than only in the tenant that named them.
+        if let Some(group_role) = group_role {
+            let tenant_id: Option<Uuid> = txn
+                .query_opt("SELECT id FROM tenant WHERE tenant = $1", &[name])
+                .await?
+                .map(|row| row.get(0));
+            if let Some(tenant_id) = tenant_id {
+                apply_group_role(txn, TenantId(tenant_id), user_id, Some(group_role)).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -325,32 +349,109 @@ pub async fn resolve_login(
     default_role: Role,
     first_user_role: Role,
     origin: MembershipOrigin, // How the token named the tenant: claim or derived.
+    group_role: Option<Role>, // The role the token's groups confer, if any.
 ) -> Result<(TenantId, UserId, Role), DBError> {
     let (tenant_id, created) =
         get_or_create_tenant_id_created(txn, new_tenant_id, tenant_name, provider.clone()).await?;
     let user_id =
         get_or_create_user(txn, new_user_id, &provider, &subject, email.as_deref()).await?;
 
-    let role = match get_member_role(txn, tenant_id, user_id).await? {
-        Some(role) => role,
-        None => {
-            let role = if created {
-                first_user_role
-            } else {
-                default_role
-            };
-            // Insert-if-absent: an admin grant committed between the read
-            // above and this write must win, not be overwritten.
-            if insert_membership_if_absent(txn, tenant_id, user_id, role, origin).await? {
-                role
-            } else {
-                get_member_role(txn, tenant_id, user_id)
-                    .await?
-                    .unwrap_or(role)
+    // A group-mapped login is decided by the map, not by the tenant's
+    // first-login grant: an operator who said "this group is admin" did not ask
+    // for the first person to arrive to be admin on their own behalf.
+    let role = if let Some(group_role) = group_role {
+        match apply_group_role(txn, tenant_id, user_id, Some(group_role)).await? {
+            Some(role) => role,
+            // The row exists but an administrator granted it, so the map may
+            // not touch it and the stored role is what the user keeps.
+            None => get_member_role(txn, tenant_id, user_id)
+                .await?
+                .unwrap_or(group_role),
+        }
+    } else {
+        match get_member_role(txn, tenant_id, user_id).await? {
+            Some(role) => role,
+            None => {
+                let role = if created {
+                    first_user_role
+                } else {
+                    default_role
+                };
+                // Insert-if-absent: an admin grant committed between the read
+                // above and this write must win, not be overwritten.
+                if insert_membership_if_absent(txn, tenant_id, user_id, role, origin).await? {
+                    role
+                } else {
+                    get_member_role(txn, tenant_id, user_id)
+                        .await?
+                        .unwrap_or(role)
+                }
             }
         }
     };
     Ok((tenant_id, user_id, role))
+}
+
+/// Applies the role the identity's groups confer, returning the role the user
+/// ends up with in this tenant.
+///
+/// The rule is one line: a mapped login owns every membership an administrator
+/// has not taken over. Concretely, a membership whose origin is
+/// [`MembershipOrigin::Api`] is an explicit grant and is left alone — the map
+/// must not silently undo a decision someone made by hand. Every other
+/// membership follows the token: `group` because the map already owned it, and
+/// `claim`, `derived` and the pre-V36 `NULL` because those only record how the
+/// login first created the row, not that anyone chose its role. Enabling the
+/// map on an existing deployment therefore takes effect for the users already
+/// in it, which is the whole point of configuring it.
+///
+/// The row's origin becomes `group` when the map takes it over, so a later
+/// demotion is recognised as the map's business rather than as an admin's.
+///
+/// `group_role` is `None` when the token names no mapped group, in which case
+/// the stored role, if any, stays as it is.
+pub async fn apply_group_role(
+    txn: &Transaction<'_>,
+    tenant_id: TenantId,
+    user_id: UserId,
+    group_role: Option<Role>,
+) -> Result<Option<Role>, DBError> {
+    let Some(group_role) = group_role else {
+        return Ok(None);
+    };
+    let stmt = txn
+        .prepare_cached(
+            // `IS DISTINCT FROM` rather than `<>`: rows from before provenance
+            // tracking carry NULL, which `<> 'api'` would not match, and those
+            // are exactly the rows a newly enabled map has to take over.
+            "INSERT INTO tenant_membership (tenant_id, user_id, role, created_at, origin) \
+             VALUES ($1, $2, $3, now(), $4) \
+             ON CONFLICT (tenant_id, user_id) DO UPDATE \
+                 SET role = EXCLUDED.role, origin = EXCLUDED.origin \
+                 WHERE tenant_membership.origin IS DISTINCT FROM 'api' \
+             RETURNING role",
+        )
+        .await?;
+    // The statement returns a row in both branches: the insert, and the
+    // conditional update. No row means there is a membership but its origin is
+    // not `group`, which case 3 leaves as it is.
+    let row = txn
+        .query_opt(
+            &stmt,
+            &[
+                &tenant_id.0,
+                &user_id.0,
+                &group_role.as_str(),
+                &MembershipOrigin::Group.as_str(),
+            ],
+        )
+        .await
+        .map_err(DBError::from)
+        .map_err(|e| maybe_tenant_id_foreign_key_constraint_err(e, tenant_id))
+        .map_err(|e| maybe_user_id_foreign_key_constraint_err(e, user_id))?;
+    Ok(row
+        .map(|row| Role::from_str(&row.get::<_, String>(0)))
+        .transpose()?)
 }
 
 /// Inserts a membership only if none exists; `true` when this call created it.

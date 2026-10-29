@@ -603,6 +603,13 @@ async fn provision_login(
     subject: &str,
     email: Option<&str>,
 ) -> Result<(), DBError> {
+    // The role the token's groups confer, if any. Computed once here rather
+    // than at each call: every path below stores it the same way, and a login
+    // that maps to a role must not depend on which path it took.
+    let group_role = state
+        .config
+        .group_role_maps
+        .role_for(token_data.claims.groups.as_deref());
     if !state.config.provision_on_login {
         let db = state.db.lock().await;
         db.get_or_create_user(Uuid::now_v7(), provider, subject, email)
@@ -628,6 +635,7 @@ async fn provision_login(
             state.config.default_role,
             state.config.first_user_role,
             MembershipOrigin::Derived,
+            group_role,
         )
         .await?;
         return Ok(());
@@ -649,6 +657,7 @@ async fn provision_login(
             state.config.default_role,
             state.config.first_user_role,
             MembershipOrigin::Claim,
+            group_role,
         )
         .await?;
     }
@@ -666,6 +675,7 @@ async fn provision_login(
             &others,
             state.config.default_role,
             MembershipOrigin::Claim,
+            group_role,
         )
         .await?;
     }
@@ -1169,31 +1179,36 @@ fn derived_tenant_name(
         })
 }
 
-/// Validates that the user belongs to at least one required group (for
-/// providers that support groups). Passes when no groups are configured.
+/// Validates that the user belongs to at least one group the platform admits.
+/// Passes when neither `authorized_groups` nor `group_role_maps` is configured.
+///
+/// Two lists admit: `authorized_groups`, which decides admission alone, and the
+/// keys of `group_role_maps`, which is primarily a role mapping but names
+/// groups all the same. A deployment that maps every group it trusts should not
+/// have to repeat the list in `authorized_groups`; one that wants admission and
+/// role decided by different lists configures both, and this admits a user
+/// holding either.
 fn validate_groups_authorization(
     token: &TokenData<OidcClaim>,
     config: &ApiServerConfig,
 ) -> Result<(), AuthError> {
     // If no groups are configured, allow access
-    if config.authorized_groups.is_empty() {
+    if config.authorized_groups.is_empty() && config.group_role_maps.is_empty() {
         return Ok(());
     }
 
     // Check if user has any of the required groups
-    if let Some(user_groups) = &token.claims.groups {
-        let has_required_group = user_groups
-            .iter()
-            .any(|user_group| config.authorized_groups.contains(user_group));
-
-        if has_required_group {
+    match &token.claims.groups {
+        Some(user_groups)
+            if user_groups
+                .iter()
+                .any(|user_group| config.authorized_groups.contains(user_group))
+                || config.group_role_maps.admits_any(Some(user_groups)) =>
+        {
             Ok(())
-        } else {
-            Err(AuthError::InsufficientGroups)
         }
-    } else {
-        // User has no groups but groups are required
-        Err(AuthError::InsufficientGroups)
+        // A token with no groups, or with none the platform admits.
+        _ => Err(AuthError::InsufficientGroups),
     }
 }
 
@@ -1348,12 +1363,15 @@ pub(crate) async fn generic_oidc_auth_config(
 
     let validation = login_validation(&iss, Some(&api_config.auth_audience));
 
-    // Add 'groups' scope if authorized_groups is configured
-    let extra_oidc_scopes = if !api_config.authorized_groups.is_empty() {
-        vec!["groups".to_string()]
-    } else {
-        vec![]
-    };
+    // Ask for the `groups` claim when anything reads it: the admission list or
+    // the role map. Without the scope a provider may omit the claim, which
+    // would silently deny every login or drop every mapped role.
+    let extra_oidc_scopes =
+        if !api_config.authorized_groups.is_empty() || !api_config.group_role_maps.is_empty() {
+            vec!["groups".to_string()]
+        } else {
+            vec![]
+        };
 
     Ok(AuthConfiguration {
         provider: AuthProvider::GenericOidc(ProviderGenericOidc {
@@ -2338,6 +2356,7 @@ mod test {
             support_data_collection_frequency: 15,
             support_data_retention: 3,
             authorized_groups: vec![],
+            group_role_maps: crate::config::GroupRoleMaps::default(),
             individual_tenant: true,
             issuer_tenant: false,
             auth_audience: "feldera-api".to_string(),
@@ -2936,5 +2955,74 @@ mod test {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    /// A token carrying these groups, for the group-authorization tests.
+    fn token_with_groups(groups: Option<Vec<String>>) -> jsonwebtoken::TokenData<OidcClaim> {
+        let mut claim = default_claim();
+        claim.groups = groups;
+        jsonwebtoken::TokenData {
+            header: jsonwebtoken::Header::default(),
+            claims: claim,
+        }
+    }
+
+    /// A group named in the role map admits its holder, so a deployment that
+    /// maps every group it trusts need not repeat the list in
+    /// `authorized_groups`.
+    #[tokio::test]
+    async fn a_mapped_group_admits_without_an_authorized_groups_entry() {
+        let mut config = default_manager_test_config();
+        config.group_role_maps = r#"{"platform-admins": "admin"}"#.parse().unwrap();
+
+        let token = token_with_groups(Some(vec!["platform-admins".to_string()]));
+        assert!(super::validate_groups_authorization(&token, &config).is_ok());
+    }
+
+    /// A group in neither list is refused, and so is a token carrying no groups
+    /// at all while a map is configured: without a group there is no role, and
+    /// admitting the login would grant the default role to someone the operator
+    /// did not map.
+    #[tokio::test]
+    async fn an_unmapped_group_is_refused_when_a_map_is_configured() {
+        let mut config = default_manager_test_config();
+        config.group_role_maps = r#"{"platform-admins": "admin"}"#.parse().unwrap();
+
+        let unlisted = token_with_groups(Some(vec!["some-other-team".to_string()]));
+        assert!(super::validate_groups_authorization(&unlisted, &config).is_err());
+
+        let groupless = token_with_groups(None);
+        assert!(super::validate_groups_authorization(&groupless, &config).is_err());
+    }
+
+    /// `authorized_groups` keeps working on its own: a deployment using only the
+    /// admission list still admits its members and refuses others.
+    #[tokio::test]
+    async fn the_admission_list_still_decides_on_its_own() {
+        let mut config = default_manager_test_config();
+        config.authorized_groups = vec!["feldera-users".to_string()];
+
+        let admitted = token_with_groups(Some(vec!["feldera-users".to_string()]));
+        assert!(super::validate_groups_authorization(&admitted, &config).is_ok());
+
+        let refused = token_with_groups(Some(vec!["outsiders".to_string()]));
+        assert!(super::validate_groups_authorization(&refused, &config).is_err());
+    }
+
+    /// Holding several mapped groups confers the highest of their roles, not
+    /// whichever the map happens to yield first.
+    #[tokio::test]
+    async fn several_mapped_groups_yield_the_highest_role() {
+        let config: crate::config::GroupRoleMaps =
+            r#"{"a": "read", "b": "admin", "c": "write"}"#.parse().unwrap();
+
+        let all = ["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(config.role_for(Some(&all)), Some(Role::Admin));
+
+        let low = ["a".to_string()];
+        assert_eq!(config.role_for(Some(&low)), Some(Role::Read));
+
+        assert_eq!(config.role_for(Some(&[])), None);
+        assert_eq!(config.role_for(None), None);
     }
 }

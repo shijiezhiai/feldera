@@ -161,6 +161,7 @@ pub(crate) trait Storage {
         default_role: Role,
         first_user_role: Role,
         origin: MembershipOrigin,
+        group_role: Option<Role>,
     ) -> Result<(TenantId, UserId, Role), DBError>;
 
     /// Lists the tenants a user may act in, with the user's role in each.
@@ -185,6 +186,7 @@ pub(crate) trait Storage {
         names: &[String],
         role: Role,
         origin: MembershipOrigin,
+        group_role: Option<Role>,
     ) -> Result<(), DBError>;
 
     /// Ensures a user record exists for an OIDC `(provider, subject)` and

@@ -201,6 +201,7 @@ impl Storage for StoragePostgres {
         default_role: Role,
         first_user_role: Role,
         origin: MembershipOrigin,
+        group_role: Option<Role>,
     ) -> Result<(TenantId, UserId, Role), DBError> {
         let mut client = self.pool.get().await?;
         let txn = transaction::begin(&mut client).await?;
@@ -215,6 +216,7 @@ impl Storage for StoragePostgres {
             default_role,
             first_user_role,
             origin,
+            group_role,
         )
         .await?;
         txn.commit().await?;
@@ -242,6 +244,7 @@ impl Storage for StoragePostgres {
         names: &[String],
         role: Role,
         origin: MembershipOrigin,
+        group_role: Option<Role>,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
         let txn = transaction::begin(&mut client).await?;
@@ -254,6 +257,7 @@ impl Storage for StoragePostgres {
             names,
             role,
             origin,
+            group_role,
         )
         .await?;
         txn.commit().await?;

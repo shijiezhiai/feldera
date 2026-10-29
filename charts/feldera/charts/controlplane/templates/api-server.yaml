@@ -156,6 +156,12 @@ spec:
             - name: FELDERA_AUTH_AUTHORIZED_GROUPS
               value: {{ join "," . | quote }}
             {{- end }}
+            {{- with .Values.authorization.groupRoleMaps }}
+            # Group name to role, as JSON: the manager parses it as one object.
+            # Its keys also admit the login, so they double as an allow-list.
+            - name: FELDERA_AUTH_GROUP_ROLE_MAPS
+              value: {{ toJson . | quote }}
+            {{- end }}
             {{- with .Values.authorization.authAudience }}
             - name: FELDERA_AUTH_AUDIENCE
               value: {{ . | quote }}
