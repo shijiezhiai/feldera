@@ -1239,6 +1239,7 @@ async fn membership_origin_is_recorded() {
             Role::Read,
             Role::Admin,
             MembershipOrigin::Claim,
+            None,
         )
         .await
         .unwrap();
@@ -1908,6 +1909,202 @@ async fn a_verified_email_outranks_a_claimed_one() {
     );
 }
 
+/// A mapped group decides the login's role, overriding the tenant's
+/// first-login grant: an operator who mapped a group to `write` did not mean
+/// for the first person in to be admin.
+#[tokio::test]
+async fn a_group_mapped_login_takes_the_mapped_role_not_the_first_user_role() {
+    let handle = test_setup().await;
+    let provider = "https://idp.example".to_string();
+
+    let (tenant, alice, role) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "mapped".to_string(),
+            provider.clone(),
+            "alice".to_string(),
+            Some("alice@mapped.test".to_string()),
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+            Some(Role::Write),
+        )
+        .await
+        .unwrap();
+    assert_eq!(role, Role::Write, "the map decides, not first_user_role");
+
+    let members = handle.db.list_tenant_members(tenant).await.unwrap();
+    let alice_role = members
+        .iter()
+        .find(|m| m.user_id == alice)
+        .map(|m| m.role)
+        .expect("alice is a member");
+    assert_eq!(alice_role, Role::Write);
+}
+
+/// A group-managed membership follows the token on every login, which is what
+/// makes removing someone from the group in the identity provider demote them
+/// on their next token rather than needing an admin to intervene.
+#[tokio::test]
+async fn a_group_managed_membership_follows_the_token() {
+    let handle = test_setup().await;
+    let provider = "https://idp.example".to_string();
+
+    let login = |group_role: Option<Role>| {
+        let handle = &handle;
+        let provider = provider.clone();
+        async move {
+            handle
+                .db
+                .resolve_login(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "mapped".to_string(),
+                    provider,
+                    "carol".to_string(),
+                    Some("carol@mapped.test".to_string()),
+                    Role::Read,
+                    Role::Admin,
+                    MembershipOrigin::Claim,
+                    group_role,
+                )
+                .await
+                .unwrap()
+                .2
+        }
+    };
+
+    assert_eq!(login(Some(Role::Admin)).await, Role::Admin);
+    // Demoted in the identity provider: the next token lowers the stored role.
+    assert_eq!(login(Some(Role::Read)).await, Role::Read);
+    // Promoted again, on the same row.
+    assert_eq!(login(Some(Role::Write)).await, Role::Write);
+    // A token naming no mapped group leaves the stored role alone rather than
+    // silently dropping the member to the default.
+    assert_eq!(login(None).await, Role::Write);
+}
+
+/// A membership that predates the map — every user an existing deployment
+/// already had — still picks the mapped role up.
+#[tokio::test]
+async fn an_existing_membership_takes_the_mapped_role_up() {
+    let handle = test_setup().await;
+    let provider = "https://idp.example".to_string();
+    let (tenant, alice, role) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "existing".to_string(),
+            provider.clone(),
+            "alice".to_string(),
+            Some("alice@existing.test".to_string()),
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+            None,
+        )
+        .await
+        .unwrap();
+    // Alice's first login created the tenant and she holds `first_user_role`;
+    // the row is recorded as `claim` because her token named the tenant.
+    assert_eq!(role, Role::Admin);
+    assert_eq!(
+        handle.db.list_tenant_members(tenant).await.unwrap()[0].origin,
+        Some(MembershipOrigin::Claim)
+    );
+
+    // Configuring the map afterwards must reach her: the point of turning it on
+    // is the users who are already there, not only the ones who arrive later.
+    let login = |group_role: Option<Role>| {
+        let handle = &handle;
+        let provider = provider.clone();
+        async move {
+            handle
+                .db
+                .resolve_login(
+                    Uuid::now_v7(),
+                    alice.0,
+                    "existing".to_string(),
+                    provider,
+                    "alice".to_string(),
+                    Some("alice@existing.test".to_string()),
+                    Role::Read,
+                    Role::Admin,
+                    MembershipOrigin::Claim,
+                    group_role,
+                )
+                .await
+                .unwrap()
+                .2
+        }
+    };
+    assert_eq!(login(Some(Role::Write)).await, Role::Write);
+    let row = &handle.db.list_tenant_members(tenant).await.unwrap()[0];
+    assert_eq!(row.role, Role::Write);
+    // The map owns the row now, so a later demotion follows the token.
+    assert_eq!(row.origin, Some(MembershipOrigin::Group));
+    assert_eq!(login(Some(Role::Read)).await, Role::Read);
+}
+
+/// A role an admin granted through the API outranks the group map for a
+/// membership that admin owns: a login must not overwrite an explicit grant,
+/// which is why only a `Group`-origin row follows the token.
+#[tokio::test]
+async fn an_api_granted_role_is_not_overwritten_by_a_group_mapping() {
+    let handle = test_setup().await;
+    let provider = "https://idp.example".to_string();
+
+    let (tenant, dave, _) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "mapped".to_string(),
+            provider.clone(),
+            "dave".to_string(),
+            Some("dave@mapped.test".to_string()),
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+            Some(Role::Read),
+        )
+        .await
+        .unwrap();
+
+    // An admin raises the role explicitly.
+    handle
+        .db
+        .upsert_member_role(tenant, dave, Role::Admin, MembershipOrigin::Api)
+        .await
+        .unwrap();
+
+    // The group now maps to read, but the admin's grant stands.
+    let (_, _, role) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "mapped".to_string(),
+            provider.clone(),
+            "dave".to_string(),
+            Some("dave@mapped.test".to_string()),
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+            Some(Role::Read),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        role,
+        Role::Admin,
+        "an explicit grant outranks the group map"
+    );
+}
+
 /// `first_user_role` sets the role of the login that creates a tenant: with
 /// `write`, the creator is not made admin (e.g. a shared sandbox).
 #[tokio::test]
@@ -1929,6 +2126,7 @@ async fn rbac_first_user_role_configurable() {
             Role::Read,
             Role::Write,
             MembershipOrigin::Claim,
+            None,
         )
         .await
         .unwrap();
@@ -1961,6 +2159,7 @@ async fn rbac_login_resolution_and_membership() {
             Role::Read,
             Role::Admin,
             MembershipOrigin::Claim,
+            None,
         )
         .await
         .unwrap();
@@ -1979,6 +2178,7 @@ async fn rbac_login_resolution_and_membership() {
             Role::Read,
             Role::Admin,
             MembershipOrigin::Claim,
+            None,
         )
         .await
         .unwrap();
@@ -1998,6 +2198,7 @@ async fn rbac_login_resolution_and_membership() {
             Role::Read,
             Role::Admin,
             MembershipOrigin::Claim,
+            None,
         )
         .await
         .unwrap();
@@ -2092,6 +2293,7 @@ async fn oidc_trust_rejects_an_unreachable_issuer() {
             Role::Read,
             Role::Admin,
             MembershipOrigin::Claim,
+            None,
         )
         .await
         .unwrap()
@@ -2178,6 +2380,7 @@ async fn oidc_trust_matching_and_issuer_gate() {
                 Role::Read,
                 Role::Admin,
                 MembershipOrigin::Claim,
+                None,
             )
             .await
             .unwrap()
@@ -2326,6 +2529,7 @@ async fn preprovision_member_survives_first_login() {
             Role::Read,
             Role::Admin,
             MembershipOrigin::Claim,
+            None,
         )
         .await
         .unwrap();
@@ -2362,6 +2566,7 @@ async fn preprovision_member_survives_first_login() {
             Role::Read,
             Role::Admin,
             MembershipOrigin::Claim,
+            None,
         )
         .await
         .unwrap();
@@ -5961,6 +6166,7 @@ async fn check_rbac_action(
                     &names,
                     role.role(),
                     MembershipOrigin::Api,
+                    None,
                 )
                 .await;
             let impl_response = handle
@@ -5973,6 +6179,7 @@ async fn check_rbac_action(
                     &names,
                     role.role(),
                     MembershipOrigin::Api,
+                    None,
                 )
                 .await;
             check_responses(i, model_response, impl_response);
@@ -8177,6 +8384,7 @@ impl Storage for Mutex<DbModel> {
         default_role: Role,
         _first_user_role: Role,
         _origin: MembershipOrigin,
+        _group_role: Option<Role>,
     ) -> DBResult<(TenantId, UserId, Role)> {
         Ok((TenantId(Uuid::nil()), UserId(Uuid::nil()), default_role))
     }
@@ -8328,6 +8536,7 @@ impl Storage for Mutex<DbModel> {
         names: &[String],
         role: Role,
         origin: MembershipOrigin,
+        group_role: Option<Role>,
     ) -> DBResult<()> {
         let user_id = self
             .get_or_create_user(new_user_id, provider, subject, email)
@@ -8343,9 +8552,27 @@ impl Storage for Mutex<DbModel> {
                 continue;
             };
             // Enroll only where no membership exists; never touch a role.
-            s.memberships
-                .entry((tenant_id, user_id))
-                .or_insert((role, origin, Utc::now()));
+            // A group-mapped login instead follows the map, the same rule
+            // `operations::user::apply_group_role` applies. The creation time
+            // is this model's, because Postgres records it when the row is
+            // inserted; a later group change only rewrites the role.
+            match group_role {
+                Some(group_role) => {
+                    let entry = s.memberships.entry((tenant_id, user_id)).or_insert((
+                        group_role,
+                        MembershipOrigin::Group,
+                        Utc::now(),
+                    ));
+                    if entry.1 == MembershipOrigin::Group {
+                        entry.0 = group_role;
+                    }
+                }
+                None => {
+                    s.memberships
+                        .entry((tenant_id, user_id))
+                        .or_insert((role, origin, Utc::now()));
+                }
+            }
         }
         Ok(())
     }

@@ -35,6 +35,11 @@ pub enum MembershipOrigin {
     Derived,
     /// Granted through the RBAC endpoints.
     Api,
+    /// The user's identity-provider groups grant this role (see
+    /// `group_role_maps`). Only a membership carrying this origin follows the
+    /// token on every login: one an admin set through the API (`Api`), or one
+    /// that predates group mapping, is left alone.
+    Group,
 }
 
 impl MembershipOrigin {
@@ -43,6 +48,7 @@ impl MembershipOrigin {
             MembershipOrigin::Claim => "claim",
             MembershipOrigin::Derived => "derived",
             MembershipOrigin::Api => "api",
+            MembershipOrigin::Group => "group",
         }
     }
 }
@@ -58,6 +64,7 @@ impl FromStr for MembershipOrigin {
             "claim" => Ok(MembershipOrigin::Claim),
             "derived" => Ok(MembershipOrigin::Derived),
             "api" => Ok(MembershipOrigin::Api),
+            "group" => Ok(MembershipOrigin::Group),
             other => Err(InvalidMembershipOrigin(other.to_string())),
         }
     }

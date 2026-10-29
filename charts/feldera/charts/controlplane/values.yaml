@@ -159,6 +159,18 @@ authorization:
   individualTenant: null
   issuerTenant: null
   authorizedGroups: null
+  # Identity-provider group name to the role it grants, rendered into
+  # FELDERA_AUTH_GROUP_ROLE_MAPS as JSON. A user holding several mapped groups
+  # gets the highest. A mapped group also admits the login, so a group map
+  # alone is enough to restrict the platform to mapped groups.
+  #
+  #   groupRoleMaps:
+  #     platform-admins: admin
+  #     data-engineers: write
+  #     analysts: read
+  #
+  # 'owner' is rejected at startup: like `owners`, it is configuration only.
+  groupRoleMaps: null
   authAudience: null
 
 allowedOrigins: null
