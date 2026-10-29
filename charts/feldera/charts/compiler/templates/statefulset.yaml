@@ -8,6 +8,13 @@ metadata:
 spec:
   serviceName: {{ include "compiler.fullname" . }}
   replicas: 1
+  # Roll the pod when its template changes. A StatefulSet defaults to
+  # `OnDelete`, so `helm upgrade --set compiler.image.tag=...` leaves the pod
+  # running the previous image while the release reports the new one: the tag
+  # `helm get values` shows and the tag the pod actually runs disagree, and
+  # every later check reads the wrong version.
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "compiler.name" . }}

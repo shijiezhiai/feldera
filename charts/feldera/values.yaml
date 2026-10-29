@@ -16,6 +16,10 @@ controlplane:
     storageClassNamesSupported: []
     storageClassName: null
     tenantNamespaces: {}
+    # P1-022: per-tenant quotas, and whether the platform may create and delete
+    # the namespaces they live in. See controlplane/values.yaml.
+    tenantQuotas: {}
+    tenantNamespaceAutomation: false
   postgresExternal: false
   postgresVersion: "17-alpine"
   postgresImageRepository: "postgres"

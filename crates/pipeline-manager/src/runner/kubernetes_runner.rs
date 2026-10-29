@@ -54,6 +54,7 @@ use crate::runner::pipeline_executor::{
     PipelineExecutor, ProvisionStatus, discover_namespace_from_runtime_config_json,
 };
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
+use crate::runner::tenant_namespace;
 use async_trait::async_trait;
 use feldera_types::config::{
     PipelineConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig, StorageOptions,
@@ -62,7 +63,7 @@ use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
 use futures_util::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
+    ConfigMap, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource, Event,
     ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, PodTemplateSpec,
     ResourceRequirements, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Volume,
@@ -76,7 +77,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
-use kube::api::{Api, DeleteParams, LogParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
@@ -351,6 +352,19 @@ impl TenantNamespace {
         config: &KubernetesRunnerConfig,
         tenant_id: &TenantId,
     ) -> Option<Self> {
+        // A tenant that carries a quota is placed by that entry, which names
+        // one namespace and one quota for it. Consulting the plain mapping
+        // first would let the two settings disagree about where a tenant's
+        // pipelines go, and the quota would then count a namespace those
+        // pipelines are not in: a quota that reads as enforced and is not.
+        for namespace in tenant_namespace::configured_namespaces(config) {
+            if tenant_namespace::tenant_of(config, &namespace) == Some(tenant_id.0) {
+                return Some(Self {
+                    tenant_id: *tenant_id,
+                    namespace,
+                });
+            }
+        }
         for entry in &config.kubernetes_runner_tenant_namespaces {
             let Some((tenant, namespace)) = entry.split_once(':') else {
                 warn!(
@@ -1002,6 +1016,47 @@ fn fatal_waiting_reason(reason: &str) -> bool {
     )
 }
 
+/// Whether the StatefulSet controller failed to create the pipeline's pod.
+///
+/// A rejected pod does not exist, so [`pod_failure`] never sees it, and the
+/// StatefulSet controller does not record the rejection on the StatefulSet's
+/// own status either: `status.conditions` stays empty and the object keeps
+/// reporting `replicas: 0`. What it does do is emit a `Warning`/`FailedCreate`
+/// Event against the StatefulSet, with the API server's message. That event is
+/// what this reads.
+///
+/// Without it a pipeline whose tenant quota is full would sit in `Provisioning`
+/// until the provisioning timeout and then report "pod does not exist", leaving
+/// the operator to discover the quota on their own.
+///
+/// `reason` is the event's reason; `message` its text.
+fn statefulset_failure(reason: &str, message: &str) -> Option<String> {
+    if reason != "FailedCreate" {
+        return None;
+    }
+    Some(if quota_exceeded(message) {
+        format!(
+            "the tenant's namespace has no room for this pipeline: {message}. Free capacity by \
+             deleting or shrinking another pipeline in the same tenant, or raise the tenant's \
+             quota"
+        )
+    } else {
+        format!("the StatefulSet controller could not create the pipeline's pod: {message}")
+    })
+}
+
+/// Whether a Kubernetes message says a `ResourceQuota` refused the request.
+fn quota_exceeded(message: &str) -> bool {
+    // Two shapes from the API server, both about a `ResourceQuota`:
+    //   "exceeded quota: req, requested: ..., used: ..., limited: ..."
+    //   "failed quota: req: must specify requests.cpu for: pipeline"
+    // The second is the namespace's LimitRange not covering a container the
+    // manager did not size, which is equally a "this namespace has no room".
+    message.contains("exceeded quota")
+        || message.contains("failed quota")
+        || message.contains("must specify")
+}
+
 /// Extracts the first fatal condition of a pod, if any.
 fn pod_failure(pod: &Pod) -> Option<String> {
     let status = pod.status.as_ref()?;
@@ -1376,6 +1431,64 @@ impl KubernetesRunner {
             }
             .into()),
         }
+    }
+
+    /// Reads why the cluster refused to create the pipeline's pod, if it did.
+    ///
+    /// The StatefulSet controller reports the rejection as an Event against the
+    /// StatefulSet, not in its status (see [`statefulset_failure`]). Events are
+    /// a separate resource and carry the involved object as a reference, so
+    /// they are filtered by that name here rather than by a path.
+    ///
+    /// An unreadable Event list is not an error: provisioning continues and the
+    /// deployment reports progress, which is what it did before this check
+    /// existed. Being forbidden from listing events is a plausible RBAC setup,
+    /// and it must not turn into a provisioning failure.
+    async fn get_statefulset_failure(
+        &mut self,
+        namespace: &str,
+    ) -> Result<Option<String>, ManagerError> {
+        let client = self.kubernetes_client().await?;
+        let statefulset_name = resource_base(self.pipeline_id);
+        let events: Api<Event> = Api::namespaced(client, namespace);
+        let list = match events.list(&ListParams::default()).await {
+            Ok(list) => list,
+            Err(error) => {
+                // Forbidden is expected on a cluster whose manager role omits
+                // events.read: say so once per poll at debug level, not as a
+                // failure.
+                tracing::debug!(
+                    pipeline_id = %self.pipeline_id,
+                    namespace = %namespace,
+                    %error,
+                    "unable to list events to look for a rejected pod"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(list
+            .items
+            .iter()
+            .filter(|event| {
+                event
+                    .involved_object
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name == statefulset_name)
+                    && event
+                        .involved_object
+                        .kind
+                        .as_deref()
+                        .is_some_and(|kind| kind == "StatefulSet")
+                    && event.type_.as_deref() == Some("Warning")
+            })
+            .filter_map(|event| {
+                statefulset_failure(
+                    event.reason.as_deref().unwrap_or_default(),
+                    event.message.as_deref().unwrap_or_default(),
+                )
+            })
+            .next())
     }
 
     /// Renders the StatefulSet from the operator-supplied template.
@@ -1772,9 +1885,22 @@ impl PipelineExecutor for KubernetesRunner {
         let namespace = self.namespace(runtime_config);
         let details = serde_json::json!({ "namespace": namespace });
         let Some(pod) = self.get_pod(&namespace).await? else {
+            // The pod may be missing because the cluster refused to create it.
+            // Check the owner before reporting progress: a quota that stays
+            // full would otherwise read as "still provisioning" forever.
+            if let Some(failure) = self.get_statefulset_failure(&namespace).await? {
+                return Err(RunnerError::RunnerProvisionError { error: failure }.into());
+            }
             return Ok(ProvisionStatus::Ongoing { details });
         };
         if let Some(failure) = pod_failure(&pod) {
+            return Err(RunnerError::RunnerProvisionError { error: failure }.into());
+        }
+        // A refused container is recorded by the kubelet as a `Failed` pod *and*
+        // as a `FailedCreate` event, so the event is also worth reading when a
+        // pod exists: `pod_failure` reports the kubelet's message, which for a
+        // quota says "Error: failed quota" without the actionable numbers.
+        if let Some(failure) = self.get_statefulset_failure(&namespace).await? {
             return Err(RunnerError::RunnerProvisionError { error: failure }.into());
         }
         let details = pod_details(&pod);
@@ -3016,6 +3142,46 @@ mod tests {
         assert_eq!(mapping.namespace, "tenant-b");
     }
 
+    /// A tenant in both maps is placed by the one that also bounds it: a quota
+    /// that counts a namespace the tenant's pipelines are not in would read as
+    /// enforced while bounding nothing.
+    #[test]
+    fn a_quota_entry_takes_precedence_over_a_plain_namespace() {
+        let tenant = TenantId(Uuid::nil());
+        let config = KubernetesRunnerConfig {
+            kubernetes_runner_tenant_namespaces: vec![format!("tenant={}:unbounded", tenant.0)],
+            kubernetes_runner_tenant_quotas: vec![format!(
+                "tenant={}:bounded:requests.cpu=2",
+                tenant.0
+            )],
+            ..runner_config()
+        };
+        let mapping = TenantNamespace::from_config(&config, &tenant)
+            .expect("the tenant has an entry of its own");
+        assert_eq!(mapping.namespace, "bounded");
+    }
+
+    /// A quota entry alone is enough to place a tenant.
+    #[test]
+    fn a_quota_entry_alone_places_a_tenant() {
+        let tenant = TenantId(Uuid::nil());
+        let config = KubernetesRunnerConfig {
+            kubernetes_runner_tenant_quotas: vec![format!(
+                "tenant={}:bounded:requests.cpu=2",
+                tenant.0
+            )],
+            ..runner_config()
+        };
+        assert_eq!(
+            TenantNamespace::from_config(&config, &tenant).map(|mapping| mapping.namespace),
+            Some("bounded".to_string())
+        );
+        assert!(
+            TenantNamespace::from_config(&config, &TenantId(Uuid::max())).is_none(),
+            "a tenant the map does not name keeps the shared namespace"
+        );
+    }
+
     /// A tenant with no entry has no mapping, and its pipelines stay in the
     /// shared namespace.
     #[test]
@@ -3077,8 +3243,7 @@ mod tests {
                 kubernetes_runner_retain_storage_claims: false,
                 kubernetes_runner_enable_storage_classes: false,
                 kubernetes_runner_storage_classes: Vec::new(),
-                kubernetes_runner_storage_class: None,
-                kubernetes_runner_tenant_namespaces: Vec::new(),
+                ..runner_config()
             },
             client: reqwest::Client::new(),
             logs_sender: logs_sender(),
@@ -3225,6 +3390,11 @@ mod tests {
             pub conflict_on: Arc<Mutex<Option<String>>>,
             /// The pod's JSON, or `None` when it does not exist.
             pub pod: Arc<Mutex<Option<serde_json::Value>>>,
+            /// The events in the namespace, as the API server lists them.
+            pub events: Arc<Mutex<Vec<serde_json::Value>>>,
+            /// Answer 403 for the event list, as a manager role without
+            /// `events.read` would.
+            pub events_forbidden: Arc<Mutex<bool>>,
             pub namespace_exists: Arc<Mutex<bool>>,
             /// The template ConfigMap's JSON, or `None` when it does not exist.
             pub configmap: Arc<Mutex<Option<serde_json::Value>>>,
@@ -3320,6 +3490,24 @@ mod tests {
                 .unwrap()
         }
 
+        fn forbidden(kind: &str) -> Response<Full<Bytes>> {
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "reason": "Forbidden",
+                        "message": format!("{kind} is forbidden: User \"system:serviceaccount:feldera:feldera\" cannot list resource \"{kind}\" in API group \"\" in the namespace \"feldera\""),
+                        "code": 403,
+                    })
+                    .to_string(),
+                )))
+                .unwrap()
+        }
+
         /// Maps a resource path segment to the `apiVersion`/`kind` pair the
         /// Kubernetes API returns for it, which the typed `kube` clients check.
         fn api_type(kind: &str) -> (&'static str, &'static str) {
@@ -3378,6 +3566,18 @@ mod tests {
                     None => status(StatusCode::NOT_FOUND, kind, name.unwrap_or("")),
                 };
             }
+            if kind == "events" && method == Method::GET && name.is_none() {
+                if *cluster.events_forbidden.lock().unwrap() {
+                    return forbidden(kind);
+                }
+                let items = cluster.events.lock().unwrap().clone();
+                return json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "EventList",
+                    "metadata": {},
+                    "items": items,
+                }));
+            }
             if method == Method::POST {
                 let conflict = cluster.conflict_on.lock().unwrap().clone();
                 if conflict.as_deref() == Some(kind) {
@@ -3387,6 +3587,26 @@ mod tests {
             }
             json(object(kind, name.unwrap_or("")))
         }
+    }
+
+    /// A `Warning`/`FailedCreate` event such as the StatefulSet controller
+    /// emits when the API server refuses the pod.
+    fn failed_create_event(statefulset: &str, message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {"name": format!("{statefulset}.18e2e353f7540972"), "namespace": "feldera"},
+            "involvedObject": {
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "name": statefulset,
+                "namespace": "feldera",
+            },
+            "reason": "FailedCreate",
+            "type": "Warning",
+            "message": message,
+            "count": 14,
+        })
     }
 
     fn ready_pod() -> serde_json::Value {
@@ -3441,6 +3661,10 @@ mod tests {
             kubernetes_runner_storage_classes: Vec::new(),
             kubernetes_runner_storage_class: None,
             kubernetes_runner_tenant_namespaces: Vec::new(),
+            kubernetes_runner_tenant_quotas: Vec::new(),
+            kubernetes_runner_tenant_namespace_automation: false,
+            kubernetes_runner_manager_service_account: None,
+            kubernetes_runner_tenant_cluster_role: None,
         }
     }
 
@@ -3648,6 +3872,150 @@ mod tests {
             ),
             Ok(_) => panic!("a crash loop must fail provisioning"),
         }
+    }
+
+    /// A full tenant quota is reported at once, from the event the
+    /// StatefulSet controller emits, not after the provisioning timeout.
+    #[tokio::test]
+    async fn is_provisioned_fails_fast_when_the_tenant_quota_refused_the_pod() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        // The pod was never created, so `pod` stays `None`; the rejection is
+        // the StatefulSet's FailedCreate event.
+        cluster.events.lock().unwrap().push(failed_create_event(
+            "pipeline-00000000-0000-0000-0000-000000000000",
+            "pods \"pipeline-00000000-0000-0000-0000-000000000000-0\" is forbidden: \
+             exceeded quota: tenant-acme, requested: requests.cpu=4, \
+             used: requests.cpu=16, limited: requests.cpu=16",
+        ));
+
+        let error = runner
+            .is_provisioned(&json!({}))
+            .await
+            .expect_err("a full quota must fail provisioning");
+        let message = error.to_string();
+        assert!(
+            message.contains("no room for this pipeline"),
+            "unexpected error: {message}"
+        );
+        // The operator needs the quota's own numbers, not just a verdict.
+        assert!(
+            message.contains("requested: requests.cpu=4"),
+            "the quota message must survive: {message}"
+        );
+        assert!(
+            message.contains("raise the tenant's quota"),
+            "the error must say what to do: {message}"
+        );
+    }
+
+    /// A quota with a `requests.cpu` cap and a pod that does not declare one
+    /// is a different API server message — "failed quota: ... must specify" —
+    /// and it means the same thing to the operator: this namespace has no room.
+    ///
+    /// The chart's LimitRange normally fills the request in, so this shape
+    /// appears when an operator maps a tenant to a namespace they created
+    /// without one; it must not be reported as a generic StatefulSet failure.
+    #[tokio::test]
+    async fn a_quota_that_needs_a_request_the_pod_omits_is_also_a_quota_refusal() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        cluster.events.lock().unwrap().push(failed_create_event(
+            "pipeline-00000000-0000-0000-0000-000000000000",
+            "pods \"pipeline-0\" is forbidden: failed quota: tenant-acme: must specify \
+             requests.cpu for: pipeline",
+        ));
+
+        let error = runner
+            .is_provisioned(&json!({}))
+            .await
+            .expect_err("a failed quota must fail provisioning");
+        let message = error.to_string();
+        assert!(
+            message.contains("no room for this pipeline"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("raise the tenant's quota"),
+            "the error must still say what to do: {message}"
+        );
+    }
+
+    /// A FailedCreate that is not about a quota still fails provisioning, but
+    /// without the quota advice.
+    #[tokio::test]
+    async fn is_provisioned_reports_a_statefulset_failure_that_is_not_a_quota() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        cluster.events.lock().unwrap().push(failed_create_event(
+            "pipeline-00000000-0000-0000-0000-000000000000",
+            "create Pod pipeline-0 in StatefulSet pipeline failed error: the node has insufficient cpu",
+        ));
+
+        let error = runner
+            .is_provisioned(&json!({}))
+            .await
+            .expect_err("a failed create must fail provisioning");
+        let message = error.to_string();
+        assert!(
+            message.contains("insufficient cpu"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("raise the tenant's quota"),
+            "a non-quota failure must not mention quotas: {message}"
+        );
+    }
+
+    /// An event about some other pipeline does not fail this one: namespaces
+    /// are shared until a tenant gets its own, so every pipeline's events are
+    /// in the same list.
+    #[tokio::test]
+    async fn an_event_about_another_pipeline_does_not_fail_provisioning() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        cluster.events.lock().unwrap().push(failed_create_event(
+            "pipeline-11111111-1111-1111-1111-111111111111",
+            "pods is forbidden: exceeded quota: other-tenant",
+        ));
+
+        assert!(matches!(
+            runner.is_provisioned(&json!({})).await.unwrap(),
+            ProvisionStatus::Ongoing { .. }
+        ));
+    }
+
+    /// A Warning that is not a FailedCreate does not fail provisioning: a
+    /// pipeline that is merely restarting emits its own warnings.
+    #[tokio::test]
+    async fn a_warning_that_is_not_a_failed_create_does_not_fail_provisioning() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        let mut runner = fake_runner(&cluster);
+        let mut event = failed_create_event(
+            "pipeline-00000000-0000-0000-0000-000000000000",
+            "something else went wrong",
+        );
+        event["reason"] = json!("FailedScheduling");
+        cluster.events.lock().unwrap().push(event);
+
+        assert!(matches!(
+            runner.is_provisioned(&json!({})).await.unwrap(),
+            ProvisionStatus::Ongoing { .. }
+        ));
+    }
+
+    /// Being unable to read events is not a provisioning failure: it leaves the
+    /// deployment reporting progress, as it did before the check existed.
+    #[tokio::test]
+    async fn an_unreadable_event_list_does_not_fail_provisioning() {
+        let cluster = fake_api::FakeCluster::with_namespace();
+        *cluster.events_forbidden.lock().unwrap() = true;
+        let mut runner = fake_runner(&cluster);
+
+        assert!(matches!(
+            runner.is_provisioned(&json!({})).await.unwrap(),
+            ProvisionStatus::Ongoing { .. }
+        ));
     }
 
     #[tokio::test]

@@ -14,8 +14,16 @@
     * secrets         — create the pipeline's config.yaml secret and delete it
     * persistentvolumeclaims — create/read the storage claim and delete it
     * networkpolicies — restrict the pipeline port to the manager namespace
+    * events          — read the StatefulSet controller's FailedCreate event,
+                        which is the only place a quota-rejected pod is reported
 
-  No cluster-scoped access is granted. `can_provision` checks the namespace by
+  Tenants can be mapped to namespaces of their own (P1-022), and the objects
+  above then live there, so the same rules are also materialised inside every
+  tenant namespace through an `aggregate-to-feldera-pipeline-runner`
+  ClusterRole; see the tenant-namespaces block below.
+
+  No cluster-scoped access is granted, except the aggregate label that folds
+  this Role into that ClusterRole. `can_provision` checks the namespace by
   sending a dry-run Secret create into it, which the API server answers with
   404 when the namespace is missing — reading the Namespace object itself would
   need a ClusterRole.
@@ -26,6 +34,11 @@ metadata:
   name: {{ include "controlplane.fullname" . }}-runner
   labels:
     {{- include "controlplane.labels" . | nindent 4 }}
+    # No aggregate label here: the API server only aggregates *ClusterRoles*,
+    # so a namespaced Role carrying that label is silently ignored and the
+    # aggregated ClusterRole stays empty. The ClusterRole below carries the
+    # same rules and is what every namespace's RoleBinding points at; keep the
+    # two lists identical when adding a permission.
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -36,6 +49,9 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["services", "secrets", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -60,4 +76,117 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "controlplane.fullname" . }}
     namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.kubernetesRunner.enabled }}
+{{- /*
+  What a pipeline may do in the namespace it runs in, as a ClusterRole rather
+  than a namespaced Role: pipelines live in the release namespace by default
+  and in a tenant namespace once one is mapped (P1-022), and an aggregated
+  ClusterRole covers both without a copy per namespace.
+
+  The rules are written out rather than aggregated from the namespaced Role
+  above, because the API server aggregates only ClusterRoles: a namespaced Role
+  carrying the aggregate label is ignored, and the ClusterRole would stay empty
+  with every permission denied in every tenant namespace. The rules here are
+  therefore a copy of the Role's, and the chart test checks that the two lists
+  match so they cannot drift apart.
+
+  A cluster administrator who needs to grant a pipeline something else in a
+  tenant namespace labels their own ClusterRole with
+  `feldera.com/tenant-pipeline-runner: "true"`; the chart binds that role into
+  each tenant namespace too.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "controlplane.fullname" . }}-pipeline-runner
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "controlplane.fullname" . }}-tenant-pipeline-runner
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+aggregationRule:
+  clusterRoleSelectors:
+    # An operator who needs more than the platform grants can label their own
+    # ClusterRole with this key; it is folded in without editing this chart.
+    - matchLabels:
+        feldera.com/tenant-pipeline-runner: "true"
+rules: []
+{{- end }}
+{{- if .Values.kubernetesRunner.enabled }}
+{{- if and .Values.kubernetesRunner.tenantNamespaceAutomation (not .Values.kubernetesRunner.tenantQuotas) }}
+{{- fail "kubernetesRunner.tenantNamespaceAutomation needs kubernetesRunner.tenantQuotas: there is no tenant namespace to keep in step without one" }}
+{{- end }}
+{{- if .Values.kubernetesRunner.tenantNamespaceAutomation }}
+---
+{{- /*
+  P1-022: the one cluster-scoped grant the platform takes, and only when asked.
+
+  Creating a namespace is a cluster-scoped operation, so it cannot be a rule on
+  the namespaced runner Role above. This ClusterRole is kept to the three kinds
+  that make up a tenant namespace — the namespace itself, its ResourceQuota and
+  its LimitRange — so the grant does not reach any pipeline object in another
+  tenant's namespace.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "controlplane.fullname" . }}-tenant-namespaces
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  # The pipelines in a tenant namespace are created by the manager, so the
+  # manager's service account needs rights there; the binding it writes is
+  # scoped to that namespace and to these two aggregate ClusterRoles.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "controlplane.fullname" . }}-tenant-namespaces
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "controlplane.fullname" . }}-tenant-namespaces
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "controlplane.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

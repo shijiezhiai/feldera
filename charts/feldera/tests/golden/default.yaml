@@ -51,35 +51,6 @@ spec:
 ---
 # Source: feldera/charts/controlplane/templates/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: feldera-controlplane-runner
-  labels:
-    app.kubernetes.io/name: controlplane
-    app.kubernetes.io/instance: feldera
-    app.kubernetes.io/part-of: feldera
-rules:
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["pods/log"]
-    verbs: ["get"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get"]
-  - apiGroups: [""]
-    resources: ["services", "secrets", "persistentvolumeclaims"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["apps"]
-    resources: ["statefulsets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
----
-# Source: feldera/charts/controlplane/templates/rbac.yaml
-apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: feldera-controlplane-runner
@@ -95,6 +66,90 @@ subjects:
   - kind: ServiceAccount
     name: feldera-controlplane
     namespace: feldera
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: feldera-controlplane-pipeline-runner
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Source: feldera/charts/controlplane/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: feldera-controlplane-tenant-pipeline-runner
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+aggregationRule:
+  clusterRoleSelectors:
+    # An operator who needs more than the platform grants can label their own
+    # ClusterRole with this key; it is folded in without editing this chart.
+    - matchLabels:
+        feldera.com/tenant-pipeline-runner: "true"
+rules: []
+---
+# Source: feldera/charts/controlplane/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: feldera-controlplane-runner
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+    # No aggregate label here: the API server only aggregates *ClusterRoles*,
+    # so a namespaced Role carrying that label is silently ignored and the
+    # aggregated ClusterRole stays empty. The ClusterRole below carries the
+    # same rules and is what every namespace's RoleBinding points at; keep the
+    # two lists identical when adding a permission.
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 # Source: feldera/charts/compiler/templates/service.yaml
 apiVersion: v1
@@ -258,6 +313,13 @@ metadata:
 spec:
   serviceName: feldera-compiler
   replicas: 1
+  # Roll the pod when its template changes. A StatefulSet defaults to
+  # `OnDelete`, so `helm upgrade --set compiler.image.tag=...` leaves the pod
+  # running the previous image while the release reports the new one: the tag
+  # `helm get values` shows and the tag the pod actually runs disagree, and
+  # every later check reads the wrong version.
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: compiler
@@ -345,6 +407,11 @@ metadata:
 spec:
   serviceName: feldera-db
   replicas: 1
+  # See the compiler StatefulSet: `OnDelete` (the default) leaves the old pod
+  # running while Helm reports the new image, which is how a `postgres:16` pod
+  # survived an upgrade to `postgres:17` and kept failing to pull.
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: postgres

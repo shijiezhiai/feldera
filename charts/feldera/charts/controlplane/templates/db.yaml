@@ -8,6 +8,11 @@ metadata:
 spec:
   serviceName: {{ .Release.Name }}-db
   replicas: 1
+  # See the compiler StatefulSet: `OnDelete` (the default) leaves the old pod
+  # running while Helm reports the new image, which is how a `postgres:16` pod
+  # survived an upgrade to `postgres:17` and kept failing to pull.
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: postgres

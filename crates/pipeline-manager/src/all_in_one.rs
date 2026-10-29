@@ -38,11 +38,17 @@ pub fn augment_args(cli: Command) -> Command {
 /// background scan that reclaims cluster objects whose pipeline no longer
 /// exists. The local runner has no cluster to scan, and passing `None` keeps
 /// it from parsing Kubernetes arguments it does not use.
+///
+/// `tenant_namespace_config` is likewise `Some` only for the Kubernetes runner
+/// that carries tenant quotas: it lets the API server keep each tenant's
+/// namespace in step with the tenant. Without it a tenant namespace is never
+/// created, so the tenants that name one stay in the shared namespace.
 pub async fn run<E: PipelineExecutor + 'static>(
     matches: &ArgMatches,
     license_check: Arc<RwLock<Option<LicenseCheck>>>,
     runner_config: impl FnOnce(LocalRunnerConfig) -> E::Config,
     reaper_config: Option<KubernetesRunnerConfig>,
+    tenant_namespace_config: Option<KubernetesRunnerConfig>,
 ) -> anyhow::Result<()>
 where
     E::Config: Send + 'static,
@@ -230,7 +236,13 @@ where
     }
 
     // The api-server blocks forever
-    crate::api::main::run(db, common_config, api_config, license_check)
+    crate::api::main::run(
+        db,
+        common_config,
+        api_config,
+        license_check,
+        tenant_namespace_config,
+    )
         .await
         .expect("API server main failed");
     Ok(())

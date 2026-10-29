@@ -2492,6 +2492,7 @@ mod test {
                 manager_config,
                 db,
                 Arc::new(RwLock::new(None)),
+                None,
             )
             .await
             .unwrap(),

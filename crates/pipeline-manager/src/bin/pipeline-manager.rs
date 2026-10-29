@@ -40,8 +40,14 @@ fn main() -> anyhow::Result<()> {
             let license_check = Arc::new(RwLock::new(None));
             match runner_kind_from_env().map_err(anyhow::Error::msg)? {
                 RunnerKind::Local => {
-                    all_in_one::run::<LocalRunner>(&matches, license_check, |config| config, None)
-                        .await
+                    all_in_one::run::<LocalRunner>(
+                        &matches,
+                        license_check,
+                        |config| config,
+                        None,
+                        None,
+                    )
+                    .await
                 }
                 RunnerKind::Kubernetes => {
                     let config = KubernetesRunnerConfig::from_arg_matches(&matches)
@@ -57,11 +63,15 @@ fn main() -> anyhow::Result<()> {
                     // The reaper scans the same cluster the runner writes to,
                     // so it takes its own copy of the configuration.
                     let reaper_config = config.clone();
+                    // The API server creates and deletes tenant namespaces, so
+                    // it too needs the quota map.
+                    let tenant_namespace_config = config.clone();
                     all_in_one::run::<KubernetesRunner>(
                         &matches,
                         license_check,
                         move |_local| config,
                         Some(reaper_config),
+                        Some(tenant_namespace_config),
                     )
                     .await
                 }
