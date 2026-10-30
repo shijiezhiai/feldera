@@ -180,6 +180,22 @@ pipeline pod fail with `RunContainerError` before the container starts — a
 symptom that reads like a bug in secret handling. The script checks the tag
 before it touches the release and refuses to continue otherwise.
 
+Because rebuilding the runner used to mean rebuilding the manager as well, the
+registry once held a dozen `feldera-runner` tags that all resolved to one image,
+plus one that resolved to a manager. If a tag is in doubt, ask the image rather
+than the tag:
+
+```bash
+docker run --rm --entrypoint sh <image> -c 'test -x /usr/local/bin/pipeline-entrypoint'
+```
+
+`deploy/build-images.sh --prune-tags` applies that test to every tag in the
+`feldera-runner` repository and deletes the ones that fail it. It keeps
+`unsigned-demo`, a deliberately unsigned fixture that
+`deploy/security/selftest.sh` asserts the signature gate rejects. This needs a
+registry started with `REGISTRY_STORAGE_DELETE_ENABLED=true`; the script now
+passes that when it starts its own.
+
 1. Two Secrets are created, one on the allowlist and one not.
 2. A pipeline that names the unlisted one is started; the script waits for the
    provisioning error and asserts it names that Secret and mentions the
