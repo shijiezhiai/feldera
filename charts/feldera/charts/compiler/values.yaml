@@ -15,6 +15,15 @@ compileInThisPod: true
 # --compiler-host=<release>-compiler.<namespace>.svc.cluster.local.
 compilerPort: 8085
 
+# Identity and port of the API server pod, for the egress policy. The API server
+# is the `controlplane` chart's pod: it enqueues compilations here and fetches
+# the programs this pod publishes, so the policy has to admit it by name. These
+# are values rather than a `{{ .Chart.Name }}` reference because a subchart
+# cannot read its sibling's chart metadata, and the wrong name fails silently --
+# the rule matches nothing and the API server is dropped along with the internet.
+apiServerName: controlplane
+apiServerPort: 8080
+
 # Port the platform database listens on inside the cluster. The umbrella chart
 # sets the same value under `controlplane`; this copy exists because a subchart
 # cannot read its sibling's values.
@@ -32,12 +41,19 @@ parallelCompilation:
   enabled: false
   replicas: 1
 
-# P1-018: the compiler pod runs cargo, which fetches crates. The default policy
-# allows the database, DNS and the API server, and nothing else: a compilation
-# that needs another endpoint has it added to `egressAllow` deliberately rather
-# than a pod silently reaching the whole cluster and the internet.
+# P1-018/P1-026: the compiler pod runs cargo, which used to fetch crates. The
+# image now carries the registry and git caches, so a compilation needs no
+# network at all; this policy allows the database, DNS and the API server and
+# drops everything else, and P1-026 verified a pipeline still compiles with it
+# on. It defaults to on because the platform's requirement is that a compiler
+# cannot reach the internet (母文档 §5.2), and a control that is off by default
+# is one nobody turns on: the rule was never exercised before P1-026.
+#
+# An operator whose CNI does not implement NetworkPolicy, or whose compiler
+# needs an endpoint not listed here, turns it off or adds to `egressAllow`
+# deliberately -- both are visible in a values file, which silent egress is not.
 networkPolicy:
-  enabled: false
+  enabled: true
   # Restrict who may call the artifact endpoints as well. Off by default
   # because the kubelet probes arrive from the node; turning it on requires the
   # node CIDR in `egressAllow`-style rules to keep liveness checks working.

@@ -89,6 +89,51 @@ fi
 printf '%s\n' "$ha" | grep -q 'replicas: 2' || fail "the replica count did not reach the Deployment"
 info "replicaCount=2 renders the election env and an anti-affinity"
 
+step "the compiler egress policy admits the API server and nothing else"
+# P1-026: the policy is on by default, and its "API server" rule names the
+# `controlplane` chart's pod. It used to say `{{ .Chart.Name }}`, which inside
+# the compiler chart is `compiler` -- the pod itself. The rule matched nothing
+# and the API server was dropped along with the internet; nothing failed,
+# because compilation does not call back. A rendered selector is the only thing
+# that shows the mistake before a cluster does.
+egress="$(render)"
+printf '%s\n' "$egress" | grep -q 'kind: NetworkPolicy' \
+  || fail "the compiler egress policy is no longer rendered by default"
+
+# Extract only the NetworkPolicy document. Grepping the whole render for
+# `name: controlplane` would match the API server's own Deployment labels and
+# pass no matter what the policy says -- a vacuous assertion of exactly the kind
+# that let the original selector bug through. The policy is the last document
+# and starts at its `kind: NetworkPolicy` line.
+policy_doc="$(printf '%s\n' "$egress" | sed -n '/kind: NetworkPolicy/,/^---$/p')"
+[ -n "$policy_doc" ] || fail "could not extract the NetworkPolicy document"
+
+# The egress rules are the only place a podSelector for another chart appears.
+# A rule is a `- to:` block ending at the next `- to:` or the next key; the
+# selector and the port must appear in the same block, because a policy with
+# both values in different rules admits neither endpoint correctly.
+api_rule="$(printf '%s\n' "$policy_doc" | sed -n '/egress:/,$p' | awk '
+  /^    - to:/ { if (blk ~ /controlplane/ && blk ~ /port: 8080/) found=1; blk="" }
+  { blk = blk "\n" $0 }
+  END { if (blk ~ /controlplane/ && blk ~ /port: 8080/) found=1; exit(found ? 0 : 1) }')" \
+  || fail "the egress policy has no single rule selecting the API server (name: controlplane, port: 8080)"
+# And no rule may select this chart's own name except the compiler-to-compiler
+# one on the compiler port; a second one would mean the API server rule regressed
+# to `{{ .Chart.Name }}` again.
+api_rule_count=$(printf '%s\n' "$policy_doc" | grep -c 'app.kubernetes.io/name: controlplane' || true)
+[ "$api_rule_count" = "1" ] \
+  || fail "expected exactly one API server selector in the policy, found ${api_rule_count}"
+info "the policy selects controlplane:8080"
+
+# The policy has to be switchable off: a CNI without NetworkPolicy support, or a
+# compiler that needs an endpoint the list does not carry, otherwise has no way
+# to run.
+no_policy="$(render --set compiler.networkPolicy.enabled=false)"
+if printf '%s\n' "$no_policy" | grep -q 'kind: NetworkPolicy'; then
+  fail "compiler.networkPolicy.enabled=false still rendered a policy"
+fi
+info "the policy can be turned off"
+
 step "the storage class policy reaches the manager's flags"
 policy="$(render \
   --set controlplane.kubernetesRunner.enableStorageClassNamesSupported=true \
