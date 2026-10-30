@@ -814,7 +814,7 @@ async fn add_cache_headers(
 /// rather than a hand-rolled stand-in. The caller chains `.app_data(...)` for
 /// `ServerState` and the awc client; tests that don't need handler success
 /// can skip those.
-fn build_app(
+pub(crate) fn build_app(
     api_config: &ApiServerConfig,
     auth_configuration: &Option<crate::auth::AuthConfiguration>,
 ) -> App<
@@ -860,11 +860,16 @@ fn build_app(
             // `Authorization` header on a WebSocket handshake, so promote a
             // token carried in a `feldera-bearer.*` subprotocol to that header
             // first), then auth (installs the principal), then the RBAC check
-            // (reads it), then the handler.
+            // (reads it), then the handler. The audit guard is outermost of the
+            // three because it must also see the 401 that authentication itself
+            // produces; see `rbac_authentication_guard`.
             app.app_data(auth_configuration.clone()).service(
                 api_scope(&base_path)
                     .wrap(middleware::from_fn(crate::api::rbac::rbac_middleware))
                     .wrap(auth_middleware)
+                    .wrap(middleware::from_fn(
+                        crate::api::rbac::rbac_authentication_guard,
+                    ))
                     .wrap(middleware::from_fn(
                         crate::auth::promote_websocket_subprotocol_auth,
                     ))
@@ -1148,9 +1153,7 @@ async fn tenant_namespaces(
                 .map(|tenant| (tenant.name, tenant.id.0))
                 .collect::<std::collections::HashMap<_, _>>(),
             Err(error) => {
-                error!(
-                    "Tenant namespace automation disabled: unable to list tenants: {error}"
-                );
+                error!("Tenant namespace automation disabled: unable to list tenants: {error}");
                 return None;
             }
         }

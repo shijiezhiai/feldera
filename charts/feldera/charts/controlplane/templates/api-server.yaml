@@ -122,6 +122,17 @@ spec:
                   name: {{ .Release.Name }}-db-insecure-secret
                   key: .password
             {{- end }}
+            {{- if .Values.logJson }}
+            {{- /* P1-027. Structured JSON logs, the format the log platform
+                   ingests. The audit trail (api/audit.rs) is emitted as events
+                   on this stream, so a deployment that leaves this off has no
+                   audit trail to query -- the events are written, but as
+                   formatted text a log platform cannot filter by principal.
+                   The key existed in values.yaml since P1-005 without a
+                   template reading it, so setting it did nothing. */}}
+            - name: FELDERA_LOG_JSON
+              value: "1"
+            {{- end }}
             {{- if .Values.httpsSecretRef }}
             - name: FELDERA_ENABLE_HTTPS
               value: "true"
