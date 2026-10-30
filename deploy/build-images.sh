@@ -72,7 +72,11 @@ ensure_registry() {
   if ! docker image inspect registry:2 >/dev/null 2>&1; then
     docker pull registry:2
   fi
-  docker run -d --name "${REGISTRY_CONTAINER}" -p "${REGISTRY_PORT}:5000" --restart=always registry:2
+  # REGISTRY_STORAGE_DELETE_ENABLED lets `--prune-tags` remove a tag. Without it
+  # the registry answers 405 and the only way to drop a bad tag is to wipe the
+  # volume, which would also drop the images that are still referenced.
+  docker run -d --name "${REGISTRY_CONTAINER}" -p "${REGISTRY_PORT}:5000" --restart=always \
+    -e REGISTRY_STORAGE_DELETE_ENABLED=true registry:2
   for _ in $(seq 1 30); do
     if curl -fsS "http://${REGISTRY}/v2/_catalog" >/dev/null 2>&1; then
       return 0
@@ -90,6 +94,65 @@ next_n() {
     n=$((n + 1))
   done
   echo "${n}"
+}
+
+# 删掉不属于本 Dockerfile 产物的 tag。
+#
+# 迭代期为了省一次 manager 全量编译，runner 镜像曾被反复 retag 旁边的镜像凑
+# 数，于是仓库里攒下一批指向 manager 镜像的 feldera-runner tag。它们看起来像
+# runner，实际没有 pipeline-entrypoint，选错之后的表现是每个 pipeline pod
+# RunContainerError——排查方向完全相反。
+#
+# 判定依据是镜像里有没有 entrypoint，不看 tag 名字：名字是人起的，镜像内容是
+# 事实。故意不是真产物的测试样本（deploy/security 的 unsigned-demo）由 KEEP
+# 保住。
+prune_mislabeled() {
+  local repo="$1"; shift
+  local keep=("$@")
+  local failed=0 tag digest
+  echo "=== pruning ${repo} of images that are not ${repo} artifacts"
+  for tag in $(curl -fsS "http://${REGISTRY}/v2/${repo}/tags/list" \
+      | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["tags"]))'); do
+    case " ${keep[*]-} " in *" ${tag} "*) echo "  keep    ${tag}: protected by KEEP"; continue ;; esac
+    case "${tag}" in
+      *.sig) echo "  keep    ${tag}: a signature, removed with its tag"; continue ;;
+    esac
+    # A tag whose manifest is still being read is not ours to delete.
+    digest="$(curl -fsSI -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+      "http://${REGISTRY}/v2/${repo}/manifests/${tag}" 2>/dev/null \
+      | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}')"
+    if [ -z "${digest}" ]; then
+      echo "  skip    ${tag}: no manifest digest"; continue
+    fi
+    # Pull the image and look for the artifact its repository promises.
+    if ! docker image inspect "${REGISTRY}/${repo}:${tag}" >/dev/null 2>&1; then
+      docker pull -q "${REGISTRY}/${repo}:${tag}" >/dev/null 2>&1 || {
+        echo "  skip    ${tag}: cannot pull to inspect"; continue; }
+    fi
+    local is_artifact=1
+    case "${repo}" in
+      feldera-runner)
+        docker run --rm --entrypoint sh "${REGISTRY}/${repo}:${tag}" \
+          -c 'test -x /usr/local/bin/pipeline-entrypoint' >/dev/null 2>&1 && is_artifact=0 ;;
+      feldera-manager)
+        docker run --rm --entrypoint sh "${REGISTRY}/${repo}:${tag}" \
+          -c 'test -x /usr/local/bin/pipeline-manager || test -x /app/pipeline-manager' >/dev/null 2>&1 && is_artifact=0 ;;
+      *)
+        is_artifact=0 ;;
+    esac
+    if [ "${is_artifact}" -eq 0 ]; then
+      echo "  keep    ${tag}: is a ${repo} image"
+      continue
+    fi
+    if curl -fsS -o /dev/null -X DELETE \
+        "http://${REGISTRY}/v2/${repo}/manifests/${digest}"; then
+      echo "  DELETE  ${tag}: no artifact for this repository (${digest})"
+    else
+      echo "  FAILED  ${tag}: the registry refused the delete (does it run with REGISTRY_STORAGE_DELETE_ENABLED=true?)" >&2
+      failed=1
+    fi
+  done
+  return "${failed}"
 }
 
 # P1-012：签名与 CVE 门禁都只对已推送的镜像有意义（cosign 把签名作为
@@ -213,6 +276,20 @@ prepare_registry() {
   # first push, not inside finish_image, or ONLY=compiler fails on a cold host.
   if [[ "${PUSH}" == "1" ]]; then ensure_registry; fi
 }
+
+# 维护入口：只做清理，不构建。
+case "${1:-}" in
+  --prune-tags)
+    shift
+    ensure_registry
+    rc=0
+    # unsigned-demo is a security fixture: deploy/security/selftest.sh asserts
+    # the signature gate rejects it, so it must stay pullable. Extra names can
+    # be passed on the command line.
+    prune_mislabeled feldera-runner unsigned-demo "${@:-}" || rc=1
+    exit "${rc}"
+    ;;
+esac
 
 prepare_registry
 case "${ONLY:-}" in
