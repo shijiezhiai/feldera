@@ -99,7 +99,7 @@ gantt
 | P1-024 | OIDC group→role 映射：映射表配置面（fda + console 管理页）+ `oidc/trust_name.rs` 基础上的 trusted-identity 配置 | 5 | 021 | 组变更下一 token 生效；viewer/read/write/admin 四级抽查 |
 | P1-025 | 连接器 secret 引用注入：pipeline 配置只允许 K8s Secret 引用（对齐官方 secret-references 特性），`kubernetesRunner.connectorKubernetesSecrets.allowlist` 白名单语义；密钥不落 PG 明文 | 5 | 009,022 | 白名单外引用被 422；PG 元数据 grep 不到密钥值 |
 | P1-026 | crates 内网 mirror 接入（基础版）：sparse 代理或 vendor；sccache 共享缓存延到 P2（母文档 §5.2） | 2 | 018 | 编译 Pod 无公网 egress 也能编译成功 |
-| P1-027 | 控制面审计日志：manager 访问日志（principal、route、角色判定结果）接公司日志平台（json-logging，`docs/operations/json-logging.md`） | 3 | 015 | 审计查询可按 principal 回放一次操作序列 |
+| P1-027 | 控制面审计日志：manager 访问日志（principal、route、角色判定结果）接公司日志平台（json-logging，`docs/operations/json-logging.md`）——**实测补充**：审计不在访问日志里另起一行，而是 `feldera_audit` 独立 target；`controlplane.logJson` 此前是无人读取的占位键；无凭据请求被 actix 提取器在 RBAC 之前拒掉，需外层 guard 补记 | 3 | 015 | 审计查询可按 principal 回放一次操作序列（e2e 见 `scripts/e2e-k8s-audit.sh`，Keycloak 夹具 `scripts/keycloak-fixture.sh`） |
 
 ## 6. S5（M4 上）：试点接入 + 混沌（5 张）
 
