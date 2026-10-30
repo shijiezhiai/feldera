@@ -51,22 +51,6 @@ spec:
 ---
 # Source: feldera/charts/controlplane/templates/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: feldera-controlplane-runner
-  labels:
-    app.kubernetes.io/name: controlplane
-    app.kubernetes.io/instance: feldera
-    app.kubernetes.io/part-of: feldera
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: feldera-controlplane-runner
-subjects:
-  - kind: ServiceAccount
-    name: feldera-controlplane
-    namespace: feldera
-apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: feldera-controlplane-pipeline-runner
@@ -150,6 +134,24 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Source: feldera/charts/controlplane/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: feldera-controlplane-runner
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: feldera-controlplane-runner
+subjects:
+  - kind: ServiceAccount
+    name: feldera-controlplane
+    namespace: feldera
 ---
 # Source: feldera/charts/compiler/templates/service.yaml
 apiVersion: v1

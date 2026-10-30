@@ -93,6 +93,15 @@ spec:
             - name: FELDERA_KUBERNETES_RUNNER_TENANT_NAMESPACE_AUTOMATION
               value: "true"
             {{- end }}
+            {{- if .Values.kubernetesRunner.connectorKubernetesSecrets.enableAllowlist }}
+            {{- /* P1-025. Always set when the switch is on, even with an empty
+                   list: the manager treats an absent list as "nothing is
+                   allowed" and an empty one the same way, so setting it makes
+                   the intent visible in `kubectl describe` rather than leaving
+                   an operator to wonder which default applied. */}}
+            - name: FELDERA_KUBERNETES_RUNNER_CONNECTOR_KUBERNETES_SECRETS_ALLOWLIST
+              value: {{ join ";" .Values.kubernetesRunner.connectorKubernetesSecrets.allowlist | quote }}
+            {{- end }}
             {{- if gt (int .Values.replicaCount) 1 }}
             # Above one replica, elect exactly one instance to reconcile
             # pipelines. Without this every replica would provision, start and

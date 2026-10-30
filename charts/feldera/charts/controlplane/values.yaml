@@ -112,6 +112,23 @@ kubernetesRunner:
   # limit ranges. Off, every namespace in tenantQuotas must exist already and
   # deleting a tenant leaves its namespace behind.
   tenantNamespaceAutomation: false
+  # P1-025: which Kubernetes Secrets a pipeline configuration may reference
+  # through `${secret:kubernetes:<name>/<key>}`.
+  #
+  # Off by default, and off means *no* connector may reference a Secret at all.
+  # The permissive reading — "off means no enforcement" — is the one that leaks:
+  # a pipeline's configuration is writable by anyone who can change a pipeline
+  # in that tenant, and a reference resolves to whatever the pipeline pod may
+  # read, so an unenforced list turns any tenant member into a reader of every
+  # Secret in the namespace.
+  #
+  # The list names Secrets, not (Secret, key) pairs: a reference may use any key
+  # of a listed Secret, and only the keys the configuration actually uses are
+  # projected into the pod. Keep unrelated credentials in separate Secrets.
+  #
+  #   connectorKubernetesSecrets:
+  #     enableAllowlist: true
+  #     allowlist: ["kafka-creds", "s3-credentials"]
   connectorKubernetesSecrets:
     enableAllowlist: false
     allowlist: []

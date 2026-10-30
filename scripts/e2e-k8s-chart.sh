@@ -138,6 +138,22 @@ printf '%s\n' "$automated" | grep -q 'resources: \["namespaces"\]' \
   || fail "the ClusterRole does not grant namespaces"
 info "automation on renders the ClusterRole, and off does not"
 
+step "the connector Secret allowlist reaches the manager"
+# Off is the default and must render nothing at all: an environment variable
+# the manager reads as "nothing allowed" and one it reads as "no restriction"
+# look the same in a diff, so absence is what the test asserts.
+if render | grep -q 'CONNECTOR_KUBERNETES_SECRETS_ALLOWLIST'; then
+  fail "the Secret allowlist reached the manager without being asked for"
+fi
+allowlisted="$(render \
+  --set controlplane.kubernetesRunner.connectorKubernetesSecrets.enableAllowlist=true \
+  --set 'controlplane.kubernetesRunner.connectorKubernetesSecrets.allowlist={kafka-creds,s3-credentials}')"
+entry="$(printf '%s\n' "$allowlisted" \
+  | grep -A 1 'CONNECTOR_KUBERNETES_SECRETS_ALLOWLIST' | tail -1)"
+printf '%s\n' "$entry" | grep -q '"kafka-creds;s3-credentials"' \
+  || fail "the allowlist did not arrive as one ';'-joined value: $entry"
+info "the allowlist arrives joined with ';'"
+
 step "the runner Role and its ClusterRole twin match"
 # The runner Role and its ClusterRole twin must grant the same thing. The API
 # server aggregates only ClusterRoles, so the namespaced Role cannot be the
@@ -182,6 +198,11 @@ rejects "a tenant mapped to an empty namespace" --set-string \
 rejects "an anti-affinity mode the chart does not have" \
   --set controlplane.apiServerAntiAffinity=sometimes
 
+rejects "a Secret allowlist while the allowlist switch is off" \
+  --set 'controlplane.kubernetesRunner.connectorKubernetesSecrets.allowlist={kafka-creds}'
+rejects "a Secret name the cluster would refuse" \
+  --set controlplane.kubernetesRunner.connectorKubernetesSecrets.enableAllowlist=true \
+  --set 'controlplane.kubernetesRunner.connectorKubernetesSecrets.allowlist={Kafka_Creds}'
 rejects "namespace automation without a tenant quota to keep in step" \
   --set controlplane.kubernetesRunner.tenantNamespaceAutomation=true
 

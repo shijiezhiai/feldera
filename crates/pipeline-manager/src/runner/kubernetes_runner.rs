@@ -64,7 +64,7 @@ use futures_util::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource, Event,
-    ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    KeyToPath, ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, PodTemplateSpec,
     ResourceRequirements, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Volume,
     VolumeMount, VolumeResourceRequirements,
@@ -78,7 +78,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
 use kube::api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -105,6 +105,16 @@ const PIPELINE_PORT: u16 = 8080;
 
 /// Directory the pipeline's `config.yaml` is mounted into.
 const CONFIG_MOUNT_DIR: &str = "/var/feldera/config";
+
+/// Directory the pipeline's secret references are mounted into.
+///
+/// `secret_resolver` looks for `${secret:kubernetes:<name>/<key>}` under
+/// `<secrets dir>/kubernetes/<name>/<key>` with the default secrets directory
+/// being `/etc/feldera-secrets` (`feldera-types/src/secret_resolver.rs:76,185`).
+/// Mounting a Secret named `n` with `items` key `k` at
+/// `/etc/feldera-secrets/kubernetes/n` therefore makes `k` appear as the file
+/// the resolver reads, with no change to the resolver itself.
+const SECRETS_MOUNT_DIR: &str = "/etc/feldera-secrets";
 
 /// Writable working directory for the program binary and the port file.
 const WORK_DIR: &str = "/var/feldera/work";
@@ -604,6 +614,47 @@ struct RenderInput {
     /// `Some` adds the metrics Service and widens the `NetworkPolicy` to
     /// admit that namespace; see `--kubernetes-runner-metrics-service`.
     metrics_namespace: Option<String>,
+    /// Kubernetes Secrets the configuration references, already checked
+    /// against the allowlist. See [`connector_secrets`].
+    secrets: Vec<RenderedSecret>,
+}
+
+/// One Kubernetes `Secret` a pipeline configuration references.
+///
+/// Carries only the names: the values are never read by the manager, so they
+/// cannot leak into the pipeline's stored configuration, the logs, or the
+/// database. Kubernetes mounts the Secret into the pod and the resolver reads
+/// the files at start-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedSecret {
+    name: String,
+    /// Keys of this Secret the configuration uses, sorted and deduplicated.
+    keys: Vec<String>,
+}
+
+impl RenderedSecret {
+    /// Volume name for this Secret.
+    ///
+    /// A volume name must be a DNS label and no longer than 63 characters,
+    /// which a 253-character Secret name can exceed, so the name is sanitized
+    /// rather than reused. Truncation plus a hash keeps two long names from
+    /// colliding into one volume.
+    fn mount_name(&self) -> String {
+        let sanitized: String = self
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        if sanitized.len() <= 40 {
+            sanitized
+        } else {
+            let hash = self
+                .name
+                .bytes()
+                .fold(0u64, |acc, byte| acc.wrapping_mul(31).wrapping_add(u64::from(byte)));
+            format!("{}-{hash:016x}", &sanitized[..40])
+        }
+    }
 }
 
 /// The objects provisioning creates for one pipeline deployment.
@@ -853,6 +904,39 @@ impl RenderInput {
             });
         }
 
+        // One volume per referenced Secret, mounted where `secret_resolver`
+        // expects to find it. `items` names only the keys the configuration
+        // actually uses, so a Secret holding other credentials does not expose
+        // them to the pod's filesystem: the file the resolver reads is the
+        // projection, not the whole Secret.
+        for secret in &self.secrets {
+            volumes.push(Volume {
+                name: format!("secret-{}", secret.mount_name()),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(secret.name.clone()),
+                    items: Some(
+                        secret
+                            .keys
+                            .iter()
+                            .map(|key| KeyToPath {
+                                key: key.clone(),
+                                path: key.clone(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            volume_mounts.push(VolumeMount {
+                name: format!("secret-{}", secret.mount_name()),
+                mount_path: format!("{SECRETS_MOUNT_DIR}/kubernetes/{}", secret.name),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
+
         let container = Container {
             name: "pipeline".to_string(),
             image: Some(self.image.clone()),
@@ -989,6 +1073,89 @@ fn platform_env(config: &PipelineConfig) -> Vec<EnvVar> {
         ..Default::default()
     }));
     env
+}
+
+/// The Kubernetes Secrets a configuration references, checked against the
+/// allowlist.
+///
+/// Two references are refused and one is honoured:
+///
+/// * `${secret:kubernetes:<name>/<key>}` is honoured when `<name>` is on the
+///   allowlist, and refused when it is not. A reference outside the list is a
+///   configuration mistake the author can fix, so the error names the Secret
+///   and the list rather than failing later inside the pod.
+/// * `${secret:kubernetes:<name>/<key>}` is also refused when `<name>` is not a
+///   valid Secret name. The resolver would build a path from it, so an invalid
+///   name (or one containing `..`) has to stop here.
+/// * `${env:NAME}` is left alone: it never reaches the filesystem.
+///
+/// The keys are returned with their Secret so the StatefulSet can project
+/// exactly those keys: mounting the whole Secret would put every key in it in
+/// the pod's filesystem, which is more than the configuration asked for.
+fn connector_secrets(
+    config: &PipelineConfig,
+    allowlist: &[String],
+) -> Result<Vec<RenderedSecret>, RunnerError> {
+    use feldera_types::secret_resolver::discover_secret_references_in_connector_config;
+    use feldera_types::secret_ref::{SecretRef, validate_kubernetes_secret_name};
+
+    // (Secret name, key) pairs, collected from every input and output.
+    let mut references: BTreeSet<(String, String)> = BTreeSet::new();
+    let connector_configs = config
+        .inputs
+        .values()
+        .map(|input| &input.connector_config)
+        .chain(config.outputs.values().map(|output| &output.connector_config));
+    for connector_config in connector_configs {
+        let as_json = serde_json::to_value(connector_config).map_err(|error| {
+            RunnerError::RunnerProvisionError {
+                error: format!("unable to inspect connector configuration for secret references: {error}"),
+            }
+        })?;
+        let discovered = discover_secret_references_in_connector_config(&as_json).map_err(
+            |error| RunnerError::RunnerProvisionError {
+                error: format!("unable to parse a secret reference: {error}"),
+            },
+        )?;
+        for secret_ref in discovered {
+            if let SecretRef::Kubernetes { name, data_key } = secret_ref {
+                references.insert((name, data_key));
+            }
+        }
+    }
+
+    let mut secrets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, data_key) in references {
+        if let Err(error) = validate_kubernetes_secret_name(&name) {
+            return Err(RunnerError::RunnerProvisionError {
+                error: format!(
+                    "the pipeline configuration references the Kubernetes Secret '{name}', \
+                     which is not a valid Secret name: {error}"
+                ),
+            });
+        }
+        if !allowlist.iter().any(|allowed| allowed == &name) {
+            return Err(RunnerError::RunnerProvisionError {
+                error: format!(
+                    "the pipeline configuration references the Kubernetes Secret '{name}', \
+                     which is not on the allowlist: {}",
+                    if allowlist.is_empty() {
+                        "no Secret is allowed (set \
+                         --kubernetes-runner-connector-kubernetes-secrets-allowlist)"
+                            .to_string()
+                    } else {
+                        allowlist.join(", ")
+                    }
+                ),
+            });
+        }
+        secrets.entry(name).or_default().push(data_key);
+    }
+
+    Ok(secrets
+        .into_iter()
+        .map(|(name, keys)| RenderedSecret { name, keys })
+        .collect())
 }
 
 /// Whether a Kubernetes error is a 404.
@@ -1323,7 +1490,14 @@ impl KubernetesRunner {
         args: Vec<String>,
         mut env: Vec<EnvVar>,
         binary_url: Option<&str>,
-    ) -> RenderInput {
+    ) -> Result<RenderInput, RunnerError> {
+        // Checked before anything is created: an unlisted Secret reference is
+        // a configuration mistake, and discovering it after the objects exist
+        // would leave a half-provisioned deployment behind.
+        let secrets = connector_secrets(
+            config,
+            &self.config.kubernetes_runner_connector_kubernetes_secrets_allowlist,
+        )?;
         if let Some(binary_url) = binary_url {
             env.push(EnvVar {
                 name: "FELDERA_PROGRAM_BINARY_URL".to_string(),
@@ -1339,7 +1513,7 @@ impl KubernetesRunner {
                 size_mb: self.limits.storage_for(config),
                 storage_class: self.storage_class.clone(),
             });
-        RenderInput {
+        Ok(RenderInput {
             pipeline_id: self.pipeline_id,
             deployment_id,
             namespace: namespace.to_string(),
@@ -1365,7 +1539,8 @@ impl KubernetesRunner {
                     .clone()
                     .unwrap_or_else(|| namespace.to_string())
             }),
-        }
+            secrets,
+        })
     }
 
     /// Creates or updates one object.
@@ -1781,16 +1956,18 @@ impl PipelineExecutor for KubernetesRunner {
 
         let args = program_args(*deployment_id, deployment_initial, bootstrap_config);
         let env = platform_env(&config);
-        let input = self.render(
-            *deployment_id,
-            &namespace,
-            image.clone(),
-            &config,
-            config_yaml,
-            args,
-            env,
-            Some(program_binary_url),
-        );
+        let input = self
+            .render(
+                *deployment_id,
+                &namespace,
+                image.clone(),
+                &config,
+                config_yaml,
+                args,
+                env,
+                Some(program_binary_url),
+            )
+            .map_err(ManagerError::from)?;
         let objects = input.render();
 
         // Resolve the template before the first object is applied: a broken or
@@ -2281,6 +2458,7 @@ mod tests {
             service_account: config.global.resources.service_account_name.clone(),
             manager_namespace: "feldera".to_string(),
             metrics_namespace: None,
+            secrets: Vec::new(),
         }
     }
 
@@ -3115,7 +3293,8 @@ mod tests {
             Vec::new(),
             Vec::new(),
             None,
-        );
+        )
+        .expect("rendering a configuration without secret references succeeds");
         assert_eq!(
             input
                 .render()
@@ -3665,6 +3844,7 @@ mod tests {
             kubernetes_runner_tenant_namespace_automation: false,
             kubernetes_runner_manager_service_account: None,
             kubernetes_runner_tenant_cluster_role: None,
+            kubernetes_runner_connector_kubernetes_secrets_allowlist: Vec::new(),
         }
     }
 
@@ -4228,5 +4408,190 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// A pipeline configuration whose only connector is a Kafka input carrying
+    /// `options` verbatim, which is where a secret reference in a transport
+    /// configuration lives.
+    fn pipeline_config_with_kafka_options(kafka_options: &[(&str, &str)]) -> PipelineConfig {
+        use feldera_types::config::{ConnectorConfig, InputEndpointConfig};
+        use feldera_types::transport::kafka::KafkaInputConfig;
+        let mut config = pipeline_config(ResourceConfig::default(), &[]);
+        config.inputs.insert(
+            std::borrow::Cow::Borrowed("orders"),
+            InputEndpointConfig {
+                stream: std::borrow::Cow::Borrowed("orders"),
+                connector_config: ConnectorConfig::new(
+                    feldera_types::config::TransportConfig::KafkaInput(KafkaInputConfig::default(
+                        kafka_options
+                            .iter()
+                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                            .collect(),
+                        "orders",
+                    )),
+                    None,
+                ),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn a_listed_secret_becomes_a_volume_mounted_where_the_resolver_looks() {
+        let config = pipeline_config_with_kafka_options(&[
+            ("sasl.username", "${secret:kubernetes:kafka-creds/username}"),
+            ("sasl.password", "${secret:kubernetes:kafka-creds/password}"),
+        ]);
+
+        let secrets = connector_secrets(&config, &["kafka-creds".to_string()]).unwrap();
+
+        // One volume per Secret, not per key, and only the keys the
+        // configuration uses are projected.
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "kafka-creds");
+        assert_eq!(secrets[0].keys, vec!["password", "username"]);
+
+        let input = RenderInput {
+            secrets: secrets.clone(),
+            ..render_input(&config)
+        };
+        let statefulset = input.render_statefulset();
+        let pod = statefulset.spec.unwrap().template.spec.unwrap();
+
+        let volume = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|volume| volume.name == format!("secret-{}", secrets[0].mount_name()))
+            .expect("the referenced Secret has a volume");
+        let source = volume.secret.as_ref().unwrap();
+        assert_eq!(source.secret_name.as_deref(), Some("kafka-creds"));
+        assert_eq!(
+            source
+                .items
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|item| (item.key.as_str(), item.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("password", "password"), ("username", "username")]
+        );
+
+        // The mount path is the layout `secret_resolver` reads:
+        // `<secrets dir>/kubernetes/<name>/<key>`.
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.name == format!("secret-{}", secrets[0].mount_name()))
+            .expect("the volume is mounted");
+        assert_eq!(mount.mount_path, "/etc/feldera-secrets/kubernetes/kafka-creds");
+        assert_eq!(mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn an_unlisted_secret_is_refused_before_anything_is_created() {
+        let config = pipeline_config_with_kafka_options(&[(
+            "sasl.password",
+            "${secret:kubernetes:kafka-creds/password}",
+        )]);
+
+        // Empty allowlist: no configuration may name a Secret at all.
+        let error = connector_secrets(&config, &[]).expect_err("an empty allowlist refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("not on the allowlist: no Secret is allowed"),
+            "unexpected error: {error}"
+        );
+
+        // A different Secret does not authorise this one.
+        let error = connector_secrets(&config, &["other-creds".to_string()])
+            .expect_err("a different Secret does not authorise this one");
+        assert!(
+            error.to_string().contains("not on the allowlist: other-creds"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_secret_reference_in_the_output_configuration_is_checked_too() {
+        use feldera_types::config::{ConnectorConfig, OutputEndpointConfig};
+        use feldera_types::config::TransportConfig;
+        let mut config = pipeline_config(ResourceConfig::default(), &[]);
+        config.outputs.insert(
+            std::borrow::Cow::Borrowed("sink"),
+            OutputEndpointConfig {
+                stream: std::borrow::Cow::Borrowed("sink"),
+                connector_config: ConnectorConfig::new(
+                    feldera_types::config::TransportConfig::HttpOutput(
+                        feldera_types::transport::http::HttpOutputConfig::default(),
+                    ),
+                    None,
+                ),
+            },
+        );
+        // An output without references passes with an empty list; the point of
+        // this test is that outputs are inspected at all, so plant the
+        // reference in a place the input scan would never look.
+        assert!(connector_secrets(&config, &[]).unwrap().is_empty());
+
+        // `KafkaOutputConfig` needs a topic and broker; build it through JSON so
+        // the test states the reference, not the struct shape.
+        let json = serde_json::json!({
+            "sink": {
+                "stream": "sink",
+                "transport": {
+                    "name": "kafka_output",
+                    "config": {
+                        "topic": "sink",
+                        "bootstrap.servers": "localhost:9092",
+                        "sasl.password": "${secret:kubernetes:kafka-creds/password}"
+                    }
+                },
+                "format": null
+            }
+        });
+        let outputs: BTreeMap<
+            std::borrow::Cow<'static, str>,
+            feldera_types::config::OutputEndpointConfig,
+        > = serde_json::from_value(json).expect("the test configuration parses");
+        let mut config = config;
+        config.outputs = outputs;
+        let error = connector_secrets(&config, &[]).expect_err("an output reference is checked");
+        assert!(
+            error.to_string().contains("no Secret is allowed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_environment_reference_is_left_alone() {
+        let config = pipeline_config_with_kafka_options(&[
+            ("sasl.username", "${env:KAFKA_USERNAME}"),
+            ("sasl.password", "${env:KAFKA_PASSWORD}"),
+        ]);
+
+        let secrets = connector_secrets(&config, &[]).expect("env references need no allowlist");
+        assert!(secrets.is_empty());
+    }
+
+    /// Two Secret names that sanitize to the same prefix must not share a
+    /// volume, or one would shadow the other's files.
+    #[test]
+    fn long_secret_names_do_not_collide_as_volume_names() {
+        let first = RenderedSecret {
+            name: format!("{}-a", "x".repeat(60)),
+            keys: vec!["k".to_string()],
+        };
+        let second = RenderedSecret {
+            name: format!("{}-b", "x".repeat(60)),
+            keys: vec!["k".to_string()],
+        };
+        assert_ne!(first.mount_name(), second.mount_name());
+        assert!(first.mount_name().len() <= 63);
+        assert!(second.mount_name().len() <= 63);
     }
 }

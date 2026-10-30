@@ -78,6 +78,7 @@ subjects:
     namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- if .Values.kubernetesRunner.enabled }}
+---
 {{- /*
   What a pipeline may do in the namespace it runs in, as a ClusterRole rather
   than a namespaced Role: pipelines live in the release namespace by default
