@@ -67,24 +67,13 @@ ensure_registry() {
       return 1
       ;;
   esac
-  echo "--- 本地 registry 未就绪，启动 ${REGISTRY_CONTAINER} (registry:2, host port ${REGISTRY_PORT})"
-  docker rm -f "${REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
-  if ! docker image inspect registry:2 >/dev/null 2>&1; then
-    docker pull registry:2
-  fi
-  # REGISTRY_STORAGE_DELETE_ENABLED lets `--prune-tags` remove a tag. Without it
-  # the registry answers 405 and the only way to drop a bad tag is to wipe the
-  # volume, which would also drop the images that are still referenced.
-  docker run -d --name "${REGISTRY_CONTAINER}" -p "${REGISTRY_PORT}:5000" --restart=always \
-    -e REGISTRY_STORAGE_DELETE_ENABLED=true registry:2
-  for _ in $(seq 1 30); do
-    if curl -fsS "http://${REGISTRY}/v2/_catalog" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  echo "ERROR: 本地 registry 30s 内未就绪" >&2
-  return 1
+  # deploy/registry.sh owns the container: it attaches a named volume, so
+  # replacing the container no longer takes the pushed images with it. The
+  # inline `docker run` this replaces had no volume, and everything it held was
+  # discarded the first time the container was recreated.
+  echo "--- 本地 registry 未就绪，由 deploy/registry.sh 拉起 ${REGISTRY_CONTAINER} (host port ${REGISTRY_PORT})"
+  REGISTRY_CONTAINER="${REGISTRY_CONTAINER}" REGISTRY_PORT="${REGISTRY_PORT}" \
+    "${REPO_ROOT}/deploy/registry.sh" >/dev/null
 }
 
 # 已有同名镜像（本地）则 N 递增

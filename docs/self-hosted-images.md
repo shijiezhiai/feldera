@@ -41,10 +41,40 @@ BILI_CARGO_JOBS=4 deploy/build-images.sh  # manager 构建降并行（见下）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `REGISTRY` | `localhost:5000` | 制品库地址；`localhost:5000` 不可达时脚本自动起 `registry:2` 容器（容器名 `feldera-local-registry`，`--restart=always`） |
+| `REGISTRY` | `localhost:5000` | 制品库地址；`localhost:5000` 不可达时脚本调 `deploy/registry.sh` 拉起容器（见下节） |
 | `PUSH` | `1` | 构建后推送 |
 | `PRUNE` | `1` | 每张镜像构建后 `docker builder prune -f` |
 | `BILI_CARGO_JOBS` | 空（全核） | 传给 manager 构建的 `CARGO_BUILD_JOBS`，OOM 时降并行 |
+
+## 本地制品库容器
+
+`deploy/registry.sh` 是启动、重启、查询本地 registry 的唯一入口：
+
+```bash
+deploy/registry.sh              # 没在跑就起，在跑就只报告
+deploy/registry.sh --status     # 容器状态、环境变量、挂载、仓库列表
+deploy/registry.sh --recreate   # 丢掉容器重建，数据卷保留
+```
+
+它做三件 `docker run` 手打容易漏的事：
+
+1. **挂命名卷** `bili-registry-data`（`REGISTRY_VOLUME` 可改）。不挂卷时数据在
+   容器的可写层里，容器一重建就全没了——而这些镜像重建要 2 小时。
+2. **`REGISTRY_STORAGE_DELETE_ENABLED=true`**。不开这个，删 tag 返回 405，
+   唯一办法是清空卷，会把好镜像一起带走。
+3. **端口 5001**（macOS 的 AirPlay 接收器占着 5000）。
+
+`build-images.sh` 不再自己 `docker run`，registry 不可达时调用这个脚本。
+
+「重建容器不丢镜像」这条保证有自测守着：
+
+```bash
+deploy/registry.sh --self-test
+```
+
+它推一张探针镜像、重建容器、再把镜像拉回来。不挂卷的实现在前一半通过、
+后一半失败——而那种失败要等到某次重建后 2 小时的编译白做才被发现。
+反向验证过：不挂卷的容器重建后探针镜像确实消失。
 
 **磁盘红线**：脚本按「逐镜像 build→push→`docker builder prune -f`」推进，
 镜像总量控制在 15G 内。本机如有他项目镜像与运行数据，**严禁**
