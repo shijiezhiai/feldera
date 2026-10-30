@@ -34,8 +34,25 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
-    # The API server, which polls this pod for health and, in a future
-    # split-compiler shape, for artifacts.
+    # The API server, which enqueues compilations here and fetches the resulting
+    # programs. It is the `controlplane` chart's pod, not this chart's: the
+    # selector used to name `{{ .Chart.Name }}` (this chart, `compiler`), which
+    # admitted the compiler to itself and dropped the API server. Compilation
+    # still worked, because a pipeline compiles without talking back to the API
+    # server, so nothing failed until an egress policy was turned on in a real
+    # deployment and the API server could no longer fetch artifacts.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.apiServerName }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiServerPort }}
+    # Other compilers in a split-compiler topology (`compileInThisPod=false`),
+    # whose artifact server this pod uploads to. With the default single pod this
+    # rule admits the pod to itself, which traffic never needs -- but the rule is
+    # what makes the split shape work, so it stays.
     - to:
         - podSelector:
             matchLabels:

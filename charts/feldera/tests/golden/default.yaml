@@ -1,4 +1,78 @@
 ---
+# Source: feldera/charts/compiler/templates/networkpolicy.yaml
+# P1-018: the compiler pod is the one pod that runs `cargo` against the
+# internet-shaped network. Everything a pipeline compilation fetches comes from
+# the crates mirror baked into the image or from a mirror an operator runs, so
+# the policy below allows exactly those and the database, and drops the rest.
+#
+# Egress to the artifact server is not listed because it is this pod: a
+# compilation uploads to itself. When `compileInThisPod` is turned off and the
+# compilers become separate pods, they talk to the artifact server over the
+# in-cluster API server rule below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: feldera-compiler
+  labels:
+    app.kubernetes.io/name: compiler
+    app.kubernetes.io/instance: feldera
+    app.kubernetes.io/part-of: feldera
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: compiler
+      app.kubernetes.io/instance: feldera
+  policyTypes:
+    - Egress
+  egress:
+    # The database, which is the work queue and the artifact registry.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+              app.kubernetes.io/instance: feldera
+      ports:
+        - protocol: TCP
+          port: 5432
+    # The API server, which enqueues compilations here and fetches the resulting
+    # programs. It is the `controlplane` chart's pod, not this chart's: the
+    # selector used to name `compiler` (this chart, `compiler`), which
+    # admitted the compiler to itself and dropped the API server. Compilation
+    # still worked, because a pipeline compiles without talking back to the API
+    # server, so nothing failed until an egress policy was turned on in a real
+    # deployment and the API server could no longer fetch artifacts.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: controlplane
+              app.kubernetes.io/instance: feldera
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Other compilers in a split-compiler topology (`compileInThisPod=false`),
+    # whose artifact server this pod uploads to. With the default single pod this
+    # rule admits the pod to itself, which traffic never needs -- but the rule is
+    # what makes the split shape work, so it stays.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: compiler
+              app.kubernetes.io/instance: feldera
+      ports:
+        - protocol: TCP
+          port: 8085
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
 # Source: feldera/charts/compiler/templates/serviceaccount.yaml
 apiVersion: v1
 kind: ServiceAccount
