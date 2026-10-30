@@ -2185,6 +2185,31 @@ pub struct KubernetesRunnerConfig {
     #[serde(default)]
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_TENANT_NAMESPACE_AUTOMATION")]
     pub kubernetes_runner_tenant_namespace_automation: bool,
+
+    /// Kubernetes `Secret` names a pipeline configuration may reference.
+    ///
+    /// Empty means no connector may reference a Kubernetes Secret at all, which
+    /// is the safe default: a pipeline's configuration is writable by anyone
+    /// who can change a pipeline in that tenant, and a Secret reference
+    /// resolves to whatever the *pipeline pod* is allowed to read. Without a
+    /// list, that permission would be enough to name any Secret in the
+    /// namespace and exfiltrate it through an HTTP output connector.
+    ///
+    /// The list names Secrets, not (Secret, key) pairs: a reference may use any
+    /// key of a listed Secret. Listing a Secret therefore hands every key in it
+    /// to every pipeline permitted to reference it, so keep unrelated
+    /// credentials in separate Secrets.
+    ///
+    /// Each entry is a Secret name (RFC 1123 label). Environment-variable
+    /// references (`${env:NAME}`) are unaffected: they read the pipeline pod's
+    /// own environment, which the platform already limits.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_CONNECTOR_KUBERNETES_SECRETS_ALLOWLIST",
+        value_delimiter = ';'
+    )]
+    pub kubernetes_runner_connector_kubernetes_secrets_allowlist: Vec<String>,
 }
 
 /// Default for `--kubernetes-runner-lower-memory-mb`.

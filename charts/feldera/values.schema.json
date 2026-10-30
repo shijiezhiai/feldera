@@ -62,8 +62,60 @@
             "upperLimitStorageMegabyte": {
               "type": "integer",
               "minimum": 1
+            },
+            "connectorKubernetesSecrets": {
+              "type": "object",
+              "description": "Kubernetes Secrets a pipeline configuration may reference. Off, no reference is allowed.",
+              "properties": {
+                "enableAllowlist": {
+                  "type": "boolean"
+                },
+                "allowlist": {
+                  "type": "array",
+                  "description": "Secret names. An entry must be a valid Kubernetes Secret name; the manager refuses anything else at provisioning.",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 253,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                  }
+                }
+              },
+              "additionalProperties": false
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "connectorKubernetesSecrets": {
+                    "properties": {
+                      "enableAllowlist": {
+                        "const": false
+                      }
+                    },
+                    "required": [
+                      "enableAllowlist"
+                    ]
+                  }
+                },
+                "required": [
+                  "connectorKubernetesSecrets"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "connectorKubernetesSecrets": {
+                    "properties": {
+                      "allowlist": {
+                        "maxItems": 0
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
         },
         "apiServerAntiAffinity": {
           "type": "string",

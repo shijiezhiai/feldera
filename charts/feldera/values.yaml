@@ -20,6 +20,11 @@ controlplane:
     # the namespaces they live in. See controlplane/values.yaml.
     tenantQuotas: {}
     tenantNamespaceAutomation: false
+    # P1-025: Kubernetes Secrets a pipeline configuration may reference. Off,
+    # no reference is allowed. See controlplane/values.yaml.
+    connectorKubernetesSecrets:
+      enableAllowlist: false
+      allowlist: []
   postgresExternal: false
   postgresVersion: "17-alpine"
   postgresImageRepository: "postgres"
