@@ -10,6 +10,7 @@
 //! ship silently world-accessible, and a path no route claims is answered 404
 //! here rather than handed on.
 
+use crate::api::audit::DenyReason;
 use crate::auth::AuthenticatedPrincipal;
 use crate::config::BasePath;
 use crate::db::error::DBError;
@@ -21,7 +22,7 @@ use actix_web::middleware::Next;
 use actix_web::{HttpMessage, HttpResponse, ResponseError};
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use tracing::{debug, error};
+use tracing::error;
 
 /// The access-control rule for each `/v0` route: the minimum role that may
 /// reach it, and whether it draws on one tenant's data or the installation's.
@@ -42,13 +43,11 @@ use tracing::{debug, error};
 /// [`every_tenant_scoped_route_reaches_a_handler_that_reads_the_acting_tenant`]
 /// checks against the endpoint sources. A [`TenantScope::Platform`] route has no
 /// owning tenant and is scoped by role alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TenantScope {
-    /// Data belonging to exactly one tenant.
-    Tenant,
-    /// Installation-wide data with no owning tenant.
-    Platform,
-}
+///
+/// The type lives in [`crate::api::audit`] because the audit line is what
+/// carries it out of the middleware: one definition keeps the table's column
+/// and the recorded field from drifting apart.
+use crate::api::audit::TenantScope;
 
 #[rustfmt::skip]
 static ROUTE_MIN_ROLE: &[(&str, &str, Role, TenantScope)] = &[
@@ -297,7 +296,7 @@ fn authorize(
     routed: bool,
     path: &str,
     principal: Option<&AuthenticatedPrincipal>,
-) -> Result<(&'static str, TenantScope), HttpResponse<BoxBody>> {
+) -> Result<(&'static str, TenantScope), Refusal> {
     let Some((pattern, required, scope)) = classify(method, path) else {
         // No table entry for this method on this path. A path the table
         // describes under other methods is a wrong-method request (`routed` is
@@ -307,23 +306,92 @@ fn authorize(
         // error. Only a path actix would dispatch yet the table classifies
         // under no method is the registered-route bug.
         if !routed || path_matches_any_route(path) {
-            return Err(not_found(method, path));
+            // Not a denial, and not an audit event: no route serves this method
+            // on this path, so there was no access decision to record. Logging
+            // it as one would bury real denials under 404s from probing.
+            return Err(Refusal::NotFound(not_found(method, path)));
         }
         error!("RBAC: route {method} {path} has no access-control entry; denying");
-        return Err(forbidden(
-            "This endpoint has no access-control classification and is denied",
-        ));
+        return Err(Refusal::Denied(Denial {
+            reason: DenyReason::Unclassified,
+            route: BOXED_PATH,
+            required_role: None,
+            scope: None,
+            response: forbidden("This endpoint has no access-control classification and is denied"),
+        }));
     };
     match principal {
         Some(p) if p.role.satisfies(required) => Ok((pattern, scope)),
-        Some(p) => Err(DBError::InsufficientPermissions {
-            required,
-            actual: p.role,
-        }
-        .error_response()),
+        Some(p) => Err(Refusal::Denied(Denial {
+            reason: DenyReason::Role,
+            route: pattern,
+            required_role: Some(required),
+            scope: Some(scope),
+            response: DBError::InsufficientPermissions {
+                required,
+                actual: p.role,
+            }
+            .error_response(),
+        })),
         None => {
             error!("RBAC: no authenticated principal for {method} {pattern}; denying");
-            Err(forbidden("No authenticated principal"))
+            Err(Refusal::Denied(Denial {
+                reason: DenyReason::Unauthenticated,
+                route: pattern,
+                required_role: Some(required),
+                scope: Some(scope),
+                response: forbidden("No authenticated principal"),
+            }))
+        }
+    }
+}
+
+/// A route string for a denial on a path the table does not classify: there is
+/// no pattern to record, and the raw path may name an object the caller is not
+/// entitled to see. A reviewer reads the method plus the denial reason instead.
+const BOXED_PATH: &str = "(unclassified path)";
+
+/// An access-control refusal, carried out of [`authorize`] so the middleware can
+/// record it before the response is returned.
+///
+/// The response is built where the reason is known, because each refusal has
+/// its own body; this type adds the fields the audit line needs, without
+/// making the middleware re-derive which branch fired.
+struct Denial {
+    reason: DenyReason,
+    route: &'static str,
+    required_role: Option<Role>,
+    scope: Option<TenantScope>,
+    response: HttpResponse<BoxBody>,
+}
+
+/// Either a refusal, or a request answered without an access decision (404).
+///
+/// A 404 is not a denial: no route serves that method on that path, so no
+/// access decision was made and nothing is recorded. Kept distinct so the
+/// middleware cannot mistake a probe for an authorization failure and bury real
+/// denials under them.
+enum Refusal {
+    Denied(Denial),
+    NotFound(HttpResponse<BoxBody>),
+}
+
+impl Refusal {
+    /// The status the caller will receive. Exists so a test can assert the
+    /// decision without consuming the response.
+    fn status(&self) -> actix_web::http::StatusCode {
+        match self {
+            Refusal::Denied(d) => d.response.status(),
+            Refusal::NotFound(r) => r.status(),
+        }
+    }
+
+    /// The audit reason this refusal carries, `None` for a 404 that made no
+    /// access decision.
+    fn reason(&self) -> Option<DenyReason> {
+        match self {
+            Refusal::Denied(d) => Some(d.reason),
+            Refusal::NotFound(_) => None,
         }
     }
 }
@@ -334,28 +402,25 @@ fn authorize(
 /// The tenant scope is carried into the audit line rather than enforced here:
 /// enforcement is the handler's tenant predicate, which
 /// [`every_tenant_scoped_route_reaches_a_handler_that_reads_the_acting_tenant`]
-/// guarantees exists. Logging the scope is what makes a cross-tenant access
-/// attempt readable afterwards -- "which tenant was the principal acting in"
-/// and "whose data does this route touch" end up on the same line.
-fn audit(
+/// keeps in place. Recording it lets an auditor separate "this principal read
+/// its own tenant's pipelines" from "this principal read the installation's
+/// configuration" without a second lookup.
+fn audit_allow(
     method: &Method,
-    pattern: &str,
+    pattern: &'static str,
     principal: Option<&AuthenticatedPrincipal>,
     scope: TenantScope,
+    required_role: Role,
 ) {
-    let Some(p) = principal else { return };
-    debug!(
-        "audit: user='{}' tenant={} role={} scope={} {} {}",
-        p.label,
-        p.acting_tenant,
-        p.role,
-        match scope {
-            TenantScope::Tenant => "tenant",
-            TenantScope::Platform => "platform",
-        },
-        method,
-        pattern
-    );
+    crate::api::audit::record(&crate::api::audit::AccessEvent {
+        decision: crate::api::audit::Decision::Allow,
+        principal,
+        method: method.as_str(),
+        route: pattern,
+        scope: Some(scope),
+        required_role: Some(required_role),
+        reason: None,
+    });
 }
 
 /// Refuse any `/v0` request whose principal is below the role its route
@@ -385,11 +450,71 @@ pub(crate) async fn rbac_middleware(
 
     match authorize(method.as_str(), routed, &path, principal.as_ref()) {
         Ok((pattern, scope)) => {
-            audit(&method, pattern, principal.as_ref(), scope);
+            let required_role = min_role_for(method.as_str(), pattern)
+                .expect("a classified route has a table row with a minimum role");
+            audit_allow(&method, pattern, principal.as_ref(), scope, required_role);
             Ok(next.call(req).await?.map_into_boxed_body())
         }
-        Err(resp) => Ok(req.into_response(resp)),
+        Err(Refusal::Denied(denial)) => {
+            crate::api::audit::record(&crate::api::audit::AccessEvent {
+                decision: crate::api::audit::Decision::Deny,
+                principal: principal.as_ref(),
+                method: method.as_str(),
+                route: denial.route,
+                scope: denial.scope,
+                required_role: denial.required_role,
+                reason: Some(denial.reason),
+            });
+            Ok(req.into_response(denial.response))
+        }
+        Err(Refusal::NotFound(response)) => Ok(req.into_response(response)),
     }
+}
+
+/// Record a request that failed authentication, which the guard above never
+/// sees.
+///
+/// `auth_validator` is an actix credential extractor: a request that carries no
+/// `Authorization` header at all is refused with 401 *by the extractor*, before
+/// any middleware inside it runs -- so without this layer an attempt with no
+/// credential, or with one in a shape the extractor rejects, leaves no trace.
+/// Those are the events an auditor most wants: a denial with a credential that
+/// did not work is what a brute-force attempt looks like from here.
+///
+/// This layer sits outside authentication, so it cannot know who called -- it
+/// has no principal to name, by construction. It records only requests that
+/// were answered 401 and that the route table classifies; an unknown path is
+/// answered without an event, for the reason given in [`authorize`]. Everything
+/// else is left to the inner layer, which knows the decision.
+pub(crate) async fn rbac_authentication_guard(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
+    let method = req.method().clone();
+    // Same view of the path as the inner layer: actix dispatches on the decoded
+    // path, and a deployment on a subpath is classified relative to its root.
+    let routed_path = req.match_info().as_str().to_string();
+    let path = BasePath::strip_from(&req, &routed_path).to_string();
+
+    let response = next.call(req).await?.map_into_boxed_body();
+    if response.status() != actix_web::http::StatusCode::UNAUTHORIZED {
+        return Ok(response);
+    }
+    if let Some((pattern, required, scope)) = classify(method.as_str(), &path) {
+        crate::api::audit::record(&crate::api::audit::AccessEvent {
+            decision: crate::api::audit::Decision::Deny,
+            // No principal: authentication is what failed. The inner layer
+            // records a rejected *credential* (an unknown key, a bad
+            // signature); this one records its absence.
+            principal: None,
+            method: method.as_str(),
+            route: pattern,
+            scope: Some(scope),
+            required_role: Some(required),
+            reason: Some(DenyReason::Unauthenticated),
+        });
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -594,6 +719,29 @@ mod test {
         // `/v0/cluster_healthz` exists for GET only.
         let resp = authorize("POST", true, "/v0/cluster_healthz", Some(&p)).unwrap_err();
         assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Each refusal must carry the reason the audit line records, and a 404 must
+    /// carry none. The middleware writes `denial.reason` straight into the log,
+    /// so a branch that forgets to set it would emit `audit_reason = "-"` for a
+    /// real denial and drop out of an alert written against `reason = "role"`.
+    #[test]
+    fn every_refusal_names_its_reason() {
+        use actix_web::http::StatusCode;
+        let reader = AuthenticatedPrincipal::for_test(Role::Read);
+
+        let below = authorize("POST", true, "/v0/pipelines", Some(&reader)).unwrap_err();
+        assert_eq!(below.status(), StatusCode::FORBIDDEN);
+        assert_eq!(below.reason(), Some(DenyReason::Role));
+
+        let anonymous = authorize("GET", true, "/v0/pipelines", None).unwrap_err();
+        assert_eq!(anonymous.status(), StatusCode::FORBIDDEN);
+        assert_eq!(anonymous.reason(), Some(DenyReason::Unauthenticated));
+
+        // No route and no table entry: answered, not denied.
+        let missing = authorize("GET", false, "/v0/nonesuch", Some(&reader)).unwrap_err();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.reason(), None);
     }
 
     #[test]
@@ -1107,6 +1255,111 @@ mod test {
             missing.is_empty(),
             "these /v0 operations are missing the minimum-role annotation:\n  {}",
             missing.join("\n  ")
+        );
+    }
+    /// A request that fails authentication is recorded, even though the guard
+    /// that records the decision never sees it.
+    ///
+    /// This is the case the audit trail is most likely to miss and least able
+    /// to afford missing: `auth_validator` answers 401 from inside actix's
+    /// credential extractor, before any middleware wrapped inside it runs, so a
+    /// caller who sends no credential -- or a malformed one -- would otherwise
+    /// leave no trace at all.
+    ///
+    /// The test drives `build_app`, the same composition that ships, so it pins
+    /// the wiring and not just the function: unwrap the guard from `build_app`
+    /// (or wrap it anywhere but outermost) and this fails, because no event is
+    /// recorded for the 401.
+    #[actix_web::test]
+    async fn an_unauthenticated_request_is_recorded_by_the_outer_guard() {
+        use crate::auth::{AuthConfiguration, AuthProvider, ProviderGenericOidc};
+        use crate::config::ApiServerConfig;
+
+        let issuer = "http://issuer.invalid/realms/test";
+        let auth_configuration = Some(AuthConfiguration {
+            provider: AuthProvider::GenericOidc(ProviderGenericOidc {
+                issuer: issuer.to_string(),
+                client_id: "feldera-console".to_string(),
+                extra_oidc_scopes: vec![],
+                jwk_uri: format!("{issuer}/protocol/openid-connect/certs"),
+            }),
+            validation: crate::auth::login_validation(issuer, Some("feldera-console")),
+            client_id: "feldera-console".to_string(),
+        });
+        let app = actix_web::test::init_service(crate::api::main::build_app(
+            &ApiServerConfig::test_config(),
+            &auth_configuration,
+        ))
+        .await;
+
+        let _ = crate::api::audit::take_recorded();
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/v0/pipelines")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::UNAUTHORIZED,
+            "a request with no credential is refused by authentication, not by the guard"
+        );
+
+        let recorded = crate::api::audit::take_recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the 401 left no audit event; an attempt with no credential is the \
+             one an auditor most wants, and without the outer guard it is invisible"
+        );
+        let event = &recorded[0];
+        assert_eq!(event.decision, "deny");
+        assert_eq!(event.reason, "unauthenticated");
+        assert_eq!(event.principal, "-", "no principal was established");
+        assert_eq!(event.method, "GET");
+        assert_eq!(event.route, "/v0/pipelines");
+        assert_eq!(event.required_role, "read");
+    }
+
+    /// A path the table cannot classify is refused before any route is
+    /// resolved, so it reaches the guard as a 401 too -- and records nothing,
+    /// because there was no access decision to record. Without this the audit
+    /// trail would fill with probing of invented paths.
+    #[actix_web::test]
+    async fn an_unclaimed_path_is_recorded_by_nothing() {
+        use crate::auth::{AuthConfiguration, AuthProvider, ProviderGenericOidc};
+        use crate::config::ApiServerConfig;
+
+        let issuer = "http://issuer.invalid/realms/test";
+        let auth_configuration = Some(AuthConfiguration {
+            provider: AuthProvider::GenericOidc(ProviderGenericOidc {
+                issuer: issuer.to_string(),
+                client_id: "feldera-console".to_string(),
+                extra_oidc_scopes: vec![],
+                jwk_uri: format!("{issuer}/protocol/openid-connect/certs"),
+            }),
+            validation: crate::auth::login_validation(issuer, Some("feldera-console")),
+            client_id: "feldera-console".to_string(),
+        });
+        let app = actix_web::test::init_service(crate::api::main::build_app(
+            &ApiServerConfig::test_config(),
+            &auth_configuration,
+        ))
+        .await;
+
+        let _ = crate::api::audit::take_recorded();
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/v0/nonesuch")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            crate::api::audit::take_recorded().is_empty(),
+            "an unclaimed path is not an access decision and must not be recorded"
         );
     }
 }

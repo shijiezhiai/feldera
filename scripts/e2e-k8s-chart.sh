@@ -199,6 +199,19 @@ printf '%s\n' "$entry" | grep -q '"kafka-creds;s3-credentials"' \
   || fail "the allowlist did not arrive as one ';'-joined value: $entry"
 info "the allowlist arrives joined with ';'"
 
+step "JSON logs reach the manager, without which nothing is auditable"
+# The audit trail (src/api/audit.rs) writes structured events, and a log
+# platform can filter them by principal only when the manager emits JSON. The
+# key shipped in values.yaml since P1-005 with no template reading it, so
+# setting it did nothing; this asserts the wire exists, in both directions.
+render_off="$(render --set controlplane.logJson=false)"
+if printf '%s\n' "${render_off}" | grep -q 'FELDERA_LOG_JSON'; then
+  fail "logJson=false still set FELDERA_LOG_JSON"
+fi
+render | grep -q 'FELDERA_LOG_JSON' \
+  || fail "the default rendering does not enable JSON logs; the audit trail would be unqueryable"
+info "JSON logging is on by default and off when asked"
+
 step "the runner Role and its ClusterRole twin match"
 # The runner Role and its ClusterRole twin must grant the same thing. The API
 # server aggregates only ClusterRoles, so the namespaced Role cannot be the

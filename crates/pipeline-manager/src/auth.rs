@@ -108,6 +108,18 @@ pub(crate) struct AuthenticatedPrincipal {
     pub label: String,
 }
 
+/// The audit label for an API-key principal: `apikey:<name>`.
+///
+/// The name is part of the label because a tenant routinely has several keys,
+/// and an audit line reading only `apikey` cannot say which one acted -- so it
+/// cannot answer the question an audit trail exists for, "replay what this
+/// principal did". It is a function rather than an inline `format!` so the
+/// shape is testable on its own; the label is what a log platform filters on,
+/// and nothing else in the log records the key.
+fn api_key_label(name: &str) -> String {
+    format!("apikey:{name}")
+}
+
 impl AuthenticatedPrincipal {
     /// Insert the principal and the acting tenant into request extensions.
     fn install(self, req: &ServiceRequest) {
@@ -982,7 +994,7 @@ async fn api_key_auth(
         db.validate_api_key(api_key_str).await
     };
     match validate {
-        Ok((tenant_id, role)) => {
+        Ok((tenant_id, role, name)) => {
             let selector = match tenant_selector(req.headers()) {
                 Ok(selector) => selector,
                 Err(e) => return Err((e, req)),
@@ -1009,7 +1021,7 @@ async fn api_key_auth(
             AuthenticatedPrincipal {
                 acting_tenant: tenant_id,
                 role,
-                label: "apikey".to_string(),
+                label: api_key_label(&name),
             }
             .install(&req);
             Ok(req)
@@ -1306,7 +1318,7 @@ impl AuthProvider {
 
 /// Shared login JWT checks. Generic OIDC requires an audience; Cognito access
 /// tokens bind to the client through `client_id`, checked after decoding.
-fn login_validation(issuer: &str, audience: Option<&str>) -> Validation {
+pub(crate) fn login_validation(issuer: &str, audience: Option<&str>) -> Validation {
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&[issuer]);
     validation.set_required_spec_claims(&["exp", "iss", "sub"]);
@@ -1981,7 +1993,7 @@ mod test {
     use tokio::sync::{Mutex, RwLock};
     use uuid::Uuid;
 
-    use super::{AuthError, AuthenticatedPrincipal};
+    use super::{AuthError, AuthenticatedPrincipal, api_key_label};
     use crate::db::types::role::{MintableKeyRole, Role};
     use crate::oidc::fetch::{OidcClients, OidcDestination};
     use crate::{
@@ -1996,6 +2008,26 @@ mod test {
     use rsa::pkcs8::EncodePublicKey;
     use rsa::{RsaPrivateKey, RsaPublicKey};
     use wiremock::MockServer;
+
+    /// Two keys of the same tenant must be distinguishable in the audit log.
+    ///
+    /// The label is the only identity an audit event carries for a key-based
+    /// principal, so collapsing it to a constant would make "which key did
+    /// this" unanswerable -- and the replay the audit trail exists for
+    /// impossible -- while every other test still passed.
+    // `#[actix_web::test]`, not `#[test]`: `use actix_web::test` is in scope in
+    // this module, so a bare `#[test]` resolves to the async macro there.
+    #[actix_web::test]
+    async fn an_api_key_principal_is_named_by_its_key() {
+        assert_eq!(api_key_label("ci"), "apikey:ci");
+        assert_ne!(
+            api_key_label("ci"),
+            api_key_label("nightly"),
+            "two keys must not share one audit identity"
+        );
+        // Not an empty label: a blank principal cannot be queried for.
+        assert_eq!(api_key_label(""), "apikey:");
+    }
 
     /// The session endpoint is the one route a login with no resolvable acting
     /// tenant may reach, so the console can drive its tenant picker. The

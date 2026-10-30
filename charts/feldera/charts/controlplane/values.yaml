@@ -48,7 +48,15 @@ felderaDatabaseSecretRef: ""
 
 # --- TLS / logging ----------------------------------------------------------
 httpsSecretRef: null
-logJson: false
+# Emit structured JSON logs instead of formatted text. Required for the audit
+# trail to be queryable: `crates/pipeline-manager/src/api/audit.rs` writes one
+# event per access decision on the `feldera_audit` target, and a log platform
+# can filter those by principal only when each field is its own JSON key.
+#
+# On by default: an audit trail that is off by default is not an audit trail.
+# The format is only a consumer choice, and the platform ingests JSON, so the
+# setting that makes the trail queryable is the one that should ship enabled.
+logJson: true
 
 # --- Control plane env --------------------------------------------------------
 controlPlane:

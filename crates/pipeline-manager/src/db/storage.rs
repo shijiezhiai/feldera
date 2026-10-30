@@ -274,7 +274,11 @@ pub(crate) trait Storage {
 
     /// Validates an API key against the database by comparing its SHA-256 hash
     /// against the stored value.
-    async fn validate_api_key(&self, key: &str) -> Result<(TenantId, Role), DBError>;
+    ///
+    /// Returns the key's tenant, its role there, and the key's name. The name
+    /// identifies the key in the audit line: several keys exist per tenant, so
+    /// tenant and role alone cannot say which one acted.
+    async fn validate_api_key(&self, key: &str) -> Result<(TenantId, Role, String), DBError>;
 
     /// Lists OIDC trust relationships in a scope: `Some(tenant)` for that
     /// tenant's trusts, `None` for the platform-wide owner trusts.

@@ -342,6 +342,8 @@ spec:
                 secretKeyRef:
                   name: feldera-db-insecure-secret
                   key: .password
+            - name: FELDERA_LOG_JSON
+              value: "1"
           # The image ENTRYPOINT already carries --bind-address, --sql-compiler-path,
           # --compilation-cargo-lock-path, --dbsp-override-path and --demos-dir
           # (deploy/Dockerfile.manager); only the DB connection differs per deploy.

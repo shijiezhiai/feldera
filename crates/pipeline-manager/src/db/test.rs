@@ -1278,6 +1278,9 @@ async fn api_key_store_and_validation() {
         let validated = handle.db.validate_api_key(&api_key).await.unwrap();
         assert_eq!(tenant_id, validated.0);
         assert_eq!(Role::Write, validated.1);
+        // The key's own name, so an audit line names the credential that acted
+        // rather than the whole class of credentials.
+        assert_eq!(api_key_name, validated.2.as_str());
 
         // Delete API key
         handle
@@ -7707,18 +7710,20 @@ impl Storage for Mutex<DbModel> {
         Ok(())
     }
 
-    async fn validate_api_key(&self, key: &str) -> DBResult<(TenantId, Role)> {
+    async fn validate_api_key(&self, key: &str) -> DBResult<(TenantId, Role, String)> {
         let s = self.lock().await;
         let hash = BASE64_STANDARD.encode(digest::digest(&digest::SHA256, key.as_bytes()).as_ref());
-        let record: Vec<(TenantId, Role)> = s
+        // The map is keyed by (tenant, name), which is the pair the audit line
+        // needs: the same hash must map to exactly one key.
+        let record: Vec<(TenantId, Role, String)> = s
             .api_keys
             .iter()
             .filter(|k| k.1.1 == hash)
-            .map(|k| (k.0.0, k.1.2))
+            .map(|k| (k.0.0, k.1.2, k.0.1.clone()))
             .collect();
         assert!(record.len() <= 1);
         match record.first() {
-            Some(record) => Ok((record.0, record.1)),
+            Some(record) => Ok((record.0, record.1, record.2.clone())),
             None => Err(DBError::InvalidApiKey),
         }
     }

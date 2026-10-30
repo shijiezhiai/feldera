@@ -102,17 +102,25 @@ pub async fn store_api_key_hash(
     }
 }
 
+/// Authenticate an API key, returning what the audit line needs to name it:
+/// the key's tenant, its role there, and the key's own name.
+///
+/// The name is returned rather than just the tenant and role because an audit
+/// line that says only "apikey" cannot answer which key performed an action.
+/// Several keys routinely exist per tenant, and a `Feldera-Tenant` header lets
+/// one act in another tenant, so the tenant alone does not identify the key.
 pub async fn validate_api_key(
     txn: &Transaction<'_>,
     api_key: &str,
-) -> Result<(TenantId, Role), DBError> {
+) -> Result<(TenantId, Role, String), DBError> {
     let hash = BASE64_STANDARD.encode(digest::digest(&digest::SHA256, api_key.as_bytes()).as_ref());
     let stmt = txn
-        .prepare_cached("SELECT tenant_id, role FROM api_key WHERE hash = $1")
+        .prepare_cached("SELECT tenant_id, role, name FROM api_key WHERE hash = $1")
         .await?;
     let res = txn.query(&stmt, &[&hash]).await?;
     let res = res.first().ok_or(DBError::InvalidApiKey)?;
     let tenant_id = TenantId(res.get(0));
     let role = Role::from_str(&res.get::<_, String>(1))?;
-    Ok((tenant_id, role))
+    let name = res.get::<_, String>(2);
+    Ok((tenant_id, role, name))
 }

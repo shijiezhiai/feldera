@@ -410,7 +410,7 @@ impl Storage for StoragePostgres {
         Ok(result)
     }
 
-    async fn validate_api_key(&self, key: &str) -> Result<(TenantId, Role), DBError> {
+    async fn validate_api_key(&self, key: &str) -> Result<(TenantId, Role, String), DBError> {
         let mut client = self.pool.get().await?;
         let txn = transaction::begin(&mut client).await?;
         let result = operations::api_key::validate_api_key(&txn, key).await?;

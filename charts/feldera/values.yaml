@@ -34,7 +34,9 @@ controlplane:
   postgresPassword: ""
   felderaDatabaseSecretRef: ""
   httpsSecretRef: null
-  logJson: false
+  # Structured JSON logs; required for the audit trail to be queryable.
+  # See charts/controlplane/values.yaml for why this defaults to on.
+  logJson: true
   # P1-021: OIDC sign-in for the web console. The manager reads the client id
   # and issuer from the environment and refuses to start without them, so
   # `enabled: true` with an empty issuer fails at pod start, not at login.
