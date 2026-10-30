@@ -31,11 +31,18 @@ NAMESPACE="${NAMESPACE:-feldera}"
 RELEASE="${RELEASE:-feldera}"
 MANAGER_TAG="${MANAGER_TAG:?set MANAGER_TAG to the manager image tag under test}"
 # The pipeline executor image is built from deploy/Dockerfile.runner and carries
-# `pipeline-entrypoint`; a manager image does not. Point this at a runner tag
-# that was actually built from that Dockerfile: the runner and manager images
-# share a version string but differ in content, and using the manager image
-# makes every pipeline pod fail with `RunContainerError` before it starts.
-DEFAULT_RUNNER_TAG="v0.357.0-20-g7a5128651-bili.8"
+# `pipeline-entrypoint`; a manager image does not. The two share a version
+# string and have been confused before, which surfaces as every pipeline pod
+# dying with `RunContainerError` long after this script starts, so the image is
+# checked up front instead.
+RUNNER_TAG="${RUNNER_TAG:?set RUNNER_TAG to a feldera-runner image tag built from deploy/Dockerfile.runner}"
+# The chart assembles `<registry>/<repository>:<tag>`, so RUNNER_TAG is the tag
+# alone. Passing a fully qualified reference makes the chart render
+# `localhost:5001/feldera-runner:localhost:5001/feldera-runner:<tag>`, which the
+# API server accepts and the kubelet then rejects as InvalidImageName.
+RUNNER_REGISTRY="${RUNNER_REGISTRY:-localhost:5001}"
+RUNNER_REPOSITORY="${RUNNER_REPOSITORY:-feldera-runner}"
+RUNNER_IMAGE="${RUNNER_REGISTRY}/${RUNNER_REPOSITORY}:${RUNNER_TAG}"
 API_PORT="${API_PORT:-18082}"
 TIMEOUT="${TIMEOUT:-240}"
 WORKDIR="$(mktemp -d /tmp/p1-025-secrets.XXXXXX)"
@@ -71,6 +78,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+step "checking that the executor image is a runner image"
+# `pipeline-entrypoint` is what the Kubernetes runner sets as the container
+# command; a manager image lacks it and every pod then dies with
+# RunContainerError, which looks like a bug in this feature rather than in the
+# image the operator picked. Fail here, before the release is touched.
+docker run --rm --entrypoint sh "${RUNNER_IMAGE}" \
+  -c 'test -x /usr/local/bin/pipeline-entrypoint' >/dev/null 2>&1 \
+  || fail "${RUNNER_IMAGE} is not a runner image: it has no /usr/local/bin/pipeline-entrypoint"
+info "${RUNNER_IMAGE} carries the pipeline entrypoint"
+
 step "creating the Secrets"
 kubectl --namespace "${NAMESPACE}" create secret generic "${ALLOWED_SECRET}" \
   --from-literal=username=alice \
@@ -88,7 +105,7 @@ helm upgrade --install "${RELEASE}" charts/feldera \
   --set "controlplane.kubernetesRunner.connectorKubernetesSecrets.allowlist={${ALLOWED_SECRET}}" \
   --set controlplane.image.tag="${MANAGER_TAG}" \
   --set compiler.image.tag="${COMPILER_TAG:-${MANAGER_TAG}}" \
-  --set controlplane.kubernetesRunner.image.tag="${RUNNER_TAG:-${DEFAULT_RUNNER_TAG}}" \
+  --set controlplane.kubernetesRunner.image.tag="${RUNNER_TAG}" \
   --set controlplane.controlPlane.deploymentTimeAnnotation=false \
   --wait --timeout 10m >/dev/null || fail "the release did not become ready"
 info "release ready"
@@ -272,8 +289,17 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 value="$(kubectl --namespace "${NAMESPACE}" exec "${pod}" -- cat "${secret_dir}/password" 2>/dev/null || true)"
-[ "${value}" = "${ALLOWED_VALUE}" ] \
-  || fail "the pipeline pod did not see the Secret value at ${secret_dir}/password"
+if [ "${value}" != "${ALLOWED_VALUE}" ]; then
+  # Print what the pod actually sees. Without it the only symptom is "not the
+  # value I expected", which is equally consistent with a missing mount, a
+  # container that never started, and a wrong path.
+  printf 'pod state: ' >&2
+  kubectl --namespace "${NAMESPACE}" get pod "${pod}" \
+    -o jsonpath='{.status.containerStatuses[0].state}' >&2 2>&1 || true
+  printf '\nmount: ' >&2
+  kubectl --namespace "${NAMESPACE}" exec "${pod}" -- sh -c "ls -la /etc/feldera-secrets/kubernetes/ 2>&1; ls -la ${secret_dir} 2>&1" >&2 2>&1 || true
+  fail "the pipeline pod did not see the Secret value at ${secret_dir}/password (got '${value}')"
+fi
 info "the pod reads the value the resolver expects"
 
 kubectl --namespace "${NAMESPACE}" exec "${pod}" -- cat "${secret_dir}/username" 2>/dev/null \

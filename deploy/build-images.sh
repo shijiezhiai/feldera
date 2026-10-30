@@ -6,6 +6,7 @@
 #   deploy/build-images.sh                     # 构建+推送+逐镜像清理
 #   REGISTRY=reg.corp.example:5000 deploy/build-images.sh   # 推真内网制品库
 #   PUSH=0 deploy/build-images.sh              # 只构建不推送
+#   ONLY=runner deploy/build-images.sh         # 只重建一张（manager/compiler/runner）
 #   BILI_CARGO_JOBS=4 deploy/build-images.sh   # manager 构建降并行（OOM 降级阶梯②）
 #
 # 版本约定：
@@ -187,18 +188,43 @@ build_manager() {
 # buildkit 对含 RUN bun 大层（webconsole）的 target 构建 export 会死锁（132s 后
 # CPU 0% 永久挂，见 MEMORY 教训）。buildkit 缓存本就按层留存：同一 Dockerfile
 # 的中间层随全量构建缓存，不必预烤。
-build_manager
+
 # The compiler image is the manager image plus a service selection (P1-018), so
-# it is built from the manager tag that was just produced rather than through
-# its own toolchain stack.
-COMPILER_BASE_IMAGE="$(docker image ls --format '{{.Repository}}:{{.Tag}}' \
-  | grep -E "^feldera-manager:${VER}-bili\\.[0-9]+$" | sort -t. -k5 -n | tail -1)"
-if [[ -z "${COMPILER_BASE_IMAGE}" ]]; then
-  echo "ERROR: no feldera-manager:${VER}-bili.N image to derive the compiler image from" >&2
-  exit 1
-fi
-build_one feldera-compiler Dockerfile.compiler --build-arg BASE_IMAGE="${COMPILER_BASE_IMAGE}"
-build_one feldera-runner Dockerfile.runner
+# it is built from a manager tag rather than through its own toolchain stack.
+build_compiler() {
+  local base_image
+  base_image="$(docker image ls --format '{{.Repository}}:{{.Tag}}' \
+    | grep -E "^feldera-manager:${VER}-bili\\.[0-9]+$" | sort -t. -k5 -n | tail -1)"
+  if [[ -z "${base_image}" ]]; then
+    echo "ERROR: no feldera-manager:${VER}-bili.N image to derive the compiler image from" >&2
+    return 1
+  fi
+  build_one feldera-compiler Dockerfile.compiler --build-arg BASE_IMAGE="${base_image}"
+}
+
+build_runner() {
+  build_one feldera-runner Dockerfile.runner
+}
+
+# ONLY keeps the iteration loop honest: a change to one image should rebuild
+# that image, not all three. Unset builds the whole set in dependency order.
+prepare_registry() {
+  # Every image is pushed to ${REGISTRY}, so the registry has to exist before the
+  # first push, not inside finish_image, or ONLY=compiler fails on a cold host.
+  if [[ "${PUSH}" == "1" ]]; then ensure_registry; fi
+}
+
+prepare_registry
+case "${ONLY:-}" in
+  "")        build_manager; build_compiler; build_runner ;;
+  manager)   build_manager ;;
+  compiler)  build_compiler ;;
+  runner)    build_runner ;;
+  *)
+    echo "ERROR: ONLY must be manager, compiler or runner (got '${ONLY}')" >&2
+    exit 2
+    ;;
+esac
 
 echo
 echo "=== done. local images:"

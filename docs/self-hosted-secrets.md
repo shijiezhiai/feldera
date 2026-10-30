@@ -167,6 +167,19 @@ next restart fails with the allowlist error.
 
 `scripts/e2e-k8s-secrets.sh` runs the whole path against a kind cluster:
 
+```bash
+source /path/to/env.sh            # KUBECONFIG and DOCKER_HOST
+MANAGER_TAG=<manager tag> RUNNER_TAG=<runner tag> scripts/e2e-k8s-secrets.sh
+```
+
+`RUNNER_TAG` must name an image built from `deploy/Dockerfile.runner`. The runner
+and manager images share a version string but not their contents: only the
+runner carries `/usr/local/bin/pipeline-entrypoint`, which the Kubernetes runner
+sets as the container command. A manager image under a runner tag makes every
+pipeline pod fail with `RunContainerError` before the container starts — a
+symptom that reads like a bug in secret handling. The script checks the tag
+before it touches the release and refuses to continue otherwise.
+
 1. Two Secrets are created, one on the allowlist and one not.
 2. A pipeline that names the unlisted one is started; the script waits for the
    provisioning error and asserts it names that Secret and mentions the
