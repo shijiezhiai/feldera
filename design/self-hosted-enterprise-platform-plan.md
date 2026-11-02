@@ -312,7 +312,10 @@ gantt
 - K8sRunner：单元测试（正常/异常路径）+ **model-based 状态机测试**（automaton 全
   状态 × K8s 事件注入）+ e2e（kind 集群）；对齐 CLAUDE.md 的属性测试要求。
 - 容灾：故障注入矩阵（kill pod / 删 PVC / 断 S3 / 断 Kafka / 主副本 kill），
-  每格断言数据水位与重复率。
+  每格断言数据水位与重复率。**v1 已落地（P1-028）**：`scripts/e2e-k8s-chaos.sh`
+  十格全绿，每夜由 `.github/workflows/chaos-nightly.yml` 跑；实现细节与三个实测
+  修正（开源树无对象存储后端、断 PG 不能经 manager 取证、输入不可达时初始化致命）
+  见 `docs/self-hosted-chaos.md`。
 - 文档：runbook（standby 切换、PVC 扩容、升级回滚、回填）进仓库 `design/../runbooks/`
   或公司 wiki；每工作流出 ADR。
 
