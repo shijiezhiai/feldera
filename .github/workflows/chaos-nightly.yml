@@ -1,0 +1,130 @@
+# The fault-injection matrix, once a night.
+#
+# `test-k8s-runner.yml` proves the Kubernetes runner works when nothing goes
+# wrong. This job proves what still holds when something does: it injects five
+# faults at two fault-tolerance tiers and checks the promise each tier makes
+# (see docs/self-hosted-chaos.md). A change that keeps the happy path green
+# while breaking recovery shows up here and nowhere else.
+#
+# Nightly rather than per-pull-request: the matrix takes roughly forty minutes
+# once the images are built, and most of that is cluster churn, not code.
+name: Chaos Matrix
+
+on:
+  schedule:
+    # 02:17 UTC: off the hour, so it does not race the other nightly jobs for
+    # the shared self-hosted runner.
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  chaos:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'chaos-matrix') }}
+    name: Fault-injection matrix on kind
+    # The same runner as test-k8s-runner.yml: it needs a Docker daemon for
+    # kind, and the disk below fails it early if the runner is too small for
+    # three images plus a cluster. The matrix takes ~40 minutes on top of the
+    # time this job takes to finish, so the limit is generous.
+    runs-on: ${{ vars.K8S_E2E_RUNNER || 'ubuntu-latest-amd64' }}
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+
+      - name: Check the runner can host the cluster
+        run: |
+          set -euo pipefail
+          docker info >/dev/null || {
+            echo "error: no Docker daemon; kind needs one and the image build needs it too" >&2
+            exit 1
+          }
+          available="$(df -Pk . | awk 'NR==2 { print int($4 / 1024 / 1024) }')"
+          echo "free disk: ${available} GiB"
+          if [ "${available}" -lt 40 ]; then
+            echo "error: need at least 40 GiB free, have ${available} GiB;" >&2
+            echo "point K8S_E2E_RUNNER at a larger runner" >&2
+            exit 1
+          fi
+
+      - name: Create the kind cluster
+        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          cluster_name: feldera-e2e
+
+      - name: Verify the default StorageClass
+        # Every cell that runs a pipeline needs one, and the drop-storage cell
+        # needs it twice: the claim has to bind before the pipeline can start
+        # and be remounted by the helper pod.
+        run: |
+          set -euo pipefail
+          kubectl get storageclass
+          kubectl get storageclass | grep -q '(default)' || {
+            echo "error: the cluster has no default StorageClass" >&2
+            exit 1
+          }
+
+      - name: Build the images
+        # The matrix does not build images itself: it loads them. Caching is
+        # per-layer, so a run with no crate changes reuses the previous build.
+        env:
+          PUSH: 1
+          PRUNE: 1
+          BILI_CARGO_JOBS: 4
+        run: |
+          set -euo pipefail
+          deploy/build-images.sh
+          tag="$(docker image ls --format '{{.Tag}}' localhost:5001/feldera-runner \
+                   | grep -v '<none>' | head -1)"
+          test -n "${tag}" || { echo "error: the build produced no runner image" >&2; exit 1; }
+          echo "FELDERA_E2E_TAG=${tag}" >> "$GITHUB_ENV"
+
+      - name: Run the matrix
+        env:
+          TAG: ${{ env.FELDERA_E2E_TAG }}
+          CLUSTER: feldera-e2e
+          NAMESPACE: feldera
+          # The compiler and the manager share a machine with the cluster here,
+          # so the matrix gets a longer start budget than a hand run.
+          START_TIMEOUT: 1200
+        run: |
+          set -euo pipefail
+          bash scripts/e2e-k8s-chaos.sh
+          # The script prints the matrix to stderr; keep it where a human will
+          # find it even though the job is green.
+          echo "::notice title=chaos matrix::all cells passed"
+
+      - name: Collect the cluster state
+        if: failure()
+        run: |
+          set -uo pipefail
+          for kind in statefulset pod service networkpolicy persistentvolumeclaim; do
+            echo "=== $kind ==="
+            kubectl --namespace feldera get "$kind" -o wide || true
+          done
+          echo "=== pipeline logs ==="
+          for pod in $(kubectl --namespace feldera get pods -o name | grep pipeline- || true); do
+            echo "--- ${pod}"
+            kubectl --namespace feldera logs "${pod}" --tail=200 --all-containers || true
+          done
+          echo "=== control plane ==="
+          kubectl --namespace feldera logs deployment/feldera-controlplane-api-server \
+            --tail=500 --all-containers || true
+          echo "=== database ==="
+          kubectl --namespace feldera logs statefulset/feldera-db \
+            --tail=200 --all-containers || true
+          echo "=== events ==="
+          kubectl --namespace feldera get events --sort-by=.lastTimestamp || true
+
+      - name: Delete the cluster
+        if: always()
+        run: kind delete cluster --name feldera-e2e || true

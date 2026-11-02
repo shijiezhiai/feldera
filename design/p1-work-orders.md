@@ -105,7 +105,7 @@ gantt
 
 | ID | 工单 | 人天 | 依赖 | DoD |
 |---|---|---|---|---|
-| P1-028 | 混沌矩阵 v1：kill pod / 删 PVC / 断 PG / 断对象存储 / 断 Kafka 五类 × L1/L2 档位，每格断言数据水位与重复率（母文档 §8） | 5 | 016,017 | 矩阵进 CI nightly；PG 断连期间数据面不中断得到证明 |
+| P1-028 | 混沌矩阵 v1：kill pod / 删 PVC / 断 PG / 断对象存储 / 断 Kafka 五类 × L1/L2 档位，每格断言数据水位与重复率（母文档 §8）——**实测补充**：①开源树无对象存储后端（`crates/storage/src/lib.rs:219` 只注册 `default`/`file`），「断对象存储」改为让存储目录不可写；②断 PG 时经 manager 的一切请求都失败（`check_pipeline` 先查库），断言必须直连 pod；③输入 broker 不可达时**初始化**是致命的（`refine_kafka_error` 把 connect 失败包成 fatal），已跑的 pipeline 反而不受影响；④跑出真缺陷：控制面数据库原为 `emptyDir`，pod 一换即丢 schema（见 `docs/self-hosted-chaos.md` §3.1，已修） | 5 | 016,017 | 矩阵进 CI nightly（`.github/workflows/chaos-nightly.yml`）；PG 断连期间数据面不中断得到证明（`scripts/e2e-k8s-chaos.sh` 十格全绿） |
 | P1-029 | 试点团队① 接入（2 条非关键 pipeline）+ 问题修复机动 | 4 | S4 门禁 | 连续 7 天无 P0 事故；反馈→backlog |
 | P1-030 | 告警基线：pipeline 非 Running、checkpoint 连续失败>3、checkpoint 年龄>3×间隔、PVC>80%、编译队列延迟、provisioning 超时（指标源 `adapter_stats.rs:512-521`） | 4 | 015 | 每类告警有注入触发用例；值班手册链接 |
 | P1-031 | 升级彩排：rebase 下一上游 tag + 回归门禁首次全量（slt 子集 + `python/tests` + FT 注入 e2e + nexmark 吞吐子集） | 4 | 008,013 | 门禁脚本一键跑；升级耗时与失败清单成文 |

@@ -42,6 +42,16 @@ postgresVersion: "17-alpine"
 postgresImageRepository: "postgres"
 postgresImagePullPolicy: "IfNotPresent"
 postgresPort: 5431
+# The control plane keeps pipelines, API keys and audit rows in this database.
+# On `emptyDir` those live no longer than the pod: replacing the database pod
+# resets the control plane to an empty schema, and because the migrations run
+# only at startup, the API then answers every request with
+# `relation "pipeline" does not exist`. On is what a real deployment wants; off
+# keeps throwaway clusters (kind smoke runs) from leaking a claim each.
+postgresPersistence:
+  enabled: true
+  size: 10Gi
+  storageClassName: ""
 postgresUser: "feldera"
 postgresPassword: ""
 felderaDatabaseSecretRef: ""
