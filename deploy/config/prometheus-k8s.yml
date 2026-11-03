@@ -8,6 +8,11 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# The paging rules (P1-030). They ship beside this file and both the e2e check
+# and the Compose stack mount them at the same path.
+rule_files:
+  - /etc/prometheus/feldera-alerts.yml
+
 scrape_configs:
   # The manager aggregates pipeline *status* only. It is still worth scraping:
   # its readiness and restart counts explain a dashboard that suddenly goes

@@ -195,6 +195,42 @@ impl TryFrom<String> for ProgramStatus {
     }
 }
 
+impl ProgramStatus {
+    /// Every compilation stage, in the order a program moves through them.
+    ///
+    /// The metrics endpoint reports one series per stage, so a stage missing
+    /// from this list is reported as 0 forever: a pipeline waiting in the
+    /// compile queue would look like it is not in the queue at all.  The
+    /// `all_lists_every_variant` test keeps this list in step with the enum.
+    pub const ALL: [Self; 8] = [
+        Self::Pending,
+        Self::CompilingSql,
+        Self::SqlCompiled,
+        Self::CompilingRust,
+        Self::Success,
+        Self::SqlError,
+        Self::RustError,
+        Self::SystemError,
+    ];
+
+    /// True if a program in this stage is waiting for or running a compiler.
+    ///
+    /// These are the stages the compile-queue alert watches: a pipeline parked
+    /// in one of them is either waiting for a compiler slot or being compiled,
+    /// and the time it has spent there is the compile latency.
+    pub fn is_compiling(&self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::CompilingSql | Self::CompilingRust
+        )
+    }
+
+    /// Returns the stage name used as a metric label and in the API.
+    pub fn as_str(&self) -> &'static str {
+        (*self).into()
+    }
+}
+
 impl From<ProgramStatus> for &'static str {
     fn from(val: ProgramStatus) -> Self {
         match val {
@@ -1065,6 +1101,45 @@ mod tests {
                 .gen2_engine_sha(),
             None
         );
+    }
+
+    /// `ALL` drives the per-stage metric series, and a missing stage reports no
+    /// series at all, which reads as every stage being 0.
+    #[test]
+    fn all_lists_every_variant() {
+        use super::ProgramStatus;
+        use utoipa::ToSchema;
+
+        let schema_variants: Vec<String> = serde_json::to_value(ProgramStatus::schema().1).unwrap()
+            ["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|variant| variant.as_str().unwrap().to_string())
+            .collect();
+        // The schema lists the Rust variant names, while `as_str` renders the
+        // serde names, so the comparison is against `Debug` rather than against
+        // the metric label.
+        let listed: Vec<String> = ProgramStatus::ALL
+            .iter()
+            .map(|status| format!("{status:?}"))
+            .collect();
+        assert_eq!(listed, schema_variants);
+    }
+
+    /// The compile-queue alert watches exactly the stages a program waits in or
+    /// runs a compiler in; the terminal stages are not queue time.
+    #[test]
+    fn only_the_compilation_stages_are_compiling() {
+        use super::ProgramStatus;
+
+        for status in ProgramStatus::ALL {
+            let expected = matches!(
+                status,
+                ProgramStatus::Pending | ProgramStatus::CompilingSql | ProgramStatus::CompilingRust
+            );
+            assert_eq!(status.is_compiling(), expected, "{status:?}");
+        }
     }
 
     #[test]

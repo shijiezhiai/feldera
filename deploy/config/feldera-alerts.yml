@@ -1,0 +1,214 @@
+# Alerting baseline for a self-hosted Feldera install (P1-030).
+#
+# Six conditions page the on-call engineer. Each rule is written against a
+# series this repository exports, and each has an injection test that makes the
+# rule fire on purpose: `scripts/e2e-k8s-alerts.sh` proves rule by rule that a
+# healthy install stays quiet and an injected fault fires.
+#
+# Scope: the two `since` gauges make the "how long" rules work without a
+# scrape-interval assumption, and the checkpoint gauges are per-pipeline, so a
+# rule needs no knowledge of which pipelines exist.
+#
+# These rules are the alerting half of monitoring. `design/p1-015-monitoring.md`
+# §7 recorded that P1-015 shipped a dashboard and no pager; this file is the
+# pager.
+groups:
+  - name: feldera-pipelines
+    interval: 30s
+    rules:
+      # 1. A pipeline that was asked to run and has not got there.
+      #
+      # "Not Running" alone is not a fault: a Stopped pipeline is exactly where
+      # its owner left it. The rule watches the statuses that mean "on the way
+      # up", because a pipeline still in one of them after the grace period is
+      # stuck rather than starting. `deployment_resources_desired_status` is not
+      # exported, so the rule cannot distinguish "asked to run" from "asked to
+      # stop" directly; it distinguishes them by status instead.
+      #
+      # Deliberately not covered:
+      #   - `Standby` parks until a failover promotes it, and a standby pipeline
+      #     sits there for days by design. Paging on that would page on a
+      #     healthy standby (P3 control-plane HA keeps it that way).
+      #   - `AwaitingApproval` waits for a human to approve bootstrapping; how
+      #     long that takes is the human's business, not an incident.
+      #   - `Coordination` is the multihost handshake, and standby pipelines hold
+      #     it for as long as they stand by.
+      #
+      # `Provisioning` is listed here and again in rule 6 with a longer,
+      # critical deadline: a slow provision warns first and escalates later.
+      - alert: FelderaPipelineNotRunning
+        expr: |
+          pipeline_status{status=~"Provisioning|Initializing|Bootstrapping|ConcurrentBootstrapping|Synchronizing|Replaying"} == 1
+            and on (pipeline, pipeline_name)
+          (time() - pipeline_status_since_timestamp_seconds) > 900
+        for: 5m
+        labels:
+          severity: warning
+          component: pipeline
+        annotations:
+          summary: "Pipeline {{ $labels.pipeline_name }} has not reached Running for 15 minutes"
+          description: >-
+            {{ $labels.pipeline_name }} has been in {{ $labels.status }} for
+            more than 15 minutes. Check the pipeline's deployment events and the
+            manager's log for the reason it is stuck. A pipeline that is Stopped
+            on purpose does not fire this rule, and neither does one that is
+            standing by for failover.
+          runbook_url: "docs/operations/alerting.md#felderapipelinenotrunning"
+
+      # 2. More than three permanent checkpoint failures.
+      #
+      # A temporary failure (a delayed checkpoint, a pending barrier) is not
+      # counted by `feldera_checkpoint_failures_total`; only permanent ones are.
+      # Three consecutive failures is the work order's threshold, and the
+      # window is long enough that one bad minute does not page.
+      - alert: FelderaCheckpointFailing
+        expr: |
+          increase(feldera_checkpoint_failures_total[15m]) > 3
+        for: 0m
+        labels:
+          severity: critical
+          component: pipeline
+        annotations:
+          summary: "Pipeline {{ $labels.pipeline_name }} failed {{ $value | humanize }} checkpoints in 15 minutes"
+          description: >-
+            {{ $labels.pipeline_name }} has failed more than three checkpoints
+            in the last 15 minutes. Fault tolerance cannot make progress while
+            this lasts: a restart would lose everything since the last good
+            checkpoint. Read `feldera_checkpoint_last_failure_timestamp_seconds`
+            and the pipeline log for the cause.
+          runbook_url: "docs/operations/alerting.md#felderacheckpointfailing"
+
+      # 3. No successful checkpoint for three times the configured interval.
+      #
+      # The interval is exported per pipeline, so the rule needs no constant. A
+      # pipeline with fault tolerance disabled exports an interval of 0 and
+      # never checkpoints: the `> 0` guard skips it, because a pipeline that
+      # cannot checkpoint is not a pipeline that stopped checkpointing.
+      #
+      # `feldera_checkpoint_last_success_timestamp_seconds` is 0 until the first
+      # checkpoint commits, and `time() - 0` is enormous, so a freshly started
+      # FT pipeline would fire immediately. The `> 0` guard on the timestamp
+      # handles that by waiting for the first success, at the cost of not
+      # alerting on a pipeline whose *first* checkpoint never succeeds; rule 2
+      # covers that case through the failure counter.
+      - alert: FelderaCheckpointStale
+        expr: |
+          (
+            time() - feldera_checkpoint_last_success_timestamp_seconds
+          ) > 3 * feldera_checkpoint_interval_seconds
+            and feldera_checkpoint_interval_seconds > 0
+            and feldera_checkpoint_last_success_timestamp_seconds > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: pipeline
+        annotations:
+          summary: "Pipeline {{ $labels.pipeline_name }} has not checkpointed for three intervals"
+          description: >-
+            The last successful checkpoint of {{ $labels.pipeline_name }} is
+            more than three times its configured interval old. Checkpoints have
+            stopped making progress, which means the pipeline's recovery point
+            is also that old. Compare with
+            `feldera_checkpoint_failures_total` and the pipeline log.
+          runbook_url: "docs/operations/alerting.md#felderacheckpointstale"
+
+      # 4. The volume holding pipeline storage is more than 80% full.
+      #
+      # `storage_usage_bytes` cannot answer this: it counts what Feldera wrote,
+      # and the volume also holds journals, logs and other tenants' files. The
+      # two `feldera_storage_volume_*` gauges are the volume itself. A pipeline
+      # on an object store or in memory exports neither, so `absent()` is not a
+      # fault and the rule simply has no series for it.
+      - alert: FelderaStorageVolumeFillingUp
+        expr: |
+          (
+            feldera_storage_volume_total_bytes - feldera_storage_volume_available_bytes
+          ) / feldera_storage_volume_total_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "The volume behind {{ $labels.pipeline_name }} is {{ $value | humanizePercentage }} full"
+          description: >-
+            The volume holding {{ $labels.pipeline_name }}'s storage has less
+            than 20% free. Writes fail when it fills, and a checkpoint that
+            cannot be written leaves the pipeline without a recovery point.
+            Free space or move the pipeline to a larger volume.
+          runbook_url: "docs/operations/alerting.md#felderastoragevolumefillingup"
+
+      # 5. Compilation is queued or running for too long.
+      #
+      # Both halves come from the manager. `pipeline_program_status` says which
+      # stage a program is in and `pipeline_program_status_since_timestamp_seconds`
+      # says since when, so a program parked in `pending` is the compile queue
+      # and one parked in a compiler stage is the compile itself. The threshold
+      # is generous: the first compile of a large program on a cold cache takes
+      # minutes, and paging on that would train the on-call to ignore the rule.
+      - alert: FelderaCompileQueueSlow
+        expr: |
+          pipeline_program_status{program_status=~"pending|compiling_sql|compiling_rust"} == 1
+            and on (pipeline, pipeline_name)
+          (
+            time() - pipeline_program_status_since_timestamp_seconds
+          ) > 1800
+        for: 5m
+        labels:
+          severity: warning
+          component: manager
+        annotations:
+          summary: "Compiling {{ $labels.pipeline_name }} is taking over 30 minutes"
+          description: >-
+            {{ $labels.pipeline_name }} has been in program stage
+            {{ $labels.program_status }} for more than half an hour. If it is
+            `pending` the compile queue is backed up; if it is a compiler stage
+            the compiler is running long. Check the compiler pod's CPU and the
+            manager log for which stage moved last.
+          runbook_url: "docs/operations/alerting.md#felderacompilequeueslow"
+
+      # 6. Provisioning has timed out.
+      #
+      # Rule 1 covers every status that means "on the way up" with one grace
+      # period. Provisioning is the one where the *manager* owns the timeout:
+      # `deployment_resources_status` moves out of Provisioning when the runner
+      # gives up, so a pipeline still here past the runner's own deadline is a
+      # runner that is wedged rather than a pipeline that is slow.
+      - alert: FelderaProvisioningTimeout
+        expr: |
+          pipeline_status{status="Provisioning"} == 1
+            and on (pipeline, pipeline_name)
+          (
+            time() - pipeline_status_since_timestamp_seconds
+          ) > 1800
+        for: 5m
+        labels:
+          severity: critical
+          component: runner
+        annotations:
+          summary: "Provisioning {{ $labels.pipeline_name }} has taken over 30 minutes"
+          description: >-
+            {{ $labels.pipeline_name }} has been Provisioning for more than 30
+            minutes, longer than the runner's own deadline. The runner may be
+            wedged or the cluster may have no capacity. Check the runner pods
+            and the node's schedulable resources.
+          runbook_url: "docs/operations/alerting.md#felderaprovisioningtimeout"
+
+  # A Prometheus that cannot scrape cannot alert, and a target that has been
+  # down for an hour is itself the incident. This watches the two jobs this
+  # repository's configs define.
+  - name: feldera-scrape
+    rules:
+      - alert: FelderaScrapeTargetDown
+        expr: |
+          up{job=~"feldera|feldera-manager|feldera-pipelines"} == 0
+        for: 10m
+        labels:
+          severity: critical
+          component: monitoring
+        annotations:
+          summary: "Cannot scrape {{ $labels.job }}/{{ $labels.instance }}"
+          description: >-
+            Prometheus has failed to scrape this target for ten minutes. While
+            it is down every pipeline alert on that target is blind. Check the
+            target's pod and whether it still serves `/metrics`.
+          runbook_url: "docs/operations/alerting.md#felderascrapetargetdown"

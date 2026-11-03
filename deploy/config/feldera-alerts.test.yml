@@ -1,0 +1,400 @@
+# Injection tests for `feldera-alerts.yml` (P1-030).
+#
+# Run with:
+#
+#   promtool test rules deploy/config/feldera-alerts.test.yml
+#
+# Each rule gets two kinds of case. A *firing* case injects the series the rule
+# is meant to catch and asserts the alert is raised after its `for` has elapsed.
+# A *quiet* case injects the series that look like a fault but are healthy by
+# design — a Stopped pipeline, a Standby pipeline, a pipeline with fault
+# tolerance off — and asserts nothing is raised. The quiet cases matter more
+# than the firing ones: an alert that fires on a healthy install is an alert
+# the on-call engineer learns to ignore.
+#
+# The series here are synthetic. These tests prove the rules select the right
+# series and honour their thresholds; `scripts/e2e-k8s-alerts.sh` proves the
+# install actually exports those series.
+#
+# Every firing case spells out `exp_annotations` in full. promtool compares
+# annotations exactly, so an expectation that omitted them would fail against a
+# rule that has any; keeping them also pins each rule's `runbook_url`, which is
+# the work order's other deliverable. The cost of that choice is that rewording
+# an alert breaks these tests, which is the right moment to notice.
+#
+# Timestamps: promtool evaluates a unit test on a clock that starts at the Unix
+# epoch, so `time()` reads 0 at the first evaluation and the test file's
+# `interval` thereafter. A `since` value of `0` therefore means "the epoch" and
+# `time() - 0` grows with the test clock, which is why the staleness cases use
+# small, nonzero timestamps: the rules guard on `> 0`.
+rule_files:
+  - feldera-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- 1. FelderaPipelineNotRunning -----------------------------------------
+  #
+  # A pipeline that has been Provisioning for longer than the 15-minute grace
+  # period raises a warning. `for: 5m` means the alert starts pending at 15m and
+  # fires at 20m.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_status{pipeline="p1",pipeline_name="p1",status="Provisioning"}'
+        values: '1x30'
+      - series: 'pipeline_status_since_timestamp_seconds{pipeline="p1",pipeline_name="p1"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: FelderaPipelineNotRunning
+        exp_alerts: []
+      - eval_time: 22m
+        alertname: FelderaPipelineNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: pipeline
+              pipeline: p1
+              pipeline_name: p1
+              status: Provisioning
+            exp_annotations:
+              description: "p1 has been in Provisioning for more than 15 minutes. Check the pipeline's deployment events and the manager's log for the reason it is stuck. A pipeline that is Stopped on purpose does not fire this rule, and neither does one that is standing by for failover."
+              runbook_url: "docs/operations/alerting.md#felderapipelinenotrunning"
+              summary: "Pipeline p1 has not reached Running for 15 minutes"
+
+  # A pipeline that is Standing by for failover stays there for days. P3's
+  # control-plane HA parks one on purpose, so paging on it would page on health.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_status{pipeline="p2",pipeline_name="p2",status="Standby"}'
+        values: '1x120'
+      - series: 'pipeline_status_since_timestamp_seconds{pipeline="p2",pipeline_name="p2"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: FelderaPipelineNotRunning
+        exp_alerts: []
+
+  # A pipeline somebody stopped is exactly where they left it.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_status{pipeline="p3",pipeline_name="p3",status="Stopped"}'
+        values: '1x60'
+      - series: 'pipeline_status_since_timestamp_seconds{pipeline="p3",pipeline_name="p3"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: FelderaPipelineNotRunning
+        exp_alerts: []
+
+  # A pipeline under its grace period is slow, not stuck.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_status{pipeline="p4",pipeline_name="p4",status="Provisioning"}'
+        values: '1x10'
+      - series: 'pipeline_status_since_timestamp_seconds{pipeline="p4",pipeline_name="p4"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: FelderaPipelineNotRunning
+        exp_alerts: []
+
+  # One pipeline stalled must not be masked by another that is fine.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_status{pipeline="ok",pipeline_name="ok",status="Running"}'
+        values: '1x30'
+      - series: 'pipeline_status_since_timestamp_seconds{pipeline="ok",pipeline_name="ok"}'
+        values: '0x30'
+      - series: 'pipeline_status{pipeline="p5",pipeline_name="p5",status="Initializing"}'
+        values: '1x30'
+      - series: 'pipeline_status_since_timestamp_seconds{pipeline="p5",pipeline_name="p5"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: FelderaPipelineNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: pipeline
+              pipeline: p5
+              pipeline_name: p5
+              status: Initializing
+            exp_annotations:
+              description: "p5 has been in Initializing for more than 15 minutes. Check the pipeline's deployment events and the manager's log for the reason it is stuck. A pipeline that is Stopped on purpose does not fire this rule, and neither does one that is standing by for failover."
+              runbook_url: "docs/operations/alerting.md#felderapipelinenotrunning"
+              summary: "Pipeline p5 has not reached Running for 15 minutes"
+
+  # --- 2. FelderaCheckpointFailing ------------------------------------------
+  #
+  # The counter is cumulative, so the rule reads its increase. Five permanent
+  # failures in fifteen minutes is more than the three the work order allows.
+  - interval: 1m
+    input_series:
+      - series: 'feldera_checkpoint_failures_total{pipeline="p1",pipeline_name="p1"}'
+        values: '0x5 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FelderaCheckpointFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: pipeline
+              pipeline: p1
+              pipeline_name: p1
+            exp_annotations:
+              description: "p1 has failed more than three checkpoints in the last 15 minutes. Fault tolerance cannot make progress while this lasts: a restart would lose everything since the last good checkpoint. Read `feldera_checkpoint_last_failure_timestamp_seconds` and the pipeline log for the cause."
+              runbook_url: "docs/operations/alerting.md#felderacheckpointfailing"
+              summary: "Pipeline p1 failed 15 checkpoints in 15 minutes"
+
+  # Two failures in the window are within what the work order tolerates.
+  - interval: 1m
+    input_series:
+      - series: 'feldera_checkpoint_failures_total{pipeline="p2",pipeline_name="p2"}'
+        values: '0x10 1 2 2 2 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FelderaCheckpointFailing
+        exp_alerts: []
+
+  # --- 3. FelderaCheckpointStale --------------------------------------------
+  #
+  # An interval of 60s and a last success at t=1: by 20m the pipeline is 1200s
+  # past a success that should have come 3 x 60 = 180s after the last one.
+  - interval: 1m
+    input_series:
+      - series: 'feldera_checkpoint_interval_seconds{pipeline="p1",pipeline_name="p1"}'
+        values: '60x30'
+      - series: 'feldera_checkpoint_last_success_timestamp_seconds{pipeline="p1",pipeline_name="p1"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: FelderaCheckpointStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: pipeline
+              pipeline: p1
+              pipeline_name: p1
+            exp_annotations:
+              description: "The last successful checkpoint of p1 is more than three times its configured interval old. Checkpoints have stopped making progress, which means the pipeline's recovery point is also that old. Compare with `feldera_checkpoint_failures_total` and the pipeline log."
+              runbook_url: "docs/operations/alerting.md#felderacheckpointstale"
+              summary: "Pipeline p1 has not checkpointed for three intervals"
+
+  # Fault tolerance is off: the pipeline exports an interval of 0 and will
+  # never checkpoint. That is not a stalled pipeline.
+  - interval: 1m
+    input_series:
+      - series: 'feldera_checkpoint_interval_seconds{pipeline="p2",pipeline_name="p2"}'
+        values: '0x60'
+      - series: 'feldera_checkpoint_last_success_timestamp_seconds{pipeline="p2",pipeline_name="p2"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: FelderaCheckpointStale
+        exp_alerts: []
+
+  # Fault tolerance is on and the first checkpoint has not happened yet. The
+  # last-success gauge is 0, and `time() - 0` is every bit as large as a truly
+  # stale checkpoint, so the rule must not treat "never" as "long ago".
+  - interval: 1m
+    input_series:
+      - series: 'feldera_checkpoint_interval_seconds{pipeline="p3",pipeline_name="p3"}'
+        values: '60x60'
+      - series: 'feldera_checkpoint_last_success_timestamp_seconds{pipeline="p3",pipeline_name="p3"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: FelderaCheckpointStale
+        exp_alerts: []
+
+  # A pipeline checkpointing on schedule is quiet.
+  - interval: 1m
+    input_series:
+      - series: 'feldera_checkpoint_interval_seconds{pipeline="p4",pipeline_name="p4"}'
+        values: '60x60'
+      - series: 'feldera_checkpoint_last_success_timestamp_seconds{pipeline="p4",pipeline_name="p4"}'
+        values: '1+60x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: FelderaCheckpointStale
+        exp_alerts: []
+
+  # --- 4. FelderaStorageVolumeFillingUp -------------------------------------
+  #
+  # 90 of 100 bytes are in use.
+  - interval: 1m
+    input_series:
+      - series: 'feldera_storage_volume_total_bytes{pipeline="p1",pipeline_name="p1"}'
+        values: '100x30'
+      - series: 'feldera_storage_volume_available_bytes{pipeline="p1",pipeline_name="p1"}'
+        values: '10x30'
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: FelderaStorageVolumeFillingUp
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: storage
+              pipeline: p1
+              pipeline_name: p1
+            exp_annotations:
+              description: "The volume holding p1's storage has less than 20% free. Writes fail when it fills, and a checkpoint that cannot be written leaves the pipeline without a recovery point. Free space or move the pipeline to a larger volume."
+              runbook_url: "docs/operations/alerting.md#felderastoragevolumefillingup"
+              summary: "The volume behind p1 is 90% full"
+
+  # Half full is not filling up.
+  - interval: 1m
+    input_series:
+      - series: 'feldera_storage_volume_total_bytes{pipeline="p2",pipeline_name="p2"}'
+        values: '100x30'
+      - series: 'feldera_storage_volume_available_bytes{pipeline="p2",pipeline_name="p2"}'
+        values: '50x30'
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: FelderaStorageVolumeFillingUp
+        exp_alerts: []
+
+  # A pipeline on an object store exports neither gauge. A missing series is
+  # not an empty volume.
+  - interval: 1m
+    input_series:
+      - series: 'feldera_storage_usage_bytes{pipeline="p3",pipeline_name="p3"}'
+        values: '999999x30'
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: FelderaStorageVolumeFillingUp
+        exp_alerts: []
+
+  # --- 5. FelderaCompileQueueSlow -------------------------------------------
+  #
+  # A compile has been running for over the 30-minute threshold.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_program_status{pipeline="p1",pipeline_name="p1",program_status="compiling_rust"}'
+        values: '1x45'
+      - series: 'pipeline_program_status_since_timestamp_seconds{pipeline="p1",pipeline_name="p1",program_status="compiling_rust"}'
+        values: '1x45'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: FelderaCompileQueueSlow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: manager
+              pipeline: p1
+              pipeline_name: p1
+              program_status: compiling_rust
+            exp_annotations:
+              description: "p1 has been in program stage compiling_rust for more than half an hour. If it is `pending` the compile queue is backed up; if it is a compiler stage the compiler is running long. Check the compiler pod's CPU and the manager log for which stage moved last."
+              runbook_url: "docs/operations/alerting.md#felderacompilequeueslow"
+              summary: "Compiling p1 is taking over 30 minutes"
+
+  # A program that finished compiling is not in the queue.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_program_status{pipeline="p2",pipeline_name="p2",program_status="success"}'
+        values: '1x60'
+      - series: 'pipeline_program_status_since_timestamp_seconds{pipeline="p2",pipeline_name="p2",program_status="success"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: FelderaCompileQueueSlow
+        exp_alerts: []
+
+  # A compile that has been going for a few minutes is normal, including the
+  # cold-cache first build of a large program.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_program_status{pipeline="p3",pipeline_name="p3",program_status="compiling_sql"}'
+        values: '1x10'
+      - series: 'pipeline_program_status_since_timestamp_seconds{pipeline="p3",pipeline_name="p3",program_status="compiling_sql"}'
+        values: '120x10'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: FelderaCompileQueueSlow
+        exp_alerts: []
+
+  # --- 6. FelderaProvisioningTimeout ----------------------------------------
+  #
+  # Past the runner's own 30-minute deadline, so the runner is wedged rather
+  # than the provision being slow.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_status{pipeline="p1",pipeline_name="p1",status="Provisioning"}'
+        values: '1x45'
+      - series: 'pipeline_status_since_timestamp_seconds{pipeline="p1",pipeline_name="p1"}'
+        values: '1x45'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: FelderaProvisioningTimeout
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: runner
+              pipeline: p1
+              pipeline_name: p1
+              status: Provisioning
+            exp_annotations:
+              description: "p1 has been Provisioning for more than 30 minutes, longer than the runner's own deadline. The runner may be wedged or the cluster may have no capacity. Check the runner pods and the node's schedulable resources."
+              runbook_url: "docs/operations/alerting.md#felderaprovisioningtimeout"
+              summary: "Provisioning p1 has taken over 30 minutes"
+
+  # Rule 1 warns long before this rule escalates: at 20m the provisioning is
+  # over the 15-minute grace period but not over the 30-minute deadline.
+  - interval: 1m
+    input_series:
+      - series: 'pipeline_status{pipeline="p2",pipeline_name="p2",status="Provisioning"}'
+        values: '1x22'
+      - series: 'pipeline_status_since_timestamp_seconds{pipeline="p2",pipeline_name="p2"}'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 21m
+        alertname: FelderaProvisioningTimeout
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: FelderaPipelineNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: pipeline
+              pipeline: p2
+              pipeline_name: p2
+              status: Provisioning
+            exp_annotations:
+              description: "p2 has been in Provisioning for more than 15 minutes. Check the pipeline's deployment events and the manager's log for the reason it is stuck. A pipeline that is Stopped on purpose does not fire this rule, and neither does one that is standing by for failover."
+              runbook_url: "docs/operations/alerting.md#felderapipelinenotrunning"
+              summary: "Pipeline p2 has not reached Running for 15 minutes"
+
+  # --- 7. FelderaScrapeTargetDown -------------------------------------------
+  #
+  # A target Prometheus cannot scrape has been down for ten minutes.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="feldera-pipelines",instance="10.244.0.9:8080"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FelderaScrapeTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: monitoring
+              job: feldera-pipelines
+              instance: 10.244.0.9:8080
+            exp_annotations:
+              description: "Prometheus has failed to scrape this target for ten minutes. While it is down every pipeline alert on that target is blind. Check the target's pod and whether it still serves `/metrics`."
+              runbook_url: "docs/operations/alerting.md#felderascrapetargetdown"
+              summary: "Cannot scrape feldera-pipelines/10.244.0.9:8080"
+
+  # A healthy target, and a target of some unrelated job, are both quiet.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="feldera-manager",instance="10.244.0.10:8080"}'
+        values: '1x60'
+      - series: 'up{job="node-exporter",instance="10.244.0.11:9100"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: FelderaScrapeTargetDown
+        exp_alerts: []

@@ -170,7 +170,8 @@ Recorded numbers are in §8.
 
 ## 7. What is not here
 
-- **Alerts.** The dashboard shows; it does not page.
+- **Alerts.** The dashboard shows; it did not page. P1-030 added the alerting
+  layer on top of these series — see `design/p1-030-alerting.md`.
 - **Per-tenant metric isolation.** Any pod in the scrape namespace reads every
   pipeline's metrics. Multi-tenancy (P2) has to decide whether that is
   acceptable.
