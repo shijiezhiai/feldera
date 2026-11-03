@@ -1310,6 +1310,7 @@ async fn user_created_at_is_recorded() {
                 Role::Read,
                 Role::Admin,
                 MembershipOrigin::Derived,
+                None,
             )
             .await
             .unwrap()

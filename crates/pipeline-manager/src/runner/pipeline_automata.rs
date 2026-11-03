@@ -2274,6 +2274,8 @@ mod test {
             Duration::from_secs(u64::MAX)
         ));
         assert!(!elapsed_exceeds(since, later, Duration::MAX));
+    }
+
     /// What the mock executor should do on its next call, so a test can put the
     /// automaton into a state a real cluster produces but that a happy-path mock
     /// never reaches: a pod that vanished, a watch that dropped, a stop that
@@ -2479,7 +2481,17 @@ mod test {
                 .lock()
                 .unwrap()
                 .push(("check", deployment_config.clone()));
-            Ok(json!(""))
+            match self.faults.take_check() {
+                Some(Fault::CheckPodGone) => Err(RunnerError::RunnerCheckError {
+                    error: "the pipeline pod does not exist in namespace 'feldera'".to_string(),
+                }
+                .into()),
+                Some(Fault::CheckUnreachable) => Err(RunnerError::RunnerCheckError {
+                    error: "the cluster could not be reached: connection refused".to_string(),
+                }
+                .into()),
+                _ => Ok(json!("")),
+            }
         }
 
         async fn stop(
@@ -2490,6 +2502,12 @@ mod test {
                 .lock()
                 .unwrap()
                 .push(("stop", deployment_config.clone()));
+            if self.faults.take_stop() == Some(Fault::StopUnreachable) {
+                return Err(RunnerError::RunnerStopError {
+                    error: "the cluster could not be reached: connection refused".to_string(),
+                }
+                .into());
+            }
             Ok(())
         }
 
@@ -2501,30 +2519,6 @@ mod test {
                 .lock()
                 .unwrap()
                 .push(("clear", deployment_config.clone()));
-            match self.faults.take_check() {
-                Some(Fault::CheckPodGone) => Err(RunnerError::RunnerCheckError {
-                    error: "the pipeline pod does not exist in namespace \'feldera\'".to_string(),
-                }
-                .into()),
-                Some(Fault::CheckUnreachable) => Err(RunnerError::RunnerCheckError {
-                    error: "the cluster could not be reached: connection refused".to_string(),
-                }
-                .into()),
-                _ => Ok(json!("")),
-            }
-        }
-
-        async fn stop(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
-            if self.faults.take_stop() == Some(Fault::StopUnreachable) {
-                return Err(RunnerError::RunnerStopError {
-                    error: "the cluster could not be reached: connection refused".to_string(),
-                }
-                .into());
-            }
-            Ok(())
-        }
-
-        async fn clear(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
             if self.faults.take_clear() == Some(Fault::ClearUnreachable) {
                 return Err(RunnerError::RunnerClearError {
                     error: "the cluster could not be reached: connection refused".to_string(),
@@ -2714,6 +2708,28 @@ mod test {
                 .await
                 .unwrap();
         }
+    }
+
+    /// Builds a test automaton whose runner injects no faults.
+    ///
+    /// Most tests exercise the state machine rather than the runner's failure
+    /// modes, so they do not name a schedule.
+    async fn setup(
+        db: Arc<Mutex<StoragePostgres>>,
+        deployment_location: String,
+        runtime_config: serde_json::Value,
+        program_config: serde_json::Value,
+        udf_rust: &str,
+    ) -> AutomatonTest {
+        setup_with_faults(
+            db,
+            deployment_location,
+            runtime_config,
+            program_config,
+            udf_rust,
+            FaultSchedule::default(),
+        )
+        .await
     }
 
     async fn setup_with_faults(
@@ -2955,8 +2971,7 @@ mod test {
         (
             mock_server,
             temp_dir,
-            setup(db.clone(), addr, runtime_config, program_config, "").await,
-            setup_with_faults(db.clone(), addr, runtime_config, program_config, faults).await,
+            setup_with_faults(db.clone(), addr, runtime_config, program_config, "", faults).await,
         )
     }
 
@@ -3614,6 +3629,8 @@ mod test {
                 .any(|line| line.contains("The control plane took")),
             "{lines:?}"
         );
+    }
+
     /// Drives the automaton from `Stopped` to `Provisioned` with a runtime status
     /// of `Running`, which is the state every fault test below starts from.
     async fn drive_to_running(

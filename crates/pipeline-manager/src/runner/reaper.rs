@@ -237,7 +237,7 @@ async fn namespaces_to_scan(db: &StoragePostgres, config: &KubernetesRunnerConfi
         Ok(pipelines) => {
             for (_, pipeline) in pipelines {
                 if let Some(namespace) =
-                    crate::runner::pipeline_executor::discover_namespace_from_runtime_config_json(
+                    crate::runner::pipeline_executor::discover_namespace_from_pipeline_config_json(
                         &pipeline.runtime_config,
                     )
                 {
@@ -334,17 +334,13 @@ async fn list_kind(
     kind: ResourceKind,
 ) -> Result<Vec<ListedObject>, kube::Error> {
     match kind {
-        ResourceKind::StatefulSet => {
-            names::<StatefulSet>(client, namespace).await
-        }
+        ResourceKind::StatefulSet => names::<StatefulSet>(client, namespace).await,
         ResourceKind::Service | ResourceKind::MetricsService => {
             names::<Service>(client, namespace).await
         }
         ResourceKind::NetworkPolicy => names::<NetworkPolicy>(client, namespace).await,
         ResourceKind::Secret => names::<Secret>(client, namespace).await,
-        ResourceKind::StorageClaim => {
-            names::<PersistentVolumeClaim>(client, namespace).await
-        }
+        ResourceKind::StorageClaim => names::<PersistentVolumeClaim>(client, namespace).await,
     }
 }
 
@@ -379,8 +375,7 @@ where
                 // A claim a deletion deliberately kept carries the marker; it
                 // is state an operator chose to keep, not a leftover.
                 retained: metadata.annotations.as_ref().is_some_and(|annotations| {
-                    annotations
-                        .contains_key(crate::runner::kubernetes_runner::RETENTION_ANNOTATION)
+                    annotations.contains_key(crate::runner::kubernetes_runner::RETENTION_ANNOTATION)
                 }),
             })
         })
@@ -495,7 +490,10 @@ mod tests {
     /// as the id `None` for a Service and be listed as orphaned.
     #[test]
     fn rejects_a_name_of_another_kind() {
-        assert_eq!(pipeline_id_from_name(ResourceKind::Service, &format!("pipeline-{ID}-storage")), None);
+        assert_eq!(
+            pipeline_id_from_name(ResourceKind::Service, &format!("pipeline-{ID}-storage")),
+            None
+        );
         assert_eq!(
             pipeline_id_from_name(ResourceKind::StorageClaim, &format!("pipeline-{ID}")),
             None
@@ -560,7 +558,10 @@ mod tests {
     /// namespace `feldera`, with every deletion succeeding.
     fn cluster_with(
         objects: &[(&str, &[FakeObject])],
-    ) -> (Client, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+    ) -> (
+        Client,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
         cluster_with_forbidden(objects, &[])
     }
 
@@ -568,7 +569,10 @@ mod tests {
     fn cluster_with_forbidden(
         objects: &[(&str, &[FakeObject])],
         forbidden: &[&str],
-    ) -> (Client, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+    ) -> (
+        Client,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
         use bytes::Bytes;
         use http::{Method, Request, Response, StatusCode};
         use http_body_util::Full;
@@ -611,7 +615,7 @@ mod tests {
                                 StatusCode::NOT_FOUND,
                                 "NotFound",
                                 &path,
-                            ))
+                            ));
                         }
                     };
                     if forbidden.iter().any(|denied| denied == kind) {
@@ -718,7 +722,14 @@ mod tests {
         let live = format!("pipeline-{ID}");
         let (client, requests) = cluster_with(&[("statefulsets", &[object(&live)])]);
         let mut report = ScanReport::default();
-        scan_namespace(&client, "feldera", &[pipeline_id_of(&live)], false, &mut report).await;
+        scan_namespace(
+            &client,
+            "feldera",
+            &[pipeline_id_of(&live)],
+            false,
+            &mut report,
+        )
+        .await;
 
         assert!(report.unreferenced.is_empty(), "{report:?}");
         assert!(
@@ -740,7 +751,11 @@ mod tests {
         let orphan = format!("pipeline-{ID}");
         let (client, _) = cluster_with(&[(
             "statefulsets",
-            &[object(&orphan), object("pipeline-not-a-uuid"), object("feldera-db-0")],
+            &[
+                object(&orphan),
+                object("pipeline-not-a-uuid"),
+                object("feldera-db-0"),
+            ],
         )]);
         let mut report = ScanReport::default();
         scan_namespace(&client, "feldera", &[], false, &mut report).await;
@@ -870,10 +885,8 @@ mod tests {
     #[tokio::test]
     async fn reports_a_list_failure_and_continues() {
         let base = format!("pipeline-{ID}");
-        let (client, _) = cluster_with_forbidden(
-            &[("statefulsets", &[object(&base)])],
-            &["secrets"],
-        );
+        let (client, _) =
+            cluster_with_forbidden(&[("statefulsets", &[object(&base)])], &["secrets"]);
         let mut report = ScanReport::default();
         scan_namespace(&client, "feldera", &[], false, &mut report).await;
 

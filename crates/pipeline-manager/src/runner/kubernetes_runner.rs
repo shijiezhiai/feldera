@@ -44,22 +44,25 @@ use crate::config::{CommonConfig, KubernetesRunnerConfig};
 use crate::db::types::pipeline::{
     PipelineId, bootstrap_policy_to_string, runtime_desired_status_to_string,
 };
-use crate::db::types::tenant::TenantId;
 use crate::db::types::program::ProgramInfo;
+use crate::db::types::program::RuntimeSelector;
+use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use crate::pipeline_env::validate_pipeline_env;
 use crate::runner::error::RunnerError;
 use crate::runner::pipeline_executor::{
-    PipelineExecutor, ProvisionStatus, discover_namespace_from_runtime_config_json,
+    PipelineExecutor, ProvisionStatus, discover_namespace_from_pipeline_config_json,
 };
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use crate::runner::tenant_namespace;
 use async_trait::async_trait;
 use feldera_types::config::{
-    PipelineConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig, StorageOptions,
+    LegacySpelling, PipelineConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig,
+    StorageOptions,
 };
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
+use feldera_types::size::ConfigSize;
 use futures_util::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
@@ -327,11 +330,16 @@ impl ResourceLimits {
     }
 
     /// Storage requested by a pipeline, in MB, with the default applied.
+    ///
+    /// The pipeline names its storage as a `ConfigSize`; the platform works in
+    /// megabytes, so the size is rounded up: a claim one byte over a megabyte
+    /// must still be one megabyte, and Kubernetes rejects fractional Mi.
     pub fn storage_for(&self, config: &PipelineConfig) -> u64 {
         let resources = &config.global.resources;
         let requested = resources
-            .storage_mb_max
-            .or(resources.storage_mb_min)
+            .storage_max
+            .or(resources.storage_min)
+            .map(mebibytes)
             .unwrap_or(self.storage_mb_default);
         self.clamp_storage(requested)
     }
@@ -358,10 +366,7 @@ impl TenantNamespace {
     /// tenant's pipelines from being provisioned, and a skipped entry merely
     /// falls back to the shared namespace, which is where those pipelines went
     /// before the mapping existed.
-    fn from_config(
-        config: &KubernetesRunnerConfig,
-        tenant_id: &TenantId,
-    ) -> Option<Self> {
+    fn from_config(config: &KubernetesRunnerConfig, tenant_id: &TenantId) -> Option<Self> {
         // A tenant that carries a quota is placed by that entry, which names
         // one namespace and one quota for it. Consulting the plain mapping
         // first would let the two settings disagree about where a tenant's
@@ -399,7 +404,7 @@ impl TenantNamespace {
                     return Some(Self {
                         tenant_id: *tenant_id,
                         namespace: namespace.to_string(),
-                    })
+                    });
                 }
                 Ok(_) => continue,
                 Err(error) => {
@@ -447,10 +452,7 @@ impl StorageClassPolicy {
     /// one, and otherwise the cluster's own default — which is the one case in
     /// which the policy cannot choose, because naming a class the cluster does
     /// not have would fail provisioning outright.
-    pub fn resolve(
-        &self,
-        requested: Option<&str>,
-    ) -> Result<Option<String>, ManagerError> {
+    pub fn resolve(&self, requested: Option<&str>) -> Result<Option<String>, ManagerError> {
         let selected = requested
             .map(|name| name.to_string())
             .or_else(|| self.default.clone());
@@ -485,7 +487,7 @@ fn pod_resources(config: &PipelineConfig, platform: ResourceLimits) -> ResourceR
     if let Some(cores) = resources.cpu_cores_min.filter(|cores| *cores > 0.0) {
         requests.insert("cpu".to_string(), cpu_quantity(cores));
     }
-    if let Some(mb) = resources.memory_mb_min.filter(|mb| *mb > 0) {
+    if let Some(mb) = resources.memory_min.map(mebibytes).filter(|mb| *mb > 0) {
         requests.insert(
             "memory".to_string(),
             mebibyte_quantity(platform.clamp_memory(mb)),
@@ -494,7 +496,7 @@ fn pod_resources(config: &PipelineConfig, platform: ResourceLimits) -> ResourceR
     if let Some(cores) = resources.cpu_cores_max.filter(|cores| *cores > 0.0) {
         limits.insert("cpu".to_string(), cpu_quantity(cores));
     }
-    if let Some(mb) = resources.memory_mb_max.filter(|mb| *mb > 0) {
+    if let Some(mb) = resources.memory_max.map(mebibytes).filter(|mb| *mb > 0) {
         let limit = memory_limit_mb(platform.clamp_memory(mb)).min(platform.memory_mb_max);
         limits.insert("memory".to_string(), mebibyte_quantity(limit));
     }
@@ -503,6 +505,21 @@ fn pod_resources(config: &PipelineConfig, platform: ResourceLimits) -> ResourceR
         limits: (!limits.is_empty()).then_some(limits),
         ..Default::default()
     }
+}
+
+/// A configuration size in mebibytes, rounded up.
+///
+/// Kubernetes memory quantities are whole MiB, and rounding down would give a
+/// container less memory than the pipeline asked for.
+fn mebibytes(size: ConfigSize) -> u64 {
+    size.as_bytes().div_ceil(1 << 20)
+}
+
+/// The pipeline configuration as YAML, as the pipeline process reads it.
+fn serialize_config<T: serde::Serialize>(config: &T) -> Result<String, RunnerError> {
+    serde_yaml::to_string(config).map_err(|error| RunnerError::RunnerProvisionError {
+        error: format!("unable to serialize the pipeline configuration: {error}"),
+    })
 }
 
 /// Headroom the container limit leaves above the pipeline's own budget.
@@ -648,10 +665,9 @@ impl RenderedSecret {
         if sanitized.len() <= 40 {
             sanitized
         } else {
-            let hash = self
-                .name
-                .bytes()
-                .fold(0u64, |acc, byte| acc.wrapping_mul(31).wrapping_add(u64::from(byte)));
+            let hash = self.name.bytes().fold(0u64, |acc, byte| {
+                acc.wrapping_mul(31).wrapping_add(u64::from(byte))
+            });
             format!("{}-{hash:016x}", &sanitized[..40])
         }
     }
@@ -1096,8 +1112,8 @@ fn connector_secrets(
     config: &PipelineConfig,
     allowlist: &[String],
 ) -> Result<Vec<RenderedSecret>, RunnerError> {
-    use feldera_types::secret_resolver::discover_secret_references_in_connector_config;
     use feldera_types::secret_ref::{SecretRef, validate_kubernetes_secret_name};
+    use feldera_types::secret_resolver::discover_secret_references_in_connector_config;
 
     // (Secret name, key) pairs, collected from every input and output.
     let mut references: BTreeSet<(String, String)> = BTreeSet::new();
@@ -1105,18 +1121,26 @@ fn connector_secrets(
         .inputs
         .values()
         .map(|input| &input.connector_config)
-        .chain(config.outputs.values().map(|output| &output.connector_config));
+        .chain(
+            config
+                .outputs
+                .values()
+                .map(|output| &output.connector_config),
+        );
     for connector_config in connector_configs {
         let as_json = serde_json::to_value(connector_config).map_err(|error| {
             RunnerError::RunnerProvisionError {
-                error: format!("unable to inspect connector configuration for secret references: {error}"),
+                error: format!(
+                    "unable to inspect connector configuration for secret references: {error}"
+                ),
             }
         })?;
-        let discovered = discover_secret_references_in_connector_config(&as_json).map_err(
-            |error| RunnerError::RunnerProvisionError {
-                error: format!("unable to parse a secret reference: {error}"),
-            },
-        )?;
+        let discovered =
+            discover_secret_references_in_connector_config(&as_json).map_err(|error| {
+                RunnerError::RunnerProvisionError {
+                    error: format!("unable to parse a secret reference: {error}"),
+                }
+            })?;
         for secret_ref in discovered {
             if let SecretRef::Kubernetes { name, data_key } = secret_ref {
                 references.insert((name, data_key));
@@ -1444,7 +1468,7 @@ impl KubernetesRunner {
     /// to place one pipeline elsewhere. Refusing it would break the existing
     /// pipelines that already rely on it.
     fn namespace(&self, runtime_config: &serde_json::Value) -> String {
-        discover_namespace_from_runtime_config_json(runtime_config)
+        discover_namespace_from_pipeline_config_json(runtime_config)
             .or_else(|| {
                 self.tenant_namespace
                     .as_ref()
@@ -1496,7 +1520,9 @@ impl KubernetesRunner {
         // would leave a half-provisioned deployment behind.
         let secrets = connector_secrets(
             config,
-            &self.config.kubernetes_runner_connector_kubernetes_secrets_allowlist,
+            &self
+                .config
+                .kubernetes_runner_connector_kubernetes_secrets_allowlist,
         )?;
         if let Some(binary_url) = binary_url {
             env.push(EnvVar {
@@ -1805,11 +1831,7 @@ impl PipelineExecutor for KubernetesRunner {
     ///
     /// Failing here surfaces a clear error while the pipeline is still `Stopped`
     /// instead of a pod that never starts.
-    async fn can_provision(
-        &self,
-        _deployment_config: &PipelineConfig,
-        runtime_config: &serde_json::Value,
-    ) -> Result<(), ManagerError> {
+    async fn can_provision(&self, deployment_config: &PipelineConfig) -> Result<(), ManagerError> {
         self.executor_image()?;
         if self.common_config.enable_https {
             return Err(RunnerError::RunnerConfigError {
@@ -1826,7 +1848,14 @@ impl PipelineExecutor for KubernetesRunner {
             Some(client) => client.clone(),
             None => build_kubernetes_client(&self.config).await?,
         };
-        let namespace = self.namespace(runtime_config);
+        // The namespace lives in the resources section, so the JSON form of the
+        // configuration is what the discovery reads.
+        let namespace =
+            self.namespace(&serde_json::to_value(deployment_config).map_err(|error| {
+                RunnerError::RunnerProvisionError {
+                    error: format!("unable to serialize the pipeline configuration: {error}"),
+                }
+            })?);
         // Probe the namespace with a dry-run create rather than reading the
         // Namespace object: the runner's Role is namespaced, so it cannot read
         // cluster-scoped resources, but it can always create a Secret in the
@@ -1873,14 +1902,17 @@ impl PipelineExecutor for KubernetesRunner {
         program_info: &serde_json::Value,
         program_binary_url: &str,
         program_info_url: &str,
+        // The kubernetes runner launches a compiled program binary, so the
+        // runtime version names nothing it could fetch: only Gen-2 selects a
+        // build, and Gen-2 is refused below.
         _program_version: Version,
-        runtime_config: &serde_json::Value,
-        is_gen2: bool,
+        runtime_selector: &RuntimeSelector,
+        legacy_spelling: LegacySpelling,
     ) -> Result<(), ManagerError> {
         if let Err(error) = validate_pipeline_env(&deployment_config.global.env) {
             return Err(RunnerError::RunnerProvisionError { error }.into());
         }
-        if is_gen2 {
+        if runtime_selector.is_gen2() {
             return Err(RunnerError::RunnerProvisionError {
                 error: "the Kubernetes runner cannot run Gen-2 pipelines yet: it launches a \
                         compiled program binary, and a Gen-2 pipeline has none"
@@ -1902,18 +1934,20 @@ impl PipelineExecutor for KubernetesRunner {
         }
         let image = self.executor_image()?;
         let client = self.kubernetes_client().await?;
-        let namespace = self.namespace(runtime_config);
+        // The namespace lives in the resources section, so the JSON form of the
+        // configuration is what the discovery reads.
+        let namespace =
+            self.namespace(&serde_json::to_value(deployment_config).map_err(|error| {
+                RunnerError::RunnerProvisionError {
+                    error: format!("unable to serialize the pipeline configuration: {error}"),
+                }
+            })?);
 
         // Resolve the storage class before anything is created: a class the
         // policy does not allow is a configuration mistake, and discovering it
         // after the claim exists would leave that claim behind.
-        let storage_class = StorageClassPolicy::from_config(&self.config).resolve(
-            deployment_config
-                .global
-                .resources
-                .storage_class
-                .as_deref(),
-        )?;
+        let storage_class = StorageClassPolicy::from_config(&self.config)
+            .resolve(deployment_config.global.resources.storage_class.as_deref())?;
         self.storage_class = storage_class;
 
         // Merge the program information into the deployment configuration, the
@@ -1930,16 +1964,25 @@ impl PipelineExecutor for KubernetesRunner {
         config.inputs = program_info.inputs;
         config.outputs = program_info.outputs;
         config.program_ir = program_info.program_ir;
-        // The pipeline process sizes its heap from `max_rss_mb`; without a pod
+        // The pipeline process sizes its heap from `max_rss`; without a pod
         // memory limit it would grow until the OOM killer fires.
-        if config.global.max_rss_mb.is_none() {
-            config.global.max_rss_mb = deployment_config.global.resources.memory_mb_max;
+        if config.global.max_rss.is_none() {
+            config.global.max_rss = deployment_config.global.resources.memory_max;
         }
 
-        let config_yaml =
-            serde_yaml::to_string(&config).map_err(|error| RunnerError::RunnerProvisionError {
-                error: format!("unable to serialize the pipeline configuration: {error}"),
+        // A pipeline pinned to an older runtime reads only the pre-rename
+        // spellings, so the configuration that goes into the Secret is rendered
+        // in the spelling that runtime understands.
+        let mut config_yaml = serialize_config(&config)?;
+        if legacy_spelling.any() {
+            let mut value = serde_json::to_value(&config).map_err(|error| {
+                RunnerError::RunnerProvisionError {
+                    error: format!("unable to serialize the pipeline configuration: {error}"),
+                }
             })?;
+            legacy_spelling.apply(&mut value);
+            config_yaml = serialize_config(&value)?;
+        }
         // Secrets and ConfigMaps are capped at 1 MiB.
         const MAX_CONFIG_BYTES: usize = 900 * 1024;
         if config_yaml.len() > MAX_CONFIG_BYTES {
@@ -1993,10 +2036,7 @@ impl PipelineExecutor for KubernetesRunner {
                         .as_ref()
                         .map(|storage| storage.mount_path.as_str())
                         .unwrap_or(""),
-                    storage_class_name: self
-                        .storage_class
-                        .as_deref()
-                        .unwrap_or(""),
+                    storage_class_name: self.storage_class.as_deref().unwrap_or(""),
                     deployment_id: &deployment_id,
                     deployment_initial: &initial,
                     bootstrap_policy: &bootstrap_policy,
@@ -2215,7 +2255,6 @@ impl PipelineExecutor for KubernetesRunner {
         }
         Ok(())
     }
-
 }
 
 /// Whether an HTTP status from the pipeline's `/status` endpoint means the
@@ -3010,7 +3049,7 @@ mod tests {
         assert_eq!(memory_limit_mb(4096), 5120);
         // A pipeline configured with no memory budget gets no limit at all.
         let resources = ResourceConfig {
-            memory_mb_max: None,
+            memory_max: None,
             ..ResourceConfig::default()
         };
         let requirements =
@@ -3022,9 +3061,9 @@ mod tests {
     fn zero_quantities_are_dropped_instead_of_becoming_zero_requests() {
         let resources = ResourceConfig {
             cpu_cores_min: Some(0.0),
-            memory_mb_min: Some(0),
+            memory_min: Some(ConfigSize::from_mib(0)),
             cpu_cores_max: Some(1.0),
-            memory_mb_max: Some(1024),
+            memory_max: Some(ConfigSize::from_mib(1024)),
             ..ResourceConfig::default()
         };
         let requirements =
@@ -3040,9 +3079,9 @@ mod tests {
         let resources = ResourceConfig {
             cpu_cores_min: Some(0.5),
             cpu_cores_max: Some(2.0),
-            memory_mb_min: Some(512),
-            memory_mb_max: Some(2048),
-            storage_mb_max: Some(4096),
+            memory_min: Some(ConfigSize::from_mib(512)),
+            memory_max: Some(ConfigSize::from_mib(2048)),
+            storage_max: Some(ConfigSize::from_mib(4096)),
             storage_class: Some("fast".to_string()),
             ..ResourceConfig::default()
         };
@@ -3185,10 +3224,7 @@ mod tests {
             policy.resolve(Some("local-path")).unwrap(),
             Some("local-path".to_string())
         );
-        assert_eq!(
-            policy.resolve(None).unwrap(),
-            Some("standard".to_string())
-        );
+        assert_eq!(policy.resolve(None).unwrap(), Some("standard".to_string()));
     }
 
     /// An enabled allowlist with no entries refuses every named class: an
@@ -3231,8 +3267,8 @@ mod tests {
                 "http://api-server:8085/binary/00000000-0000-0000-0000-000000000000/1/checksum/integrity",
                 "http://api-server:8085/program_info/00000000-0000-0000-0000-000000000000/1/checksum",
                 Version(1),
-                &json!({}),
-                false,
+                &RuntimeSelector::default(),
+                LegacySpelling::NONE,
             )
             .await
             .expect_err("a class outside the allowlist must fail provisioning");
@@ -3277,24 +3313,25 @@ mod tests {
                 "http://api-server:8085/binary/00000000-0000-0000-0000-000000000000/1/checksum/integrity",
                 "http://api-server:8085/program_info/00000000-0000-0000-0000-000000000000/1/checksum",
                 Version(1),
-                &json!({}),
-                false,
+                &RuntimeSelector::default(),
+                LegacySpelling::NONE,
             )
             .await
             .expect("the allowed class must provision");
 
         assert_eq!(runner.storage_class.as_deref(), Some("fast"));
-        let input = runner.render(
-            Uuid::max(),
-            "feldera",
-            "example/pipeline:1".to_string(),
-            &config,
-            String::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-        )
-        .expect("rendering a configuration without secret references succeeds");
+        let input = runner
+            .render(
+                Uuid::max(),
+                "feldera",
+                "example/pipeline:1".to_string(),
+                &config,
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .expect("rendering a configuration without secret references succeeds");
         assert_eq!(
             input
                 .render()
@@ -3366,10 +3403,7 @@ mod tests {
     #[test]
     fn a_tenant_without_a_namespace_has_no_mapping() {
         let config = KubernetesRunnerConfig {
-            kubernetes_runner_tenant_namespaces: vec![format!(
-                "tenant={}:tenant-a",
-                Uuid::max()
-            )],
+            kubernetes_runner_tenant_namespaces: vec![format!("tenant={}:tenant-a", Uuid::max())],
             ..runner_config()
         };
         assert!(TenantNamespace::from_config(&config, &TenantId(Uuid::nil())).is_none());
@@ -3627,14 +3661,17 @@ mod tests {
                     // server to record.
                     if method == Method::PATCH {
                         let request = request;
-                        let bytes = request.into_body().collect().await.map(|body| {
-                            body.to_bytes()
-                        });
+                        let bytes = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(|body| body.to_bytes());
                         if let Ok(bytes) = bytes {
-                            cluster.bodies.lock().unwrap().push(format!(
-                                "{method}{}",
-                                String::from_utf8_lossy(&bytes)
-                            ));
+                            cluster
+                                .bodies
+                                .lock()
+                                .unwrap()
+                                .push(format!("{method}{}", String::from_utf8_lossy(&bytes)));
                         }
                     }
                     Ok::<_, std::convert::Infallible>(respond(&cluster, &method, &path))
@@ -3890,8 +3927,8 @@ mod tests {
                 "http://api-server:8085/binary/00000000-0000-0000-0000-000000000000/1/checksum/integrity",
                 "http://api-server:8085/program_info/00000000-0000-0000-0000-000000000000/1/checksum",
                 Version(1),
-                &json!({}),
-                false,
+                &RuntimeSelector::default(),
+                LegacySpelling::NONE,
             )
             .await
     }
@@ -3943,8 +3980,8 @@ mod tests {
                 "http://api-server:8085/binary/x",
                 "http://api-server:8085/program_info/x",
                 Version(1),
-                &json!({}),
-                false,
+                &RuntimeSelector::default(),
+                LegacySpelling::NONE,
             )
             .await
             .expect("provisioning succeeds");
@@ -4366,7 +4403,10 @@ mod tests {
     #[test]
     fn the_retention_annotation_is_the_one_the_reaper_reads() {
         assert_eq!(RETENTION_ANNOTATION, "feldera.com/storage-retention");
-        assert_eq!(RETAINED_PIPELINE_ANNOTATION, "feldera.com/retained-pipeline-id");
+        assert_eq!(
+            RETAINED_PIPELINE_ANNOTATION,
+            "feldera.com/retained-pipeline-id"
+        );
     }
 
     #[tokio::test]
@@ -4375,7 +4415,7 @@ mod tests {
         let runner = fake_runner(&cluster);
 
         let error = runner
-            .can_provision(&pipeline_config(ResourceConfig::default(), &[]), &json!({}))
+            .can_provision(&pipeline_config(ResourceConfig::default(), &[]))
             .await
             .expect_err("a missing namespace is a configuration error");
         assert!(
@@ -4487,7 +4527,10 @@ mod tests {
             .iter()
             .find(|mount| mount.name == format!("secret-{}", secrets[0].mount_name()))
             .expect("the volume is mounted");
-        assert_eq!(mount.mount_path, "/etc/feldera-secrets/kubernetes/kafka-creds");
+        assert_eq!(
+            mount.mount_path,
+            "/etc/feldera-secrets/kubernetes/kafka-creds"
+        );
         assert_eq!(mount.read_only, Some(true));
     }
 
@@ -4511,15 +4554,17 @@ mod tests {
         let error = connector_secrets(&config, &["other-creds".to_string()])
             .expect_err("a different Secret does not authorise this one");
         assert!(
-            error.to_string().contains("not on the allowlist: other-creds"),
+            error
+                .to_string()
+                .contains("not on the allowlist: other-creds"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
     fn a_secret_reference_in_the_output_configuration_is_checked_too() {
-        use feldera_types::config::{ConnectorConfig, OutputEndpointConfig};
         use feldera_types::config::TransportConfig;
+        use feldera_types::config::{ConnectorConfig, OutputEndpointConfig};
         let mut config = pipeline_config(ResourceConfig::default(), &[]);
         config.outputs.insert(
             std::borrow::Cow::Borrowed("sink"),

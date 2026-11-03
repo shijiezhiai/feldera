@@ -952,6 +952,7 @@ mod test {
         let app = actix_test::init_service(
             App::new()
                 .app_data(web::Data::new(fixture.pipelines.clone()))
+                .app_data(web::Data::new(leader()))
                 .service(get_logs),
         )
         .await;
