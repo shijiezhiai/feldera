@@ -231,6 +231,34 @@ static TRANSACTION_COMMIT_TIME_MICROSECONDS: ExponentialHistogram = ExponentialH
 /// checkpoint.
 static CHECKPOINT_PROCESSED_RECORDS: AtomicU64 = AtomicU64::new(0);
 
+/// Unix timestamp, in seconds, of the last checkpoint that committed, or zero
+/// if none has.
+///
+/// The age of this value is the only way to alert on "checkpoints have quietly
+/// stopped": the runtime histogram below is exported only once a checkpoint has
+/// succeeded, so a pipeline that has never checkpointed looks identical to one
+/// that checkpointed a minute ago.
+static CHECKPOINT_LAST_SUCCESS_SECONDS: AtomicU64 = AtomicU64::new(0);
+
+/// Unix timestamp, in seconds, of the last checkpoint that failed for a
+/// permanent reason, or zero if none has.
+static CHECKPOINT_LAST_FAILURE_SECONDS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of checkpoints that failed for a permanent reason.
+///
+/// Temporary reasons (a delayed checkpoint, a pending barrier) are not counted:
+/// they delay a checkpoint rather than fail one, and counting them would make
+/// the rate depend on how often the pipeline was polled.
+static CHECKPOINT_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the current Unix time in whole seconds.
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Interval between updating statistics for transaction commit.
 static COMMIT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -1742,6 +1770,37 @@ impl Controller {
             labels,
             &CHECKPOINT_PROCESSED_RECORDS,
         );
+        // Exported as a gauge rather than as an age in seconds so that a
+        // Prometheus rule can say `time() - feldera_checkpoint_last_success_timestamp_seconds > 1800`
+        // without depending on the scrape interval: an age would be stale by up
+        // to one interval, and would be zero forever if scraping stopped.
+        metrics.gauge(
+            "feldera_checkpoint_last_success_timestamp_seconds",
+            "Unix timestamp of the last checkpoint that committed, or 0 if none has. Compare against `time()` to get its age.",
+            labels,
+            CHECKPOINT_LAST_SUCCESS_SECONDS.load(Ordering::Relaxed) as f64,
+        );
+        metrics.gauge(
+            "feldera_checkpoint_last_failure_timestamp_seconds",
+            "Unix timestamp of the last checkpoint that failed for a permanent reason, or 0 if none has.",
+            labels,
+            CHECKPOINT_LAST_FAILURE_SECONDS.load(Ordering::Relaxed) as f64,
+        );
+        metrics.counter(
+            "feldera_checkpoint_failures_total",
+            "Number of checkpoints that failed for a permanent reason. Temporary reasons that only delay a checkpoint are not counted.",
+            labels,
+            &CHECKPOINT_FAILURES_TOTAL,
+        );
+        // Zero means fault tolerance is off and this pipeline never checkpoints,
+        // which lets the age alert skip it rather than fire on a pipeline that
+        // could not possibly have checkpointed.
+        metrics.gauge(
+            "feldera_checkpoint_interval_seconds",
+            "The configured interval between checkpoints in seconds, or 0 if fault tolerance is disabled and the pipeline never checkpoints.",
+            labels,
+            self.inner.checkpoint_interval_seconds,
+        );
         metrics.counter(
             "pipeline_start_time_seconds",
             "Start time of the pipeline in seconds since the Unix epoch.\n\nThis will be earlier than `process_start_time_seconds` if the pipeline resumed from a checkpoint.  This will be zero if the pipeline resumed from a checkpoint produced by a pipeline too old to record its start time.",
@@ -1755,6 +1814,31 @@ impl Controller {
             labels,
             &status.global_metrics.storage_bytes,
         );
+        // `storage_usage_bytes` above counts what Feldera itself has written,
+        // which cannot answer "is the volume filling up": the volume also holds
+        // journals, logs and other tenants' files.  The two gauges below report
+        // the volume itself, so a rule can compute a ratio without assuming
+        // Feldera owns the disk.  A pipeline that stores its data in an object
+        // store or in memory has no volume of its own, so it reports neither.
+        if let Some(disk_usage) = self
+            .inner
+            .storage_path
+            .as_deref()
+            .and_then(DiskUsage::from_path)
+        {
+            metrics.gauge(
+                "feldera_storage_volume_total_bytes",
+                "Capacity of the volume that holds the pipeline's storage, in bytes.",
+                labels,
+                disk_usage.total_bytes as f64,
+            );
+            metrics.gauge(
+                "feldera_storage_volume_available_bytes",
+                "Bytes the pipeline can still write to the volume that holds its storage.",
+                labels,
+                disk_usage.available_bytes as f64,
+            );
+        }
 
         if let Some(runtime) = self.inner.runtime.upgrade() {
             let (cache_used, cache_max) = runtime.cache_occupancy();
@@ -4212,6 +4296,8 @@ impl CircuitThread {
         // Log a warning if the checkpoint failed permanently.
         if let Err(error) = &result {
             warn!("checkpoint failed: {error}");
+            CHECKPOINT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            CHECKPOINT_LAST_FAILURE_SECONDS.store(unix_now_seconds(), Ordering::Relaxed);
         }
 
         // Update the coordinator and, on success, advance the checkpointed-step
@@ -7252,6 +7338,13 @@ pub struct ControllerInner {
     datafusion_runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     adhoc_tables: HashMap<SqlIdentifier, Arc<AdHocTable>>,
     fault_tolerance: Option<FtModel>,
+    /// Configured interval between checkpoints, in seconds, or zero when fault
+    /// tolerance is disabled and this pipeline never checkpoints.
+    ///
+    /// Exported so that the checkpoint-age alert can compare the age against a
+    /// multiple of the interval this pipeline actually uses, instead of a
+    /// constant baked into the rule.
+    checkpoint_interval_seconds: f64,
     step_receiver: tokio::sync::watch::Receiver<StepStatus>,
     checkpoint_receiver: tokio::sync::watch::Receiver<Option<CheckpointCoordination>>,
     transaction_receiver: tokio::sync::watch::Receiver<TransactionCoordination>,
@@ -7363,6 +7456,11 @@ impl ControllerInner {
                 datafusion_runtime_env,
                 adhoc_tables,
                 fault_tolerance: config.global.fault_tolerance.model,
+                checkpoint_interval_seconds: config
+                    .global
+                    .fault_tolerance
+                    .checkpoint_interval()
+                    .map_or(0.0, |interval| interval.as_secs_f64()),
                 transaction_info: Mutex::new(TransactionInfo::new(
                     is_multihost,
                     transaction_sender,
@@ -10049,6 +10147,7 @@ impl CheckpointThread {
         CHECKPOINT_DELAY.record(self.delay.as_micros());
         CHECKPOINT_WRITTEN_MEGABYTES.record(bytes_written / 1_000_000);
         CHECKPOINT_PROCESSED_RECORDS.store(self.checkpoint.processed_records, Ordering::Relaxed);
+        CHECKPOINT_LAST_SUCCESS_SECONDS.store(unix_now_seconds(), Ordering::Relaxed);
 
         Ok(self.checkpoint)
     }
@@ -10233,5 +10332,71 @@ mod controller_init_tests {
             "max_worker_batch_size": max_queued_records + 2,
         }))
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_metrics_tests {
+    use super::unix_now_seconds;
+    use feldera_types::config::{FtConfig, FtModel};
+
+    /// The metric exists so that a rule can compare a checkpoint's age against
+    /// three times its interval, which needs the interval the pipeline was
+    /// configured with rather than a constant.
+    #[test]
+    fn the_interval_metric_follows_the_configuration() {
+        let config = FtConfig {
+            model: Some(FtModel::AtLeastOnce),
+            checkpoint_interval_secs: Some(30),
+        };
+        assert_eq!(
+            config.checkpoint_interval().map(|i| i.as_secs_f64()),
+            Some(30.0)
+        );
+    }
+
+    /// A pipeline with fault tolerance off never checkpoints, so it reports an
+    /// interval of zero and the age rule skips it instead of measuring the age
+    /// of a timestamp that will stay zero forever.
+    #[test]
+    fn no_fault_tolerance_means_no_interval() {
+        let config = FtConfig {
+            model: None,
+            checkpoint_interval_secs: Some(60),
+        };
+        assert_eq!(config.checkpoint_interval(), None);
+        assert_eq!(
+            config
+                .checkpoint_interval()
+                .map_or(0.0, |i| i.as_secs_f64()),
+            0.0
+        );
+    }
+
+    /// The configuration is clamped, and the metric reports the clamped value,
+    /// so that a rule's threshold matches the interval the pipeline obeys.
+    #[test]
+    fn the_interval_metric_reports_the_clamped_interval() {
+        for (configured, effective) in [(0, 1), (1, 1), (60, 60), (3600, 3600), (99_999, 3600)] {
+            let config = FtConfig {
+                model: Some(FtModel::ExactlyOnce),
+                checkpoint_interval_secs: Some(configured),
+            };
+            assert_eq!(
+                config.checkpoint_interval().map(|i| i.as_secs()),
+                Some(effective),
+                "an interval of {configured}s should be reported as {effective}s"
+            );
+        }
+    }
+
+    /// The timestamps are Unix seconds, because a rule compares them against
+    /// `time()` and a different epoch would silently make every checkpoint look
+    /// decades old.
+    #[test]
+    fn the_clock_is_unix_seconds() {
+        let now = unix_now_seconds();
+        // 2024-01-01, long before this ran, and 2100-01-01, long after.
+        assert!((1_704_067_200..4_102_444_800).contains(&now), "got {now}");
     }
 }

@@ -2,6 +2,11 @@ global:
   scrape_interval:     1s
   evaluation_interval: 5s
 
+# The paging rules (P1-030). A Prometheus without them scrapes everything and
+# tells nobody; see `docs/operations/alerting.md`.
+rule_files:
+  - /etc/prometheus/feldera-alerts.yml
+
 scrape_configs:
   - job_name: 'feldera'
     metrics_path: '/v0/metrics'

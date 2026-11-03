@@ -276,6 +276,7 @@ say "prometheus scrapes the pipeline"
 kubectl create configmap prometheus-scrape-check-config \
   --namespace "${NAMESPACE}" \
   --from-file=prometheus.yml="${REPO_ROOT}/deploy/config/prometheus-k8s.yml" \
+  --from-file=feldera-alerts.yml="${REPO_ROOT}/deploy/config/feldera-alerts.yml" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl delete deployment prometheus-scrape-check --namespace "${NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
 kubectl apply --namespace "${NAMESPACE}" -f - >/dev/null <<'YAML'

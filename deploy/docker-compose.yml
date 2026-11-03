@@ -110,6 +110,7 @@ services:
       - 9090:9090
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./config/feldera-alerts.yml:/etc/prometheus/feldera-alerts.yml
     command: --web.enable-lifecycle --config.file=/etc/prometheus/prometheus.yml
     healthcheck:
       test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:9090/-/healthy"]
