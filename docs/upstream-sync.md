@@ -156,11 +156,23 @@ only on `myfork` feature branches with no other consumer.
 All of these must pass before a rebased branch replaces a working branch. They mirror the P1
 verification story; the image gate is the slow one, so run the first three first.
 
+**The list runs as one command**: `scripts/post-rebase-gates.sh` executes every gate below, keeps
+each one's output, and writes a timing table plus a failure list to
+`design/rebase-gates-<date>-<sha>.md`. The table below is the specification; the script is what
+produces the evidence.
+
+```bash
+scripts/post-rebase-gates.sh                    # gates 1-4 + the §4 invariants
+scripts/post-rebase-gates.sh --scope release    # all seven, for a release
+scripts/post-rebase-gates.sh --only 1,2         # after a lockfile-only rebase
+scripts/post-rebase-gates.sh --dry-run          # what would run, without running it
+```
+
 | # | Gate | Command | Catches |
 | --- | --- | --- | --- |
 | 1 | Lockfile resolves | `cargo +1.96.1 metadata --format-version 1` (network) | upstream added a dependency (including new `git` deps) we cannot resolve |
 | 2 | Workspace compiles | `cargo +1.96.1 check --all-targets` | API drift in the 9 bucket-B files |
-| 3 | Manager unit tests | `cargo +1.96.1 test -p pipeline-manager --lib` | behavioural drift in runner/config code |
+| 3 | Manager unit tests | `cargo +1.96.1 test -p pipeline-manager --lib -- --test-threads=4 --skip db_impl_behaves_like_model` | behavioural drift in runner/config code |
 | 4 | FT e2e (local) | `python/tests/platform/test_selfhosted_ft_e2e.py` | checkpoint/restore contract used by the platform layer |
 | 5 | Three images | `deploy/build-images.sh` | Dockerfile drift (paths, toolchain pins, base image) |
 | 6 | kind smoke | `helm upgrade --install` + `/healthz` == 200 | chart/values drift against renamed settings |
@@ -169,6 +181,18 @@ verification story; the image gate is the slow one, so run the first three first
 Gate 1 and 2 are fast; gate 5 is the long pole (currently hours with a cold cache). For a *rebase
 check* before a pilot, gates 1–4 plus a warm-cache image rebuild are enough; for a release, all
 seven.
+
+Before the numbered gates the script checks four invariants from §4 that no compile would catch: the
+lockfile is committed, migration versions are unique, the stub crates are neither ignored nor
+untracked, and no conflict marker survived a hand resolution. Each of these has been a real
+post-rebase failure; all four are seconds to check and expensive to debug.
+
+Gate 3 carries the thread limit because the database-backed tests share one embedded Postgres: at
+the default thread count `db_impl_behaves_like_model` overflows its stack and several others hang,
+which reads as a hang rather than as a failure. The same suite passes in ~66 s with four threads.
+
+The rehearsal that produced this section (`design/rebase-rehearsal-2026-11-03.md`) records what each
+gate cost on the 2026-11-03 rebase and which four of them were red on the first attempt.
 
 Gate 1 needs a **working registry mirror**, and it is the one gate whose failure looks like a code
 bug. Upstream keeps moving dependencies to new sources (v0.367.0 moved `deltalake` and 20 sibling
