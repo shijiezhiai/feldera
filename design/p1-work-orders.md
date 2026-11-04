@@ -109,7 +109,7 @@ gantt
 | P1-029 | 试点团队① 接入（2 条非关键 pipeline）+ 问题修复机动 | 4 | S4 门禁 | 连续 7 天无 P0 事故；反馈→backlog |
 | P1-030 | 告警基线：pipeline 非 Running、checkpoint 连续失败>3、checkpoint 年龄>3×间隔、PVC>80%、编译队列延迟、provisioning 超时（指标源 `adapter_stats.rs:512-521`） | 4 | 015 | 每类告警有注入触发用例；值班手册链接 |
 | P1-031 | 升级彩排：rebase 下一上游 tag + 回归门禁首次全量（slt 子集 + `python/tests` + FT 注入 e2e + nexmark 吞吐子集） | 4 | 008,013 | 门禁脚本一键跑；升级耗时与失败清单成文 |
-| P1-032 | 性能基线：同机型 本地 vs K8s PVC，验证盘型达标（16k IOPS），吞吐/恢复时间基线入库 | 2 | 019 | 基线数字进 runbook 附录 |
+| P1-032 | 性能基线：同机型 本地 vs K8s PVC，验证盘型达标（16k IOPS），吞吐/恢复时间基线入库——**实测补充**：①`kubectl exec <pod> -- kill -9 1` 杀不掉 pipeline：内核不允许从 PID 命名空间内部向该命名空间的 init 进程投递 SIGKILL/SIGSTOP，命令返回 0 而进程不动（P1-028 的混沌矩阵 L2 kill-pod 格与断 PG 格因此都是空跑，已同步改为 `crash_container_of_pod` 从节点命名空间发信号），必须从**节点**命名空间发信号（kind 下 `docker exec <node> crictl inspect` 取 pid 后 `kill -9`），kubelet 才会在同一 pod 内重启容器；②删 pod 不是崩溃恢复：manager 够不到没有 pod 的 pipeline，判为失败并停机（`a_vanished_pod_stops_the_pipeline_and_records_the_error`），测到的是停机时间；③探针文件必须先顺序写满再测随机读，`ftruncate` 的稀疏文件读空洞不落盘，会测出 821573 IOPS 这种假值；④ConfigMap 走 `kubectl apply` 会因 `last-applied-configuration` 注解 256 KiB 上限被拒（base64 后 378 KiB），须用 `kubectl create`；⑤实测结论：local-path PVC 与本地目录同盘同量级（无额外开销），本机机械盘随机读 150.8/158.6 IOPS 远低于 16k，吞吐 108010 records/s，崩溃恢复 3903 ms | 2 | 019 | 基线数字进 runbook 附录（`docs/operations/performance-baseline.md` §Appendix，原始报告 `design/perf-baseline-2026-11-04.md`） |
 
 ## 7. S6（M4 下）：加固 + P1 出口（6 张）
 

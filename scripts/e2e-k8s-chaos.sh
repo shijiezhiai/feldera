@@ -346,6 +346,41 @@ pod_of() {
   echo "pipeline-${id}-0"
 }
 
+# Kill the process a pod runs, and leave the restart to the kubelet.
+#
+# `kubectl exec <pod> -- kill -9 1` does not do this. The kernel discards
+# SIGKILL and SIGSTOP sent to the init process of a PID namespace from inside
+# that namespace, so the command returns success and nothing dies -- a cell built
+# on it passes without ever injecting the fault. The signal has to come from the
+# node's namespace: on a kind cluster the node is a container, and on a plain node
+# this has to run on the node itself with `crictl` on PATH.
+crash_container_of_pod() {
+  local pod="$1" node cid pid
+  node="$(kubectl get pod --namespace "${NAMESPACE}" "${pod}" \
+    -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+  [ -n "${node}" ] || fail "the pod ${pod} has no node"
+
+  if docker exec "${node}" true >/dev/null 2>&1; then
+    cid="$(docker exec "${node}" crictl ps 2>/dev/null \
+      | awk -v pod="${pod}" 'index($0, pod) { print $1; exit }')"
+    [ -n "${cid}" ] || fail "no container for ${pod} on node ${node}"
+    pid="$(docker exec "${node}" crictl inspect "${cid}" 2>/dev/null \
+      | python3 -c 'import json,sys; print((json.load(sys.stdin).get("info") or {}).get("pid") or 0)')"
+    [ "${pid:-0}" -gt 0 ] || fail "container ${cid} has no init pid"
+    docker exec "${node}" kill -9 "${pid}" >/dev/null 2>&1 \
+      || fail "the process ${pid} of ${pod} could not be killed"
+  elif command -v crictl >/dev/null 2>&1; then
+    cid="$(crictl ps 2>/dev/null | awk -v pod="${pod}" 'index($0, pod) { print $1; exit }')"
+    [ -n "${cid}" ] || fail "no container for ${pod} on this node"
+    pid="$(crictl inspect "${cid}" 2>/dev/null \
+      | python3 -c 'import json,sys; print((json.load(sys.stdin).get("info") or {}).get("pid") or 0)')"
+    [ "${pid:-0}" -gt 0 ] || fail "container ${cid} has no init pid"
+    kill -9 "${pid}" || fail "the process ${pid} of ${pod} could not be killed"
+  else
+    fail "cannot reach node ${node} to kill the process of ${pod} (needs 'docker exec ${node}' or a local crictl)"
+  fi
+}
+
 # The count the pipeline's own `/query` reports, read from inside the pod.
 count_in_pod() {
   local pod="$1"
@@ -811,7 +846,7 @@ postgres_pod() {
 break_postgres() {
   local pod; pod="$(postgres_pod)"
   [ -n "${pod}" ] || fail "no PostgreSQL pod to break"
-  kubectl exec --namespace "${NAMESPACE}" "${pod}" -- kill -9 1 >/dev/null 2>&1 || true
+  crash_container_of_pod "${pod}"
   note "killed the PostgreSQL process; the kubelet restarts the container"
 }
 
@@ -909,8 +944,7 @@ run_cell() {
       local resume_at; resume_at="$(last_checkpoint_records "${name}")"
       note "the newest checkpoint holds ${resume_at} records"
 
-      # The entrypoint `exec`s the binary, so PID 1 is the pipeline itself.
-      kubectl exec --namespace "${NAMESPACE}" "${pod}" -- kill -9 1 >/dev/null 2>&1 || true
+      crash_container_of_pod "${pod}"
       note "killed the pipeline process; the kubelet restarts the container"
       sleep 5
 
@@ -1051,7 +1085,7 @@ run_cell() {
 
       break_postgres
       sleep 15
-      kubectl exec --namespace "${NAMESPACE}" "${pod}" -- kill -9 1 >/dev/null 2>&1 || true
+      crash_container_of_pod "${pod}"
       note "killed the pipeline process while the database was down"
       sleep 15
 
@@ -1164,7 +1198,7 @@ run_cell() {
         || fail "L2: a checkpoint completed while storage was read-only (${checkpoints_at_fault} -> ${checkpoints_after_fault}); the fault did not bite"
       note "L2: no checkpoint completed in 25s of a read-only volume (${checkpoints_at_fault} on disk)"
 
-      kubectl exec --namespace "${NAMESPACE}" "${pod}" -- kill -9 1 >/dev/null 2>&1 || true
+      crash_container_of_pod "${pod}"
       note "killed the pipeline while storage was read-only"
       sleep 5
       for _ in $(seq 1 240); do
@@ -1281,7 +1315,7 @@ run_cell() {
       local resume_at; resume_at="$(last_checkpoint_records "${name}")"
       note "the newest checkpoint holds ${resume_at} records"
 
-      kubectl exec --namespace "${NAMESPACE}" "${pod}" -- kill -9 1 >/dev/null 2>&1 || true
+      crash_container_of_pod "${pod}"
       note "killed the pipeline process; the kubelet restarts the container"
       sleep 5
       for _ in $(seq 1 240); do
