@@ -1000,6 +1000,21 @@ impl RenderInput {
                         // Give the pipeline time to write its exit checkpoint
                         // before the kubelet sends SIGKILL.
                         termination_grace_period_seconds: Some(60),
+                        // A pipeline talks to its sources and sinks, never to
+                        // the API server, so by default it has no use for a
+                        // token — and a pod running tenant-supplied SQL and
+                        // connector addresses should not carry a credential at
+                        // all. Leaving the field unset for the namespace's
+                        // `default` account is what mounts one.
+                        //
+                        // When an operator names a service account, the token
+                        // is the reason they named it, so the platform leaves
+                        // the cluster default in place rather than second-
+                        // guessing them.
+                        automount_service_account_token: self
+                            .service_account
+                            .is_none()
+                            .then_some(false),
                         ..Default::default()
                     }),
                 },
@@ -1456,25 +1471,62 @@ impl KubernetesRunner {
         Ok(client)
     }
 
+    /// Namespace whose pods may reach the pipeline's port.
+    ///
+    /// An unset `--kubernetes-runner-manager-namespace` falls back to the
+    /// runner's own namespace, which is where the chart runs the manager. The
+    /// pipeline's namespace is *not* the fallback: it agrees with the runner's
+    /// only while every pipeline sits in the release namespace, and disagreeing
+    /// is silent and total. The policy would then admit the tenant's namespace
+    /// and refuse the manager, so the pipeline starts, serves requests, and stays
+    /// `Unavailable` forever because nothing that manages it can reach it.
+    fn manager_namespace(&self) -> String {
+        self.config
+            .kubernetes_runner_manager_namespace
+            .clone()
+            .unwrap_or_else(|| self.config.kubernetes_runner_namespace.clone())
+    }
+
     /// Namespace the pipeline's objects live in.
     ///
-    /// An explicit per-pipeline namespace wins. Otherwise the tenant's
-    /// namespace applies, from the `tenant=<uuid>:<namespace>` mapping, and a
-    /// tenant without a mapping uses the runner-wide namespace.
+    /// The tenant's namespace applies, from the `tenant=<uuid>:<namespace>`
+    /// mapping. A tenant without a mapping uses the runner-wide namespace,
+    /// unless the pipeline names one.
     ///
-    /// A per-pipeline namespace is honoured as given rather than checked
-    /// against the tenant mapping: the mapping states where a tenant's
-    /// pipelines go by default, and an explicit request has always been the way
-    /// to place one pipeline elsewhere. Refusing it would break the existing
-    /// pipelines that already rely on it.
-    fn namespace(&self, runtime_config: &serde_json::Value) -> String {
-        discover_namespace_from_pipeline_config_json(runtime_config)
-            .or_else(|| {
-                self.tenant_namespace
-                    .as_ref()
-                    .map(|mapping| mapping.namespace.clone())
-            })
-            .unwrap_or_else(|| self.config.kubernetes_runner_namespace.clone())
+    /// A tenant with a mapping may not be placed anywhere else. The mapping is
+    /// what makes the tenant's namespace its isolation boundary: the quota, the
+    /// NetworkPolicy peers and — decisively — the namespace a Secret mount
+    /// resolves in all follow from it. Honouring an explicit namespace for a
+    /// mapped tenant would let it deploy into another tenant's namespace and
+    /// mount that tenant's Secrets into a pod whose connectors the first tenant
+    /// controls, which is the escalation this refusal exists to stop.
+    ///
+    /// Unmapped tenants keep the old behaviour. Their pipelines share the
+    /// platform namespace, so an explicit namespace moves a pipeline between two
+    /// equally shared ones, and existing pipelines rely on being able to.
+    fn namespace(&self, runtime_config: &serde_json::Value) -> Result<String, ManagerError> {
+        let explicit = discover_namespace_from_pipeline_config_json(runtime_config);
+        let mapped = self
+            .tenant_namespace
+            .as_ref()
+            .map(|mapping| mapping.namespace.clone());
+        if let (Some(explicit), Some(mapped)) = (&explicit, &mapped)
+            && explicit != mapped
+        {
+            return Err(RunnerError::RunnerProvisionError {
+                error: format!(
+                    "the pipeline asks for namespace '{explicit}', but its tenant is provisioned \
+                     in '{mapped}'. A tenant with its own namespace may only run pipelines in it: \
+                     that namespace is what scopes its quota, its network policy and the Secrets \
+                     its connectors mount. Remove `runtime_config.resources.namespace` from the \
+                     request, or have an owner map the tenant to the namespace it needs."
+                ),
+            }
+            .into());
+        }
+        Ok(explicit
+            .or(mapped)
+            .unwrap_or_else(|| self.config.kubernetes_runner_namespace.clone()))
     }
 
     /// The `host:port` at which the manager reaches the pipeline's HTTP API.
@@ -1550,11 +1602,7 @@ impl KubernetesRunner {
             resources: pod_resources(config, self.limits),
             storage,
             service_account: config.global.resources.service_account_name.clone(),
-            manager_namespace: self
-                .config
-                .kubernetes_runner_manager_namespace
-                .clone()
-                .unwrap_or_else(|| namespace.to_string()),
+            manager_namespace: self.manager_namespace(),
             // A metrics Service without a namespace to admit would create an
             // object nobody may scrape. Fall back to the manager namespace,
             // which keeps the policy exactly as it was and still leaves the
@@ -1855,7 +1903,7 @@ impl PipelineExecutor for KubernetesRunner {
                 RunnerError::RunnerProvisionError {
                     error: format!("unable to serialize the pipeline configuration: {error}"),
                 }
-            })?);
+            })?)?;
         // Probe the namespace with a dry-run create rather than reading the
         // Namespace object: the runner's Role is namespaced, so it cannot read
         // cluster-scoped resources, but it can always create a Secret in the
@@ -1941,7 +1989,7 @@ impl PipelineExecutor for KubernetesRunner {
                 RunnerError::RunnerProvisionError {
                     error: format!("unable to serialize the pipeline configuration: {error}"),
                 }
-            })?);
+            })?)?;
 
         // Resolve the storage class before anything is created: a class the
         // policy does not allow is a configuration mistake, and discovering it
@@ -2099,7 +2147,7 @@ impl PipelineExecutor for KubernetesRunner {
         &mut self,
         runtime_config: &serde_json::Value,
     ) -> Result<ProvisionStatus, ManagerError> {
-        let namespace = self.namespace(runtime_config);
+        let namespace = self.namespace(runtime_config)?;
         let details = serde_json::json!({ "namespace": namespace });
         let Some(pod) = self.get_pod(&namespace).await? else {
             // The pod may be missing because the cluster refused to create it.
@@ -2136,7 +2184,7 @@ impl PipelineExecutor for KubernetesRunner {
         &mut self,
         runtime_config: &serde_json::Value,
     ) -> Result<serde_json::Value, ManagerError> {
-        let namespace = self.namespace(runtime_config);
+        let namespace = self.namespace(runtime_config)?;
         let Some(pod) = self.get_pod(&namespace).await? else {
             return Err(RunnerError::RunnerCheckError {
                 error: format!(
@@ -2181,7 +2229,7 @@ impl PipelineExecutor for KubernetesRunner {
 
     /// Scales the pipeline down to zero replicas, keeping its storage claim.
     async fn stop(&mut self, runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
-        let namespace = self.namespace(runtime_config);
+        let namespace = self.namespace(runtime_config)?;
         // A runner that was restarted while its pipeline was running has no
         // cached client; the resources still exist and are found by name.
         let client = self.kubernetes_client().await?;
@@ -2192,7 +2240,7 @@ impl PipelineExecutor for KubernetesRunner {
 
     /// Deletes the pipeline's compute and storage resources.
     async fn clear(&mut self, runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
-        let namespace = self.namespace(runtime_config);
+        let namespace = self.namespace(runtime_config)?;
         let client = self.kubernetes_client().await?;
         self.stop_log_follower();
         let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &namespace);
@@ -2507,6 +2555,27 @@ mod tests {
             metrics_namespace: Some(namespace.to_string()),
             ..render_input(config)
         }
+    }
+
+    /// The network policy admits the manager, wherever the pipeline runs.
+    ///
+    /// A tenant namespace is not the manager's namespace, so a policy that fell
+    /// back to the pipeline's namespace would leave the manager outside its own
+    /// pipeline: the pod comes up, answers on 8080, and every cycle the manager
+    /// spends trying to `GET /status` times out, which the runner reports as
+    /// `Unavailable`. The fallback therefore has to be the runner's namespace.
+    #[test]
+    fn a_pipeline_in_a_tenant_namespace_admits_the_runner_namespace() {
+        let runner = mapped_runner("tenant-acme");
+        assert_eq!(runner.manager_namespace(), "feldera");
+
+        let mut config = runner_config();
+        config.kubernetes_runner_manager_namespace = Some("control-plane".to_string());
+        let runner = KubernetesRunner {
+            config,
+            ..mapped_runner("tenant-acme")
+        };
+        assert_eq!(runner.manager_namespace(), "control-plane");
     }
 
     #[test]
@@ -3162,6 +3231,25 @@ mod tests {
                 .any(|var| var.name == "FOO" && var.value.as_deref() == Some("bar"))
         );
         assert!(env.iter().any(|var| var.name == "POD_NAME"));
+        // The account was named to obtain permissions, which needs its token,
+        // so the platform must not switch automounting off for it.
+        assert_eq!(pod_spec.automount_service_account_token, None);
+    }
+
+    /// A pipeline gets no service account token unless an operator asks for one.
+    ///
+    /// The pod runs tenant-supplied SQL and tenant-supplied connector addresses;
+    /// a token in it is a credential those tenants have no use for. Leaving the
+    /// field unset is what mounts the namespace's `default` token, so unset is
+    /// the wrong answer here.
+    #[test]
+    fn a_pipeline_gets_no_service_account_token_by_default() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let input = render_input(&config);
+        let objects = input.render();
+        let pod_spec = objects.statefulset.spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod_spec.service_account_name, None);
+        assert_eq!(pod_spec.automount_service_account_token, Some(false));
     }
 
     /// The allowlist rejects a class the platform does not provision on, and
@@ -3466,9 +3554,11 @@ mod tests {
             tenant_namespace: None,
             kubernetes: None,
         };
-        assert_eq!(runner.namespace(&json!({})), "feldera");
+        assert_eq!(runner.namespace(&json!({})).unwrap(), "feldera");
         assert_eq!(
-            runner.namespace(&json!({"resources": {"namespace": "tenant-a"}})),
+            runner
+                .namespace(&json!({"resources": {"namespace": "tenant-a"}}))
+                .unwrap(),
             "tenant-a"
         );
         assert_eq!(
@@ -3477,33 +3567,84 @@ mod tests {
         );
     }
 
-    /// The tenant's namespace applies when the pipeline names none, and an
-    /// explicit per-pipeline namespace still overrides it.
+    /// The tenant's namespace applies when the pipeline names none.
     #[test]
     fn the_tenant_namespace_applies_when_the_pipeline_names_none() {
-        let runner = KubernetesRunner {
-            tenant_namespace: Some(TenantNamespace {
-                tenant_id: TenantId(Uuid::nil()),
-                namespace: "tenant-b".to_string(),
-            }),
-            ..KubernetesRunner {
-                pipeline_id: PipelineId(Uuid::nil()),
-                common_config: CommonConfig::test_config(),
-                config: runner_config(),
-                client: reqwest::Client::new(),
-                logs_sender: logs_sender(),
-                logs_task: None,
-                limits: ResourceLimits::default(),
-                storage_class: None,
-                tenant_namespace: None,
-                kubernetes: None,
-            }
-        };
-        assert_eq!(runner.namespace(&json!({})), "tenant-b");
+        let runner = mapped_runner("tenant-b");
+        assert_eq!(runner.namespace(&json!({})).unwrap(), "tenant-b");
+    }
+
+    /// A mapped tenant cannot move its pipeline out of its namespace.
+    ///
+    /// This is the isolation boundary, not a default: the namespace decides
+    /// whose Secrets a connector mounts, so honouring a caller's choice here
+    /// would let one tenant run a pod in another's namespace and read its
+    /// Secrets out through a connector it controls.
+    #[test]
+    fn a_mapped_tenant_cannot_name_another_namespace() {
+        let runner = mapped_runner("tenant-b");
+        let error = runner
+            .namespace(&json!({"resources": {"namespace": "tenant-a"}}))
+            .expect_err("a mapped tenant must not be placed in another namespace");
+        let message = error.to_string();
+        // The error has to name both namespaces and say what to do instead; an
+        // operator who sees only "forbidden" cannot tell a mistake from a bug.
+        assert!(message.contains("tenant-a"), "{message}");
+        assert!(message.contains("tenant-b"), "{message}");
+        assert!(
+            message.contains("runtime_config.resources.namespace"),
+            "{message}"
+        );
+    }
+
+    /// Naming the tenant's own namespace stays valid, so a client that always
+    /// sends the namespace it read back does not start failing.
+    #[test]
+    fn a_mapped_tenant_may_name_its_own_namespace() {
+        let runner = mapped_runner("tenant-b");
         assert_eq!(
-            runner.namespace(&json!({"resources": {"namespace": "elsewhere"}})),
+            runner
+                .namespace(&json!({"resources": {"namespace": "tenant-b"}}))
+                .unwrap(),
+            "tenant-b"
+        );
+    }
+
+    /// A tenant without a mapping keeps the behaviour pipelines predate: the
+    /// namespace it names is the namespace it gets.
+    #[test]
+    fn an_unmapped_tenant_may_name_any_namespace() {
+        let runner = KubernetesRunner {
+            tenant_namespace: None,
+            ..mapped_runner("unused")
+        };
+        assert_eq!(
+            runner
+                .namespace(&json!({"resources": {"namespace": "elsewhere"}}))
+                .unwrap(),
             "elsewhere"
         );
+        assert_eq!(runner.namespace(&json!({})).unwrap(), "feldera");
+    }
+
+    /// A runner for the namespace tests: one pipeline, the default
+    /// configuration, and the given tenant namespace.
+    fn mapped_runner(namespace: &str) -> KubernetesRunner {
+        KubernetesRunner {
+            pipeline_id: PipelineId(Uuid::nil()),
+            common_config: CommonConfig::test_config(),
+            config: runner_config(),
+            client: reqwest::Client::new(),
+            logs_sender: logs_sender(),
+            logs_task: None,
+            limits: ResourceLimits::default(),
+            storage_class: None,
+            tenant_namespace: Some(TenantNamespace {
+                tenant_id: TenantId(Uuid::nil()),
+                namespace: namespace.to_string(),
+            }),
+            kubernetes: None,
+        }
     }
 
     /// Property tests: the DoD of P1-011 asks for them, because the interesting

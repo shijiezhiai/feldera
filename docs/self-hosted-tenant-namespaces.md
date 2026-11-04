@@ -25,6 +25,14 @@ controlplane:
 值是"namespace 名 + 冒号 + 配额"，多个租户之间用 **`;`** 连接（渲染成
 `FELDERA_KUBERNETES_RUNNER_TENANT_QUOTAS`）。这里有一个已经踩过的坑：
 
+- **键必须写租户 UUID，写租户名会静默失效**。建表时用名字查库能把名字解析成
+  id，所以命名空间和配额都会被建出来——但 runner 放置 pipeline 时只按 id 查这张
+  表，于是那个租户的 pipeline 仍然落在共享命名空间里，而配额一分钱都不计。看起来
+  一切正常，只有 `kubectl -n tenant-acme get pod` 是空的。现在启动时会为每个不是
+  UUID 的键打一条 `warn!`，点名租户与应该填的 id。
+
+还有两个已经踩过的坑：
+
 - **租户之间用 `;`，一个租户的配额键之间用 `,`**。命令行参数的分隔符是 `;`，
   因为 `requests.cpu=16,requests.memory=32Gi` 自己就用逗号分键；若按逗号切分会把
   一个租户切成两条坏条目。
@@ -182,3 +190,25 @@ cannot create resource "secrets" in API group "" in the namespace "tenant-acme"
 Pod 里跑的还是旧镜像：`StatefulSet` 的 `updateStrategy` 默认是 `OnDelete`。P1-005
 撞过一次（`postgres:16` 的 Pod 活过了升级到 17 的那次 release），这单又撞了一次
 （compiler 停在 `p1-018`）。两处模板都补了 `updateStrategy: {type: RollingUpdate}`。
+
+### 6.3 自动化在全新安装上曾经完全不可用
+
+§6.1 的修法（manager 自己写 `RoleBinding` 指向 `ClusterRole`）在**全新集群**上会
+被 Kubernetes 的提权防护拒绝：
+
+```
+rolebindings.rbac.authorization.k8s.io "feldera-pipeline-runner" is forbidden:
+user "system:serviceaccount:feldera:feldera-controlplane" is attempting to grant
+RBAC permissions not currently held: {APIGroups:[""],Resources:["configmaps"],Verbs:["get"]}
+```
+
+规则是「你要在命名空间 N 里授予权限 X，必须先在 N 里持有 X」。manager 的 pipeline
+权限来自 release 命名空间里的一座 `Role`，在租户命名空间里一条都没有，所以第一条
+`RoleBinding` 就写不进去；租户创建随之回滚，功能表现为「建租户直接失败」。
+
+P1-022 没暴露这点，是因为当时验证用的集群上还留着更早某版 chart 写下的绑定。修法
+是让 chart 在 `tenantNamespaceAutomation=true` 时再渲染一座
+`ClusterRoleBinding`（`<release>-pipeline-runner-tenant-namespaces`），主体是
+manager 自己，指向同一座 `pipeline-runner` `ClusterRole`——**授权必须先于绑定存在**。
+`scripts/e2e-k8s-chart.sh` 对两条渲染都做了断言，`scripts/e2e-k8s-isolation.sh`
+则在全新安装上把两个命名空间都建一遍。

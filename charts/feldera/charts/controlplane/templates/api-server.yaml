@@ -206,6 +206,12 @@ spec:
             {{- if .Values.kubernetesRunner.enabled }}
             - "--compiler-host=$(COMPILER_HOST)"
             - "--kubernetes-runner-namespace={{ .Release.Namespace }}"
+            # The manager's own namespace, which every pipeline's NetworkPolicy
+            # has to admit. Left unset, the runner assumes the pipeline's
+            # namespace is the manager's -- true only while pipeline==release
+            # namespace. With tenant namespaces the policy then admits the tenant
+            # and refuses the manager, and the pipeline never becomes reachable.
+            - "--kubernetes-runner-manager-namespace={{ .Release.Namespace }}"
             - "--kubernetes-runner-pipeline-executor-image={{ .Values.kubernetesRunner.image.registry }}/{{ .Values.kubernetesRunner.image.repository }}:{{ .Values.kubernetesRunner.image.tag }}"
             {{- if .Values.kubernetesRunner.enablePerPipelineNamespace }}
             - "--kubernetes-runner-per-pipeline-namespace"

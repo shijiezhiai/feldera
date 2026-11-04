@@ -221,6 +221,13 @@ names longer than a volume name may be.
 * **All pipelines in a namespace share the list.** The allowlist is a runner-wide
   setting, not per tenant. A per-tenant list would need a per-tenant runner, which
   this platform does not have yet.
+* **Tenants that share a namespace share their Secrets.** The mount is
+  namespace-local, so isolation between tenants comes from the namespace each
+  tenant is mapped to (`docs/self-hosted-tenant-namespaces.md`), not from the
+  allowlist: a tenant with no mapped namespace can mount any listed Secret in the
+  platform's namespace, including one another unmapped tenant put there. Multi-tenant
+  deployments are expected to map a namespace per tenant
+  (`design/p1-033-tenant-isolation.md`).
 * **`secrets` are mounted read-only and never mediated.** The manager cannot
   audit which pipeline read which key; the volume projection is the only record.
 * **No secret is available to the compiler.** Compilation does not resolve

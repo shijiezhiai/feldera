@@ -351,6 +351,12 @@ spec:
             - "--db-connection-string=postgres://$(DB_USER):$(DB_PASSWORD)@feldera-db:5431/feldera"
             - "--compiler-host=$(COMPILER_HOST)"
             - "--kubernetes-runner-namespace=feldera"
+            # The manager's own namespace, which every pipeline's NetworkPolicy
+            # has to admit. Left unset, the runner assumes the pipeline's
+            # namespace is the manager's -- true only while pipeline==release
+            # namespace. With tenant namespaces the policy then admits the tenant
+            # and refuses the manager, and the pipeline never becomes reachable.
+            - "--kubernetes-runner-manager-namespace=feldera"
             - "--kubernetes-runner-pipeline-executor-image=localhost:5001/feldera-runner:v0.357.0-20-g7a5128651-bili.1"
             # P1-019: storage class policy. The allowlist only takes effect with
             # the switch on, and every tenant namespace must already exist.
@@ -529,6 +535,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-      volumes:
-        - name: data
-          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi

@@ -189,5 +189,38 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "controlplane.fullname" . }}
     namespace: {{ .Release.Namespace }}
+---
+{{- /*
+  The runner's own rights, cluster-wide, and only when tenant namespaces are on.
+
+  The manager writes the `RoleBinding` that gives itself the pipeline verbs in
+  each tenant namespace, and the API server refuses a `RoleBinding` that grants
+  permissions the creator does not already hold ("attempting to grant RBAC
+  permissions not currently held"). Namespaces are created at runtime, so there
+  is no moment at which the manager could be granted those rights per namespace
+  before it binds them — the grant has to come first, which makes it a
+  cluster-wide binding.
+
+  A fresh install with `tenantNamespaceAutomation` therefore needs this, and
+  without it the manager cannot create the tenant's namespace at all: it fails
+  with `unable to bind the runner's permissions`. The grant is not wider than
+  what the platform already takes in this block — namespace, quota, limit range
+  and RoleBinding management are all cluster-scoped — and the pipeline verbs
+  themselves are only ever used in a namespace the platform provisioned.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "controlplane.fullname" . }}-pipeline-runner-tenant-namespaces
+  labels:
+    {{- include "controlplane.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "controlplane.fullname" . }}-pipeline-runner
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "controlplane.fullname" . }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- end }}

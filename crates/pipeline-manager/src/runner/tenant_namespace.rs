@@ -492,6 +492,33 @@ impl TenantNamespaces {
             // step. The warnings that were logged say why.
             return Ok(None);
         }
+        // A quota entry keyed by tenant *name* is resolved here, through the
+        // database, so the namespace and the quota are created for the right
+        // tenant. The runner that places a pipeline has no database to consult
+        // and can only parse a UUID, so that tenant's pipelines would still go
+        // to the runner-wide namespace: the quota would read as enforced while
+        // nothing was counted against it. Say so once, loudly, with the id the
+        // operator has to paste back.
+        for plan in &plans {
+            let keyed_by_id = config.kubernetes_runner_tenant_quotas.iter().any(|entry| {
+                let key = entry
+                    .split_once(':')
+                    .map(|(key, _)| key.trim().strip_prefix("tenant=").unwrap_or(key.trim()))
+                    .unwrap_or("");
+                uuid::Uuid::parse_str(key) == Ok(plan.tenant_id)
+            });
+            if !keyed_by_id {
+                warn!(
+                    tenant = %plan.tenant_id,
+                    namespace = plan.namespace,
+                    "the tenant quota is keyed by tenant name, so the namespace and its quota \
+                     were created, but the runner places pipelines by tenant id only: this \
+                     tenant's pipelines still go to the shared namespace and its quota counts \
+                     nothing. Replace the tenant name with the id above in \
+                     kubernetesRunner.tenantQuotas."
+                );
+            }
+        }
         let client = crate::runner::kubernetes_runner::build_kubernetes_client(config).await?;
         // The binding is only needed when the platform creates namespaces: a
         // namespace an operator created is theirs to grant permissions in, and

@@ -181,7 +181,24 @@ for expected in 'kind: ClusterRole' 'tenant-namespaces' 'FELDERA_KUBERNETES_RUNN
 done
 printf '%s\n' "$automated" | grep -q 'resources: \["namespaces"\]' \
   || fail "the ClusterRole does not grant namespaces"
-info "automation on renders the ClusterRole, and off does not"
+# The manager writes the RoleBinding that gives itself the pipeline verbs in
+# each tenant namespace, and the API server refuses a RoleBinding that grants
+# permissions the creator does not hold. The grant therefore has to exist
+# cluster-wide before the first namespace is created.
+printf '%s\n' "$automated" | grep -q 'name: feldera-controlplane-pipeline-runner-tenant-namespaces' \
+  || fail "automation on did not bind the runner's rights cluster-wide, so the first tenant namespace cannot be created"
+if printf '%s\n' "$quota" | grep -q 'pipeline-runner-tenant-namespaces'; then
+  fail "the cluster-wide runner binding appeared without tenantNamespaceAutomation"
+fi
+info "automation on renders the ClusterRole and the runner binding, and off does not"
+
+# The pipeline's NetworkPolicy admits one namespace: the manager's. The runner
+# defaults that namespace to its own, so the two agree only while pipelines land
+# in the release namespace -- and a tenant namespace is exactly the case where
+# they do not. The flag makes the manager name itself instead of guessing.
+printf '%s\n' "$automated" \
+  | grep -q -- '--kubernetes-runner-manager-namespace=feldera' \
+  || fail "the chart did not tell the manager its own namespace, so a pipeline in a tenant namespace would refuse it"
 
 step "the connector Secret allowlist reaches the manager"
 # Off is the default and must render nothing at all: an environment variable

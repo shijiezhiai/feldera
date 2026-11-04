@@ -1,0 +1,137 @@
+# Tenants cannot reach each other, and a change that lets them does not merge.
+#
+# `test-k8s-runner.yml` proves the runner works for one tenant; each of P1-022
+# through P1-025 proved its own mechanism from the inside. This job is the only
+# one that puts two tenants against each other with the credentials a tenant
+# holds, and it is the evidence P1-033 owes its security review (see
+# design/p1-033-tenant-isolation.md).
+#
+# It installs the release twice — the tenant quota map is keyed by tenant UUID,
+# so the tenant has to exist before the release can be told about it — and then
+# attacks the network, quota, Secret, access-control and namespace boundaries.
+# Roughly forty minutes once the images exist.
+name: Tenant isolation
+
+on:
+  schedule:
+    # 03:11 UTC, off the hour and clear of the chaos matrix at 02:17.
+    - cron: '11 3 * * *'
+  workflow_dispatch:
+  pull_request:
+    # The boundaries are only as good as the code that draws them, so a change
+    # to any of these is exactly when this job has something to say.
+    paths:
+      - 'crates/pipeline-manager/src/runner/**'
+      - 'crates/pipeline-manager/src/api/**'
+      - 'crates/pipeline-manager/src/auth.rs'
+      - 'crates/pipeline-manager/src/db/**'
+      - 'crates/pipeline-manager/migrations/**'
+      - 'crates/feldera-types/src/config.rs'
+      - 'charts/feldera/**'
+      - 'scripts/e2e-k8s-isolation.sh'
+      - 'scripts/keycloak-fixture.sh'
+      - '.github/workflows/test-tenant-isolation.yml'
+
+jobs:
+  isolation:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'tenant-isolation') }}
+    name: Two tenants, five boundaries, on kind
+    runs-on: ${{ vars.K8S_E2E_RUNNER || 'ubuntu-latest-amd64' }}
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+
+      - name: Check the runner can host the cluster
+        run: |
+          set -euo pipefail
+          docker info >/dev/null || {
+            echo "error: no Docker daemon; kind needs one and the image build needs it too" >&2
+            exit 1
+          }
+          available="$(df -Pk . | awk 'NR==2 { print int($4 / 1024 / 1024) }')"
+          echo "free disk: ${available} GiB"
+          if [ "${available}" -lt 40 ]; then
+            echo "error: need at least 40 GiB free, have ${available} GiB;" >&2
+            echo "point K8S_E2E_RUNNER at a larger runner" >&2
+            exit 1
+          fi
+
+      - name: Create the kind cluster
+        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          cluster_name: feldera-e2e
+
+      - name: Build the images
+        # The job loads images rather than building them itself; the layers are
+        # cached, so a run with no crate changes reuses the previous build.
+        env:
+          PUSH: 1
+          PRUNE: 1
+          BILI_CARGO_JOBS: 4
+        run: |
+          set -euo pipefail
+          deploy/build-images.sh
+          tag="$(docker image ls --format '{{.Tag}}' localhost:5001/feldera-runner \
+                   | grep -v '<none>' | head -1)"
+          test -n "${tag}" || { echo "error: the build produced no runner image" >&2; exit 1; }
+          echo "FELDERA_E2E_TAG=${tag}" >> "$GITHUB_ENV"
+          echo "FELDERA_MANAGER_TAG=$(docker image ls --format '{{.Tag}}' localhost:5001/feldera-manager \
+                   | grep -v '<none>' | head -1)" >> "$GITHUB_ENV"
+
+      - name: Load the Keycloak image
+        # The fixture starts Keycloak from an image the cluster can pull; kind
+        # cannot reach the internet from a pod, so it is loaded instead.
+        run: |
+          set -euo pipefail
+          docker pull "quay.io/keycloak/keycloak:${KEYCLOAK_TAG:-26.0}"
+          kind load docker-image "quay.io/keycloak/keycloak:${KEYCLOAK_TAG:-26.0}" \
+            --name feldera-e2e
+
+      - name: Run the isolation suite
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG }}
+          MANAGER_TAG: ${{ env.FELDERA_MANAGER_TAG }}
+          RUNNER_TAG: ${{ env.FELDERA_E2E_TAG }}
+          # The compiler and the manager share a machine with the cluster here,
+          # so the suite gets a longer start budget than a hand run.
+          TIMEOUT: 1200
+        run: |
+          set -euo pipefail
+          bash scripts/e2e-k8s-isolation.sh
+          echo "::notice title=tenant isolation::five boundaries refused A"
+
+      - name: Collect the cluster state
+        if: failure()
+        run: |
+          set -uo pipefail
+          for namespace in feldera tenant-acme tenant-beta; do
+            echo "=== ${namespace} ==="
+            for kind in namespace resourcequota limitrange rolebinding statefulset pod networkpolicy; do
+              kubectl --namespace "${namespace}" get "$kind" -o wide 2>/dev/null || true
+            done
+          done
+          echo "=== control plane ==="
+          kubectl --namespace feldera logs deployment/feldera-controlplane-api-server \
+            --tail=500 --all-containers || true
+          echo "=== what the manager said about its tenants ==="
+          kubectl --namespace feldera logs deployment/feldera-controlplane-api-server \
+            --all-containers 2>/dev/null | grep -i "tenant\|quota\|namespace" | tail -100 || true
+          echo "=== events ==="
+          for namespace in feldera tenant-acme tenant-beta; do
+            kubectl --namespace "${namespace}" get events --sort-by=.lastTimestamp 2>/dev/null || true
+          done
+
+      - name: Delete the cluster
+        if: always()
+        run: kind delete cluster --name feldera-e2e || true

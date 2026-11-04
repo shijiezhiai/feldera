@@ -115,7 +115,7 @@ gantt
 
 | ID | 工单 | 人天 | 依赖 | DoD |
 |---|---|---|---|---|
-| P1-033 | 安全评审整改：租户互打不穿专项（网络/配额/secret/越权 403 全用例回归）、评审意见闭环 | 4 | 022–025 | 安全团队签字，用例集进 CI |
+| P1-033 | 安全评审整改：租户互打不穿专项（网络/配额/secret/越权 403 全用例回归）、评审意见闭环——**实测补充**：四轴回归套件 `scripts/e2e-k8s-isolation.sh`（两租户、两命名空间、两配额，五条边界依次攻击，绿跑 160 s，CI `.github/workflows/test-tenant-isolation.yml`）；评审包 `design/p1-033-tenant-isolation.md`（ISO-1…ISO-9）。写套件过程中查出并修掉 4 个只有多租户才会暴露的缺陷：①**ISO-1（High，真漏洞）**`runtime_config.resources.namespace` 压过租户映射，A 可把 pipeline 放进 B 的命名空间、在 B 里解析 `${secret:kubernetes:<白名单名>/<key>}` 并经 A 自己的 connector 带走；②**ISO-8（High）** `tenantNamespaceAutomation=true` 在全新安装上根本不可用——manager 在租户命名空间建 `RoleBinding` 被 K8s 提权防护拒绝（「attempting to grant RBAC permissions not currently held」，因为它的 pipeline 权限只在 release 命名空间持有），租户创建回滚，修法是 chart 在自动化打开时多渲染一座 `ClusterRoleBinding`；③**ISO-9（High）** `manager_namespace` 回落到 *pipeline 的* 命名空间（而 `config.rs:2384` 文档写的是 runner 自己的），租户命名空间里的 NetworkPolicy 于是只放行租户、把 manager 关在门外，pipeline 起来后永远 `Unavailable`；④**ISO-7（Medium）** 配额表 key 只有 UUID 会被 runner 解析，写租户名时命名空间与配额都建好但 pipeline 仍落共享命名空间，已加启动告警。另有两条可复用事实：`requests.cpu` 配额条目会强制命名空间内每个 pod 声明 cpu request（不请求 CPU 的 pipeline 会被直接拒绝，必须配 `defaultRequest.cpu`），跨租户读按名/按 id 一律 404（行过滤先于角色检查，套件按「与不存在的名字逐字节相同」断言）。顺带修好 P1-028 之后就一直是红的 `scripts/e2e-k8s-chart.sh` golden | 4 | 022–025 | 安全团队签字，用例集进 CI |
 | P1-034 | 试点②③ 接入 + 租户配额压测（互相打不穿实测） | 4 | 029 | 3 团队在线；压测报告（配额越界零穿透） |
 | P1-035 | runbook v1：部署/升级回滚/试点快速接入/故障速查（standby 留占位，P3 补） | 4 | 030 | 新人按文档独立部署一次成功 |
 | P1-036 | P1 出口验收演练：§6 四条件逐项实测（SSO 登录、Pod 崩溃 RTO<2min、看板、3 试点） | 3 | 033,034 | 演练记录 + 缺口清单归档 |
