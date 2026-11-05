@@ -233,6 +233,12 @@ kind/eval 集群 e2e + 状态机 model-based test）。
    降级为免开发。
 3. 不做跨区控制面（租户 pipeline 跨区接管已覆盖数据面 DR）。
 
+> **P1 后更新（2026-11-05）**：第 1 条已落地——P1-019 把控制面做成带 Lease 的
+> Deployment（`replicaCount > 1` 时 chart 注入 `FELDERA_LEADER_ELECTION=true`），
+> P1-036 实测重启交接 **13s**，期间 pipeline 全程 `Running Success`、`deployment_id`
+> 与 pod UID 都不变。因此「automaton 能不能多活」这个问法作废（P1-037 撤销），剩下
+> 的决策是「值不值得为 15s 不可用做多活」——归 **P2-004**（`design/p2-work-orders.md`）。
+
 ### 5.8 可观测（G7）
 
 - 指标：每 runner `/metrics`（Prometheus scrape，含 checkpoint 直方图、背压、
@@ -289,6 +295,9 @@ gantt
   控制台经公司 SSO 登录；指标看板上线。
 - **P2（M6–M7）**：租户配额压测（互相打不穿）；secret 白名单越权用例全部 403；
   安全评审通过 → 开放生产关键路径之外的自助开通。
+  ⚠️ P1 结束后重切：配额压测与 403 用例已在 P1 交付（P1-034 / P1-033），P2 的实际
+  内容是**转正 + 清账 + 开门**（三个替身换真、修 P1 暴露的缺陷、然后才开自助），
+  12 张工单见 `design/p2-work-orders.md`。
 - **P3（M9–M12）**：游戏日实测 P0 pipeline RPO≤5min/RTO≤15min；控制面主副本 kill
   后 30s 内接管且无状态错乱；告警演练命中率 100%。→ 生产 GA。
 - **P4（M12–M14+）**：回填提速 4×+，平台文档/SLA 对外承诺，稳定运行季度。
@@ -342,10 +351,22 @@ gantt
 
 ## 11. 未决问题
 
-1. ~~P0 实测若发现 FT 有隐藏门控~~ 已闭环：门控为纯编译期 feature，Layer A/B 实测
-   通过（见 §9-R1 更新）。剩 e2e 尾巴：stub 两个闭源 crate 后编译 `--enterprise`
-   程序跑暂停/恢复；以及本地 rdkafka（cmake_build）环境。
-2. automaton 是否可 active-active（代码走读结论待出，影响 §5.7 选型）。
-3. 公司 IdP 的 group claim 容量与角色映射治理归口（安全团队 or 平台团队）。
-4. JDBC 查询网关（业务低延迟点查）是否需要——OSS 当前无 SQL-over-HTTP，
-   视图导出走 Kafka/S3；若有需求属新增工作流（+2–3 人月）。
+> P1 结束后逐条更新（依据 `design/p1-retrospective.md` §7）。四条里两条已闭环、一条
+> 转成政策问题、一条降到 P4。
+
+1. ~~P0 实测若发现 FT 有隐藏门控~~ **已闭环**：门控是纯编译期 feature，不是 runtime
+   entitlement（`crates/pipeline-manager/src/db/types/utils.rs:204`、
+   `crates/connectors/src/server.rs:946`），Layer A/B 实测通过。e2e 尾巴也关了：
+   `--enterprise` 程序的暂停/恢复由 P1-002、P1-016 覆盖，崩溃恢复由 P1-028、P1-036
+   实测（RTO 1s / 判据 120s），本地 rdkafka 环境由 P1-003 固化。唯一遗留是「构建产物
+   必须能自证是 enterprise 版」，已写进 `docs/self-hosted-chaos.md`（看
+   `GET /v0/config` 的 `edition`）。
+2. ~~automaton 是否可 active-active~~ **改问法**：P1-019 已把控制面做成带 Lease 的
+   Deployment，P1-036 实测重启交接 13s、pipeline 全程 `Running Success` 且
+   `deployment_id` 与 pod UID 不变。所以剩下的不是「能不能多活」，而是「值不值得为
+   15s 不可用做多活」。决策进 **P2-004**（`design/p2-work-orders.md`），P1-037 撤销。
+3. 公司 IdP 的 group claim 容量与角色映射治理归口 — **仍未决，且它是政策问题不是技术
+   问题**：代码侧 `oidc/trust_name.rs` + P1-024 的映射机制已就绪，缺的是「谁拥有这张
+   映射表」。归 P2-002，在自助开通（P2-007）之前必须有 owner。
+4. JDBC 查询网关 — **P1/P2 都不需要**：三个试点没有点查诉求，视图经 Kafka/S3 出口。
+   降为 P4 候选，不进 P2 清单。
