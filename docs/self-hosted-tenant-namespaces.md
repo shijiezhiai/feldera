@@ -122,6 +122,33 @@ or raise the tenant's quota
 
 非配额原因的 `FailedCreate`（例如节点 CPU 不足）同样立刻失败，但不带配额建议。
 
+### 3.1 配额怎么定：先算，别猜
+
+配额条目对一个租户的**每个 Pod** 都生效，所以两条规则决定了它到底能不能用：
+
+- 写了 `requests.cpu`（或 `requests.memory`），该命名空间里**每个** Pod 都必须声明
+  这个资源，否则一律被拒——包括根本没打算用 CPU 的 pipeline（平台的
+  `pod_resources` 对 `cpu_cores_min: 0` 不产生 request）。所以只要写了这条，
+  必须同时给 `defaultRequest.cpu`（`LimitRange` 的默认值），否则配额一装上，
+  该租户所有 pipeline 立刻起不来。
+- 同理，写了 `limits.cpu` 会让每个 Pod 都必须声明 cpu limit。**除非确实要管上限，
+  否则不要写它**：它会拦住所有没声明 limit 的 pipeline，而它们与这条配额无关。
+
+定容量就是做一次除法：一条 pipeline 的请求量 × 你愿意容忍的并发条数。实测
+（`design/p1-034-quota-stress.md` §5，kind 单节点，每条 1.0 CPU / 4Gi）：
+
+```
+每个租户：requests.cpu=4  requests.memory=16Gi
+          persistentvolumeclaims=12  requests.storage=48Gi
+          defaultRequest.cpu=100m
+```
+
+结果完全符合算术：2 条 pipeline 跑起来后 `status.used` 是 `requests.cpu=2/4`、
+`requests.memory=8Gi/16Gi`；再并发申请 4 条（空位 2 个），恰好 2 条被接受、2 条被拒，
+过程中任何一次采样都没有越过上限。存储配额故意给得比 CPU 宽（12 条 vs 4 条），
+因为 StatefulSet 控制器**先建 volume claim 再建 Pod**：被拒的 pipeline 会留下一个
+claim，把这条差异留在数字里，比让它悄悄消失在配额边界上更好排查。
+
 ## 4. 与工单/直觉不一致的地方
 
 - **工单说"租户创建→namespace + ResourceQuota（cpu/mem/storage 总和）+
