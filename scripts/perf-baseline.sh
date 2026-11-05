@@ -692,7 +692,7 @@ crash_targets() {
   # The container is matched by pod name rather than by the runtime's sandbox
   # listing, because the pod name is the only identifier the script already has.
   cid="$(node_exec "${node}" crictl ps 2>/dev/null \
-    | awk -v pod="${pod}" 'index($0, pod) { print $1; exit }')"
+    | awk -v pod="${pod}" '!seen && index($0, pod) { print $1; seen = 1 }')"
   [ -n "${cid}" ] || { note "no container for ${pod} on node ${node}"; return 1; }
 
   pid="$(node_exec "${node}" crictl inspect "${cid}" 2>/dev/null \

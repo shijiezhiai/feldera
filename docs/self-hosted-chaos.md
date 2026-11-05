@@ -6,7 +6,7 @@
 ```
 FAULT × TIER
               L1（优雅）              L2（崩溃）
-kill-pod      精确不丢                恢复到最后一个 checkpoint
+kill-pod      精确不丢                恢复到最后一个 checkpoint，且计时（P1 出口：<2min）
 delete-pvc    回到空库且可见          崩溃+丢盘也回到空库
 drop-postgres 数据面不中断            控制面能收敛且可重启
 drop-storage  继续摄入、事后补 checkpoint  恢复到不早于最后的 checkpoint
@@ -24,6 +24,21 @@ KEEP=1 CELLS=drop-storage:L1 TAG=... bash scripts/e2e-k8s-chaos.sh      # 留现
 
 一条命令跑完约 13 分钟（十格，编译缓存已热）。单个镜像 tag 不统一时用
 `MANAGER_TAG` / `RUNNER_TAG` / `COMPILER_TAG` 分开指定。
+
+**必须是 enterprise 构建。** 每一格都建带 `fault_tolerance` 的 pipeline，
+而 FT 是编译期特性：OSS 构建的 manager 会在建 pipeline 时回
+`400 InvalidRuntimeConfig ... enterprise feature: fault tolerance`，pipeline
+进程侧（`crates/connectors/src/server.rs`）有同一个 `cfg` 门。所以用
+`deploy/Dockerfile.manager`（它自带 `--features feldera-enterprise`）构建，
+或自己构建时加同一个 flag。判断手上这个镜像行不行，两条都不用建 pipeline：
+`curl :8080/v0/config` 的 `edition` 是 `Enterprise` 还是 `Open source`，
+以及 `GET /v0/pipelines` 里 `platform_version` 有没有 `+enterprise` 后缀。
+
+`kill-pod:L2` 额外计时：从 `kill -9` 到重启后的进程**按 checkpoint 的记录数
+回答查询**为止，这段就是 P1 出口条件里的「Pod 崩溃自动恢复 RTO」——不是等到
+`deployment_status` 变 `Running`（那只是 pod 起来了，进程还没应答）。判据是
+`RTO_LIMIT`（默认 120 秒），超了直接 fail，所以这条承诺由每夜的矩阵守着，而不是
+只在验收那天量一次。
 
 最后一次整跑（2026-11-02，kind `bili-p1005`，manager `p1-027` / compiler
 `p1-025` / runner `v0.357.0-52-gc13e46766-bili.1`）：**10 passed, 0 failed, in 785s**。

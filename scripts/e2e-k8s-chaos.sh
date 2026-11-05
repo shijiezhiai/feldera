@@ -54,10 +54,21 @@
 #   CELLS        comma-separated <fault>:<tier> cells (default: the matrix)
 #   FAULTS       comma-separated faults, expanding to both tiers
 #   KEEP         set to 1 to leave the pipelines behind for inspection
+#   RTO_LIMIT    seconds a crash may take to serve its view again (default:
+#                120). Only kill-pod:L2 measures it; it is the P1 exit
+#                criterion for a crashed pod, so the cell fails rather than
+#                reports when it slips.
 #
 # The pipeline compiles inside the manager pod, so a run is fast only when a
 # previous run left the compilation cache in place.
 set -euo pipefail
+# A cell that dies without a message teaches nothing: `set -e` exits quietly on
+# an unguarded command and the matrix then prints a bare FAIL. The trap makes
+# the shell name the line it was running, so the next silent failure is a
+# diagnosis instead of a rerun.
+set -E
+trap 'rc=$?; printf "error: %s:%s exited %s running: %s\n" \
+  "${BASH_SOURCE[0]}" "${LINENO}" "${rc}" "${BASH_COMMAND}" >&2' ERR
 
 CLUSTER="${CLUSTER:-bili-p1005}"
 NAMESPACE="${NAMESPACE:-feldera}"
@@ -92,6 +103,9 @@ KAFKA_IMAGE="${KAFKA_IMAGE:-apache/kafka:3.9.0}"
 KAFKA_SERVICE="chaos-kafka"
 KAFKA_TOPIC="chaos-input"
 KEEP="${KEEP:-0}"
+# The P1 exit criterion for a crashed pod: serving again within two minutes.
+# Only the kill-pod:L2 cell measures it; the others are not time-bounded.
+RTO_LIMIT="${RTO_LIMIT:-120}"
 
 FAULTS_ALL="kill-pod delete-pvc drop-postgres drop-storage drop-kafka"
 if [ -n "${CELLS:-}" ]; then
@@ -362,7 +376,7 @@ crash_container_of_pod() {
 
   if docker exec "${node}" true >/dev/null 2>&1; then
     cid="$(docker exec "${node}" crictl ps 2>/dev/null \
-      | awk -v pod="${pod}" 'index($0, pod) { print $1; exit }')"
+      | awk -v pod="${pod}" '!seen && index($0, pod) { print $1; seen = 1 }')"
     [ -n "${cid}" ] || fail "no container for ${pod} on node ${node}"
     pid="$(docker exec "${node}" crictl inspect "${cid}" 2>/dev/null \
       | python3 -c 'import json,sys; print((json.load(sys.stdin).get("info") or {}).get("pid") or 0)')"
@@ -370,7 +384,7 @@ crash_container_of_pod() {
     docker exec "${node}" kill -9 "${pid}" >/dev/null 2>&1 \
       || fail "the process ${pid} of ${pod} could not be killed"
   elif command -v crictl >/dev/null 2>&1; then
-    cid="$(crictl ps 2>/dev/null | awk -v pod="${pod}" 'index($0, pod) { print $1; exit }')"
+    cid="$(crictl ps 2>/dev/null | awk -v pod="${pod}" '!seen && index($0, pod) { print $1; seen = 1 }')"
     [ -n "${cid}" ] || fail "no container for ${pod} on this node"
     pid="$(crictl inspect "${cid}" 2>/dev/null \
       | python3 -c 'import json,sys; print((json.load(sys.stdin).get("info") or {}).get("pid") or 0)')"
@@ -944,25 +958,30 @@ run_cell() {
       local resume_at; resume_at="$(last_checkpoint_records "${name}")"
       note "the newest checkpoint holds ${resume_at} records"
 
+      local crashed_at; crashed_at="$(date +%s)"
       crash_container_of_pod "${pod}"
       note "killed the pipeline process; the kubelet restarts the container"
-      sleep 5
 
-      for _ in $(seq 1 240); do
-        [ "$(deployment_status "${name}")" = "Running" ] && break
-        sleep 5
-      done
-      [ "$(deployment_status "${name}")" = "Running" ] \
-        || fail "the pipeline did not come back after the crash: $(pipeline_json "${name}")"
-
-      # Wait for the restarted process to answer.
-      local after=""
-      for _ in $(seq 1 120); do
+      # Poll the view once a second for the first minute, then every five
+      # seconds. The stopwatch ends when the restarted process answers with a
+      # count, because that is the moment the platform is serving again; the
+      # pod reports `Running` before the new process has read its checkpoint,
+      # so that is not the end of the recovery. A five-second floor would have
+      # reported this number as "under five" whatever it was.
+      local after="" attempts=0
+      while [ "${attempts}" -lt 300 ]; do
+        attempts=$((attempts + 1))
+        if [ "${attempts}" -le 60 ]; then sleep 1; else sleep 5; fi
         after="$(count_in_pod "${pod}" 2>/dev/null || true)"
-        [ -n "${after}" ] && break
-        sleep 5
+        if [ -n "${after}" ]; then break; fi
       done
       [ -n "${after}" ] || fail "the restarted pipeline never answered a query"
+      local rto=$(( $(date +%s) - crashed_at ))
+      note "L2: the view answered ${rto}s after the crash"
+      [ "${rto}" -lt "${RTO_LIMIT}" ] \
+        || fail "L2: recovery took ${rto}s; the P1 exit criterion is under ${RTO_LIMIT}s"
+      [ "$(deployment_status "${name}")" = "Running" ] \
+        || fail "the pipeline answered but the manager does not report it Running: $(pipeline_json "${name}")"
       # At-least-once resumes from the checkpoint, so the state is exactly the
       # checkpoint's record count: a record ingested after it may be replayed or
       # lost, but the resume point itself is not approximate.

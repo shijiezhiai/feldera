@@ -16,7 +16,9 @@
 #   CLUSTER       kind cluster name (default: bili-p1005)
 #   NAMESPACE     namespace of the platform (default: feldera)
 #   RELEASE       Helm release name (default: feldera)
-#   TAG           image tag to deploy (required)
+#   TAG           image tag for the manager and compiler (required)
+#   RUNNER_TAG    image tag for the pipeline runner (default: TAG); the runner
+#                 is built on its own cadence, so it rarely shares TAG
 #   TIMEOUT       seconds to wait for Running (default: 2400)
 #   METRICS_NS    namespace the scrape client runs in (default: monitoring)
 #   PROM_TIMEOUT  seconds to wait for a Prometheus sample (default: 180)
@@ -30,6 +32,7 @@ CLUSTER="${CLUSTER:-bili-p1005}"
 NAMESPACE="${NAMESPACE:-feldera}"
 RELEASE="${RELEASE:-feldera}"
 TAG="${TAG:?TAG must be set, for example v0.357.0-20-g7a5128651-bili.9}"
+RUNNER_TAG="${RUNNER_TAG:-${TAG}}"
 TIMEOUT="${TIMEOUT:-2400}"
 METRICS_NS="${METRICS_NS:-monitoring}"
 METRICS_FILE="${METRICS_FILE:-/tmp/e2e-k8s-monitoring-metrics.txt}"
@@ -51,10 +54,10 @@ done
 [ "$(kind get clusters | grep -cx "${CLUSTER}")" = "1" ] \
   || fail "kind cluster '${CLUSTER}' does not exist"
 
-say "loading images ${TAG} into ${CLUSTER}"
+say "loading images ${TAG} (runner ${RUNNER_TAG}) into ${CLUSTER}"
 for ref in \
   "localhost:5001/feldera-manager:${TAG}" \
-  "localhost:5001/feldera-runner:${TAG}" \
+  "localhost:5001/feldera-runner:${RUNNER_TAG}" \
   "localhost:5001/feldera-compiler:${TAG}" \
   "postgres:17-alpine" \
   "curlimages/curl:8.11.1" \
@@ -79,7 +82,7 @@ say "installing release ${RELEASE} with metrics in namespace ${METRICS_NS}"
 helm upgrade --install "${RELEASE}" charts/feldera \
   --namespace "${NAMESPACE}" --create-namespace \
   --set "controlplane.image.tag=${TAG}" \
-  --set "controlplane.kubernetesRunner.image.tag=${TAG}" \
+  --set "controlplane.kubernetesRunner.image.tag=${RUNNER_TAG}" \
   --set "compiler.image.tag=${TAG}" \
   --set controlplane.controlPlane.deploymentTimeAnnotation=false \
   --set controlplane.compilationCache.enabled=true \
@@ -479,6 +482,27 @@ done
 [ -n "${dashboard}" ] || fail "grafana does not serve the feldera dashboard (uid dbsp)"
 printf '%s' "${dashboard}" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin)["dashboard"]; rows=[p["title"] for p in d["panels"] if p.get("type")=="row"]; print("  rows:", rows); assert "Checkpoint" in rows, rows; assert "Backpressure" in rows, rows'
+
+# The panel divides a one-minute rate, so it has input only while a checkpoint
+# falls inside that window. Take one now, with grafana already up, and wait
+# until prometheus has scraped it: with a zero rate on every bucket
+# `histogram_quantile` returns no series at all -- an empty result, which reads
+# as "the panel is broken" when the panel and the data source are both fine.
+say "a checkpoint lands inside the panel's rate window"
+api_call POST "/v0/pipelines/${PIPELINE}/checkpoint" >/dev/null 2>&1 \
+  || fail "the checkpoint that should fill the panel's window failed"
+tries=0
+while :; do
+  window="$(query "sum(rate(feldera_checkpoint_runtime_seconds_count{pipeline_name=\"${PIPELINE}\"}[1m]))")"
+  if [ -n "${window}" ] && awk "BEGIN { exit !(${window} > 0) }"; then
+    break
+  fi
+  tries=$((tries + 1))
+  [ "${tries}" -le 40 ] \
+    || fail "no checkpoint reached prometheus within 120s, so the panel's window is empty"
+  sleep 3
+done
+echo "  prometheus counts ${window} checkpoints per second inside the window"
 
 # A dashboard that serves is not a dashboard that works. Ask Grafana to run the
 # checkpoint panel's own query through its Prometheus data source, so the
