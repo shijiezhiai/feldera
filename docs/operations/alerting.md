@@ -4,6 +4,10 @@ The dashboard answers "what is happening". This page is for the other question:
 an alert is firing, the engineer who was paged has never seen this system, and
 what they need is the four steps that end the page.
 
+Deploying, upgrading, or onboarding a team rather than working a page? That is
+[docs/runbook.md](../runbook.md), which indexes these same alerts by symptom and
+lists the seven rules in one table.
+
 Every alert in `deploy/config/feldera-alerts.yml` carries a `runbook_url` that
 points at a section of this page. The anchors below are load-bearing: rename a
 heading and the alert's link breaks.
