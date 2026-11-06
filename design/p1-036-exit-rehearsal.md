@@ -244,3 +244,74 @@ backlog before it is declared.
 Importantly, the one condition that had never been measured — the two-minute
 recovery bound — has the widest margin of all four, and it is now guarded nightly
 by `scripts/e2e-k8s-chaos.sh` rather than by this document.
+
+That paragraph was written on 2026-11-05 and was too kind to itself on 2026-11-06;
+see §7. The number survived the re-examination, but the way it was measured did not.
+
+## 7. A second opinion, from re-running
+
+Four green runs hid a defect. On 2026-11-06 the same three suites were run again,
+against a freshly built image, with nothing changed in the scripts. Two passed and
+one failed — the one that measures the exit criterion:
+
+```
+    L2: the view answered 2s after the crash
+error: the pipeline answered but the manager does not report it Running
+```
+
+The manager's own view of that pipeline at that moment was:
+
+```
+deployment_status: Unavailable
+deployment_desired_status: Unavailable
+details.reason: Pipeline status endpoint could not be reached: error sending
+  request for url (http://pipeline-....feldera.svc.cluster.local:8080/status);
+  source: failed to lookup address information: Name or service not known
+```
+
+Two defects, both in the runner, both real:
+
+1. **The headless Service published only ready endpoints.** While the pipeline's
+   container restarts, the pod is not ready, so the Service has no endpoints and
+   its DNS name stops resolving outright — during exactly the window in which the
+   manager polls `/status` to decide whether the pipeline came back. `render_service`
+   now sets `publishNotReadyAddresses: true`, so the name resolves throughout the
+   restart.
+2. **A single unreachable poll rewrote the *desired* status.** `parse_status_result`
+   turned one transport error into `Unavailable` and persisted the same value as
+   `deployment_runtime_desired_status`, so the control plane recorded agreement that
+   a healthy pipeline was gone. It now tolerates three consecutive unreachable polls
+   (about 7s at the provisioned poll period) and clears the count on any answer; only
+   a sustained absence is treated as one.
+
+The earlier 1s and 5s readings were not false, they were unverifiable: the poll
+period (1–5s) and the restart window (1–2s) interleaved so that the assertion ran
+before the poll that would have failed. A measurement whose outcome depends on that
+race is not a measurement.
+
+Both fixes carry unit tests — `the_headless_service_publishes_the_pod_before_it_is_ready`
+and `a_restart_is_not_a_status_change` — and the strict assertion at
+`scripts/e2e-k8s-chaos.sh:983` was left untouched. Two runs after the fix:
+
+| run | build | result | recovery | resume point |
+| --- | --- | --- | --- | --- |
+| 2026-11-05 | before | FAIL at the status assertion | 2s | 1000 (exact) |
+| 2026-11-06 | `p1-036-fix1` | 1 passed, 0 failed, 237s | 1s | 1000 (exact) |
+| 2026-11-06 | `p1-036-fix1` | 1 passed, 0 failed, 245s | 1s | 1000 (exact) |
+
+Two supporting observations, both from the cluster rather than from a test:
+
+- the Service created by the fixed manager carries `publishNotReadyAddresses: true`
+  (`pipeline-01a1ae83-...`, created during the second run), while every Service
+  created before the fix has the field absent;
+- the manager logged **no** tolerated-poll warning during either run, which means
+  the name resolved throughout: fix 2 is a belt over fix 1's braces rather than the
+  mechanism that was exercised. It is still worth having — it is the difference
+  between "the manager cannot see the pod" and "the manager has decided the pipeline
+  is gone".
+
+The general lesson belongs with the retrospective's "a suite that goes green before
+and after a defect exists is not evidence that the defect is absent". Only running
+it against a different build tells the two apart, and the build that exposes it is
+the one built from the tree that is actually going to ship.
+

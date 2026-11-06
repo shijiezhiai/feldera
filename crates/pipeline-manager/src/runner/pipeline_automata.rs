@@ -232,6 +232,10 @@ where
     /// `Unavailable` because the pipeline cannot be reached.
     provisioned_grace_period_start: Option<Instant>,
 
+    /// How many polls in a row failed to reach the pipeline's `/status` endpoint. Any response
+    /// from the pipeline, even an unsuccessful one, resets it.
+    consecutive_unreachable_status_polls: u32,
+
     /// Counter for how many database errors were encountered in succession.
     database_error_counter: u64,
 
@@ -294,6 +298,16 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
     /// `Initializing`. If it comes back one time something different, the grace period ends.
     const PROVISIONED_GRACE_PERIOD: Duration = Duration::from_secs(20);
 
+    /// How many polls in a row may fail to reach the pipeline's `/status` endpoint before the
+    /// pipeline is reported as `Unavailable`.
+    ///
+    /// A restarting container takes the endpoint away for a second or two: the pod is not ready,
+    /// and a headless Service only publishes ready addresses. A single failed poll is therefore
+    /// evidence of a restart, not of a broken pipeline. At [Self::POLL_PERIOD_PROVISIONED] this
+    /// tolerance rides out a window of roughly seven seconds, and a pipeline that answers again
+    /// within it is never reported as unhealthy.
+    const UNREACHABLE_STATUS_POLL_TOLERANCE: u32 = 3;
+
     /// The details can potentially change very frequently (especially if some counters or
     /// a timestamp is part of it). This is the minimum bound for them getting updated in the
     /// database, unless the status itself changed.
@@ -350,6 +364,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             provision_called: None,
             default_provisioning_timeout,
             provisioned_grace_period_start: None,
+            consecutive_unreachable_status_polls: 0,
             logs_sender,
             logs_thread_terminate_sender_and_join_handle: Some(
                 logs_thread_terminate_sender_and_join_handle,
@@ -1756,12 +1771,16 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
     fn parse_status_result(
         &mut self,
         deployment_initial: RuntimeDesiredStatus,
+        current_runtime_status: Option<RuntimeStatus>,
+        current_runtime_desired_status: Option<RuntimeDesiredStatus>,
         result: Result<(StatusCode, serde_json::Value), InternalRequestError>,
     ) -> Result<ExtendedRuntimeStatus, ErrorResponse> {
         let pipeline_id = self.pipeline_id;
         match result {
             Ok((status_code, body)) => {
-                // Able to reach the pipeline HTTP(S) server and get a response
+                // Able to reach the pipeline HTTP(S) server and get a response, however
+                // unsuccessful: whatever the pipeline is doing, it is not gone.
+                self.consecutive_unreachable_status_polls = 0;
                 if status_code == StatusCode::OK {
                     if let Some(response_str) = body.as_str() {
                         // Backward compatibility: a JSON string is returned with 200 OK
@@ -1884,20 +1903,54 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                         storage_status_details: None,
                     })
                 } else {
-                    warn!(
-                        pipeline_id = %pipeline_id,
-                        pipeline = self.pipeline_name.as_deref().unwrap_or("N/A"),
-                        "Pipeline status endpoint could not be reached: {e}"
-                    );
-                    Ok(ExtendedRuntimeStatus {
-                        runtime_status: RuntimeStatus::Unavailable,
-                        runtime_status_details: RuntimeStatusDetails::new_only_reason(&format!(
-                            "Pipeline status endpoint could not be reached: {e}"
-                        ))
-                        .serialize_guaranteed(),
-                        runtime_desired_status: RuntimeDesiredStatus::Unavailable,
-                        storage_status_details: None,
-                    })
+                    // The endpoint did not answer at all. A restarting container is unreachable
+                    // for a little while, so the runner rides the first few failures out instead
+                    // of calling a healthy pipeline `Unavailable` -- and, worse, believing it.
+                    self.consecutive_unreachable_status_polls =
+                        self.consecutive_unreachable_status_polls.saturating_add(1);
+                    if self.consecutive_unreachable_status_polls
+                        <= Self::UNREACHABLE_STATUS_POLL_TOLERANCE
+                    {
+                        warn!(
+                            pipeline_id = %pipeline_id,
+                            pipeline = self.pipeline_name.as_deref().unwrap_or("N/A"),
+                            "Pipeline status endpoint could not be reached ({} of {} tolerated polls): {e}",
+                            self.consecutive_unreachable_status_polls,
+                            Self::UNREACHABLE_STATUS_POLL_TOLERANCE,
+                        );
+                        // Keep believing what the pipeline last said: an unreachable endpoint is
+                        // not, on its own, a status. Reporting the last known one keeps the
+                        // pipeline visible as it was and leaves the desired status alone.
+                        Ok(ExtendedRuntimeStatus {
+                            runtime_status: current_runtime_status
+                                .unwrap_or(RuntimeStatus::Initializing),
+                            runtime_status_details: RuntimeStatusDetails::new_only_reason(&format!(
+                                "Pipeline status endpoint could not be reached (attempt {} of {}) due to: {e}",
+                                self.consecutive_unreachable_status_polls,
+                                Self::UNREACHABLE_STATUS_POLL_TOLERANCE,
+                            ))
+                            .serialize_guaranteed(),
+                            runtime_desired_status: current_runtime_desired_status
+                                .unwrap_or(deployment_initial),
+                            storage_status_details: None,
+                        })
+                    } else {
+                        warn!(
+                            pipeline_id = %pipeline_id,
+                            pipeline = self.pipeline_name.as_deref().unwrap_or("N/A"),
+                            "Pipeline status endpoint could not be reached {} times in a row: {e}",
+                            self.consecutive_unreachable_status_polls,
+                        );
+                        Ok(ExtendedRuntimeStatus {
+                            runtime_status: RuntimeStatus::Unavailable,
+                            runtime_status_details: RuntimeStatusDetails::new_only_reason(
+                                &format!("Pipeline status endpoint could not be reached: {e}"),
+                            )
+                            .serialize_guaranteed(),
+                            runtime_desired_status: RuntimeDesiredStatus::Unavailable,
+                            storage_status_details: None,
+                        })
+                    }
                 }
             }
         }
@@ -1951,6 +2004,8 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         // Retrieve latest runtime status
         let latest_runtime_extended_status = match self.parse_status_result(
             deployment_initial,
+            pipeline.deployment_runtime_status,
+            pipeline.deployment_runtime_desired_status,
             self.http_request_pipeline_json(
                 Method::GET,
                 deployment_location,
@@ -2150,7 +2205,7 @@ mod test {
     use crate::logging;
     use crate::runner::error::RunnerError;
     use crate::runner::main::MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS;
-    use crate::runner::pipeline_automata::PipelineAutomaton;
+    use crate::runner::pipeline_automata::{InternalRequestError, PipelineAutomaton};
     use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
     use crate::runner::pipeline_logs::{
         FollowMode, FollowRequest, FollowerMessage, LogMessage, LogsSender,
@@ -2160,8 +2215,11 @@ mod test {
     use feldera_types::config::{PipelineConfig, StorageConfig};
     use feldera_types::error::ErrorResponse;
     use feldera_types::program_schema::ProgramSchema;
-    use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
+    use feldera_types::runtime_status::{
+        BootstrapConfig, ExtendedRuntimeStatus, RuntimeDesiredStatus, RuntimeStatus,
+    };
     use feldera_types::size::ConfigSize;
+    use reqwest::StatusCode;
     use serde_json::json;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -3707,6 +3765,71 @@ mod test {
         test.tick().await;
         assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
         assert_eq!(faults.delivered(), vec![Fault::CheckUnreachable]);
+    }
+
+    /// One poll of the status endpoint that never reached the pipeline: the
+    /// pod was restarting and nothing is listening on its port yet.
+    fn poll_unreachable(test: &mut AutomatonTest) -> ExtendedRuntimeStatus {
+        test.automaton
+            .parse_status_result(
+                RuntimeDesiredStatus::Running,
+                Some(RuntimeStatus::Running),
+                Some(RuntimeDesiredStatus::Running),
+                Err(InternalRequestError::Unreachable {
+                    error: "connection refused".to_string(),
+                }),
+            )
+            .expect("an unreachable endpoint is not a fatal status")
+    }
+
+    /// One poll the pipeline answered with `Running`.
+    fn poll_answered(test: &mut AutomatonTest) -> ExtendedRuntimeStatus {
+        test.automaton
+            .parse_status_result(
+                RuntimeDesiredStatus::Running,
+                Some(RuntimeStatus::Running),
+                Some(RuntimeDesiredStatus::Running),
+                Ok((StatusCode::OK, json!("Running"))),
+            )
+            .expect("a 200 is a status")
+    }
+
+    /// A restarting container is not a status change.
+    ///
+    /// While the pipeline's pod restarts, its `/status` endpoint refuses
+    /// connections for a moment. The runner has to ride that out: the pipeline
+    /// stays reported as it was and the desired status is left alone. Only a
+    /// sustained absence turns the pipeline `Unavailable`.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn a_restart_is_not_a_status_change() {
+        let (_server, _temp, mut test) = setup_complete().await;
+        const TOLERANCE: u32 = PipelineAutomaton::<MockRunner>::UNREACHABLE_STATUS_POLL_TOLERANCE;
+
+        for attempt in 1..=TOLERANCE {
+            let status = poll_unreachable(&mut test);
+            assert_eq!(
+                status.runtime_status, RuntimeStatus::Running,
+                "poll {attempt} of {TOLERANCE} must ride the restart out"
+            );
+            assert_eq!(status.runtime_desired_status, RuntimeDesiredStatus::Running);
+        }
+
+        // The endpoint stays away: that is an absence, not a restart.
+        let status = poll_unreachable(&mut test);
+        assert_eq!(status.runtime_status, RuntimeStatus::Unavailable);
+        assert_eq!(status.runtime_desired_status, RuntimeDesiredStatus::Unavailable);
+
+        // One answer is believed again, and it restarts the count.
+        let status = poll_answered(&mut test);
+        assert_eq!(status.runtime_status, RuntimeStatus::Running);
+        for attempt in 1..=TOLERANCE {
+            let status = poll_unreachable(&mut test);
+            assert_eq!(
+                status.runtime_status, RuntimeStatus::Running,
+                "an answer resets the count, so poll {attempt} is tolerated again"
+            );
+        }
     }
 
     /// A 409 while provisioning (the object is already there) stops the pipeline

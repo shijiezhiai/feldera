@@ -752,12 +752,19 @@ impl RenderInput {
     /// The headless Service the manager addresses the pipeline through.
     ///
     /// `headless`: the DNS name resolves to the pod's own address, so the
-    /// manager can reach the pipeline without a stable ClusterIP.
+    /// manager can reach the pipeline without a stable ClusterIP. A headless
+    /// Service publishes only *ready* endpoints by default, which means its
+    /// name stops resolving altogether while the pod is restarting -- exactly
+    /// when the manager is polling `/status` to find out whether the pipeline
+    /// came back. `publish_not_ready_addresses` keeps the name pointing at the
+    /// pod through that window, so a restart reads as an endpoint that is
+    /// about to answer instead of as a DNS failure.
     fn render_service(&self) -> Service {
         Service {
             metadata: self.metadata(),
             spec: Some(ServiceSpec {
                 cluster_ip: Some("None".to_string()),
+                publish_not_ready_addresses: Some(true),
                 ports: Some(vec![ServicePort {
                     name: Some("http".to_string()),
                     port: i32::from(PIPELINE_PORT),
@@ -2668,6 +2675,32 @@ mod tests {
             STORAGE_MOUNT_BASE
         );
         assert!(runner.generate_storage_options().is_some());
+    }
+
+    /// The headless Service has to publish the pod while it is restarting.
+    ///
+    /// A headless Service publishes only ready endpoints by default, so while a
+    /// container restarts its DNS name stops resolving and the manager reads a
+    /// restart as the pipeline being gone.
+    #[test]
+    fn the_headless_service_publishes_the_pod_before_it_is_ready() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let input = render_input(&config);
+
+        let service = input.render_service();
+        assert_eq!(
+            service.metadata.name.as_deref(),
+            Some(resource_base(PipelineId(Uuid::nil())).as_str())
+        );
+        let spec = service.spec.expect("the service has a spec");
+        // Still headless: the manager addresses one pod, not a load balancer.
+        assert_eq!(spec.cluster_ip.as_deref(), Some("None"));
+        // But the name keeps resolving through a restart.
+        assert_eq!(spec.publish_not_ready_addresses, Some(true));
+        assert_eq!(
+            spec.selector,
+            Some(selector_labels(PipelineId(Uuid::nil())))
+        );
     }
 
     /// The default deployment creates no scrape target.

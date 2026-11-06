@@ -37,8 +37,14 @@ KEEP=1 CELLS=drop-storage:L1 TAG=... bash scripts/e2e-k8s-chaos.sh      # 留现
 `kill-pod:L2` 额外计时：从 `kill -9` 到重启后的进程**按 checkpoint 的记录数
 回答查询**为止，这段就是 P1 出口条件里的「Pod 崩溃自动恢复 RTO」——不是等到
 `deployment_status` 变 `Running`（那只是 pod 起来了，进程还没应答）。判据是
-`RTO_LIMIT`（默认 120 秒），超了直接 fail，所以这条承诺由每夜的矩阵守着，而不是
-只在验收那天量一次。
+`RTO_LIMIT`（默认 120 秒），超了直接 fail，所以这条承诺由每夜的矩阵守着，而不是只在验收那天量一次。
+
+答案到达后还有一条更严的断言：manager 必须**当场**把这个 pipeline 报成 `Running`。
+它依赖两件事——headless Service 发布未就绪的地址（否则容器重启的那一两秒里 DNS
+直接查不到这个名字），以及 manager 不把一次连接失败当成终局。两者都在
+`crates/pipeline-manager/src/runner/` 里修过一次（见 `design/p1-036-exit-rehearsal.md`
+§7），因此这条断言同时也是那两个修复的回归检查：任何一边退回去，`kill-pod:L2`
+都会在一秒内红。
 
 最后一次整跑（2026-11-02，kind `bili-p1005`，manager `p1-027` / compiler
 `p1-025` / runner `v0.357.0-52-gc13e46766-bili.1`）：**10 passed, 0 failed, in 785s**。
