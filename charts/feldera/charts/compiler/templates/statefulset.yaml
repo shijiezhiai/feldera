@@ -24,8 +24,27 @@ spec:
       labels:
         app.kubernetes.io/name: {{ include "compiler.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
+        {{- with .Values.labels }}
+        {{- include "compiler.pairsToMap" . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.annotations }}
+      annotations:
+        {{- include "compiler.pairsToMap" . | nindent 8 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "compiler.fullname" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- include "compiler.pairsToMap" . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: compiler
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"

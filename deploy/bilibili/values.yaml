@@ -1,0 +1,164 @@
+# Feldera on the Bilibili Kubernetes clusters.
+#
+# This is an overlay on charts/feldera:
+#
+#   helm upgrade --install feldera charts/feldera -n feldera -f deploy/bilibili/values.yaml
+#
+# It exists because these clusters differ from a self-hosted one in four ways,
+# and each difference has exactly one setting below that answers it:
+#
+#   1. Images come from the internal registry, which needs a pull secret. The
+#      pipeline pods the manager creates are separate objects and do not
+#      inherit the manager's secret, so it is named twice.
+#   2. Nodes are labelled and tainted by workload. Both the control plane and
+#      the pipeline pods therefore need a node selector and a toleration.
+#   3. Every pod carries an annotation the platform's admission controller reads
+#      to size `/proc/sys/kernel/pid_max`.
+#   4. Pipeline state has to land on a named storage class rather than whatever
+#      the cluster considers default.
+#
+# The values marked TODO are the ones this file cannot know: the registry
+# group, the node labels and taints, and the storage class name. Read them off
+# a running Flink job rather than guessing:
+#
+#   kubectl -n <flink-namespace> get pod -l component=jobmanager \
+#     -o jsonpath='{.items[0].spec.nodeSelector}{"\n"}{.items[0].spec.tolerations}'
+#   kubectl get storageclass
+#
+# Every list of scheduling settings is a list of `key=value` strings for the
+# pipeline pods, because the manager takes them as flags; the control plane and
+# compiler accept either that or a plain map.
+
+controlplane:
+  image:
+    # TODO: the group the CI publishes into. `bigdata` mirrors the Flink images
+    # at tx-deepblue-hub.bilibili.co/bigdata/flink; use whatever group owns
+    # Feldera there.
+    registry: hub.bilibili.co/bigdata
+    repository: feldera-manager
+    # Must be the tag the CI built, and the same commit as the compiler and
+    # runner images.
+    tag: "0.376.0-bili.1"
+    pullPolicy: IfNotPresent
+
+  imagePullSecrets:
+    # Created once per namespace; see README.md. The name is referenced by the
+    # pipeline pods below as well imagePullSecrets: [], so keep the two equal.
+    - name: bilibili-hub
+
+  nodeSelectors:
+    # TODO: label the scheduler uses to place control-plane workloads.
+    controlPlane: ["workload=control-plane"]
+
+  tolerations:
+    # TODO: the taint those nodes carry. A wrong key here means the pod stays
+    # Pending with `0/N nodes are available: N node(s) had untolerated taint`,
+    # which names the taint and is therefore easy to fix.
+    controlPlane:
+      - key: workload
+        operator: Equal
+        value: control-plane
+        effect: NoSchedule
+
+  annotations:
+    controlPlane:
+      - "cloud.bilibili.co/sysctls-pids.max=2000"
+
+  logJson: true
+
+  postgresExternal: false
+  # The embedded database needs a volume that survives a pod restart. It is
+  # separate from the pipeline storage class because the database is a
+  # control-plane object: losing it loses every pipeline definition.
+  # TODO: confirm the class; `standard` and `csi-nfs` are the usual choices.
+  postgresStorageClassName: "standard"
+
+  kubernetesRunner:
+    enabled: true
+    image:
+      registry: hub.bilibili.co/bigdata
+      repository: feldera-runner
+      tag: "0.376.0-bili.1"
+    # TODO: the class pipeline state is written to. It must survive an eviction,
+    # so a local-path or hostPath class is wrong here even if it is faster: the
+    # pipeline's checkpoints are the only copy of its state.
+    storageClassName: "standard"
+    # Keep the allowlist closed: a pipeline that names any other class is
+    # refused before its claim is created, rather than discovering after an
+    # eviction that its state was on one node's disk.
+    enableStorageClassNamesSupported: true
+    storageClassNamesSupported: ["standard", "csi-nfs"]
+
+    # The pipeline pods: same node set as the control plane unless told
+    # otherwise, plus the same pull secret and the same annotation the
+    # admission controller reads.
+    pod:
+      # TODO: the label for pipeline workloads. Pipelines are the heavy
+      # tenants: they hold CPU and write to disk continuously, so they usually
+      # belong on a different label than the control plane.
+      nodeSelector: ["workload=streaming"]
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: streaming
+          effect: NoSchedule
+      imagePullSecrets: ["bilibili-hub"]
+      labels: ["app.kubernetes.io/part-of=feldera"]
+      annotations: ["cloud.bilibili.co/sysctls-pids.max=2000"]
+
+    # Expose one Service per pipeline for the Prometheus that lives in the
+    # monitoring namespace, and admit that namespace on the pipeline port.
+    # Without the namespace the policy falls back to the manager's own, and the
+    # scrape job resolves nothing.
+    metrics:
+      enabled: true
+      namespace: "monitoring"
+
+  resources:
+    postgres:
+      requests:
+        cpu: "1"
+        memory: "1Gi"
+    apiServer:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+    compilerServer:
+      requests:
+        cpu: "2"
+        memory: "8Gi"
+    kubernetesRunner:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+
+compiler:
+  image:
+    registry: hub.bilibili.co/bigdata
+    repository: feldera-compiler
+    tag: "0.376.0-bili.1"
+    pullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: bilibili-hub
+  # TODO: the label for build workloads. Compilation is CPU-bound and bursty;
+  # if the cluster keeps it off the streaming nodes, say so here.
+  nodeSelector: ["workload=compile"]
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: compile
+      effect: NoSchedule
+  labels: ["app.kubernetes.io/part-of=feldera"]
+  annotations:
+    - "cloud.bilibili.co/sysctls-pids.max=2000"
+  # `optimized` is the profile the released images are built for; a debug
+  # profile compiles faster and runs a pipeline an order of magnitude slower.
+  compilationProfile: optimized
+  # Persistent cargo target directory. On: the compilers keep their artefacts
+  # between pods, which is what makes the second compilation of a pipeline
+  # seconds instead of minutes. Needs a storage class that can be mounted by
+  # more than one pod.
+  compilationCache:
+    enabled: true
+    size: 100Gi
+    storageClassName: "standard"

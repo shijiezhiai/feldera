@@ -67,10 +67,10 @@ use futures_util::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource, Event,
-    KeyToPath, ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, PodTemplateSpec,
-    ResourceRequirements, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Volume,
-    VolumeMount, VolumeResourceRequirements,
+    KeyToPath, LocalObjectReference, ObjectFieldSelector, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec,
+    PodTemplateSpec, ResourceRequirements, Secret, SecretVolumeSource, Service, ServicePort,
+    ServiceSpec, Toleration, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -634,6 +634,23 @@ struct RenderInput {
     /// Kubernetes Secrets the configuration references, already checked
     /// against the allowlist. See [`connector_secrets`].
     secrets: Vec<RenderedSecret>,
+    /// Where the pipeline pod may be scheduled; empty means anywhere.
+    ///
+    /// Set by `--kubernetes-runner-pod-node-selector`. A cluster that keeps
+    /// its streaming workloads on a labelled and tainted node set needs both
+    /// this and `tolerations`, and needs them on the pod the runner creates
+    /// rather than on the pod the runner runs as.
+    node_selector: BTreeMap<String, String>,
+    /// Taints the pipeline pod tolerates. See
+    /// `--kubernetes-runner-pod-tolerations`.
+    tolerations: Vec<Toleration>,
+    /// Registry credentials the pipeline pod pulls with. See
+    /// `--kubernetes-runner-pod-image-pull-secrets`.
+    image_pull_secrets: Vec<LocalObjectReference>,
+    /// Additional labels on the pipeline pod, beyond the runner's own.
+    pod_labels: BTreeMap<String, String>,
+    /// Additional annotations on the pipeline pod, beyond the runner's own.
+    pod_annotations: BTreeMap<String, String>,
 }
 
 /// One Kubernetes `Secret` a pipeline configuration references.
@@ -686,7 +703,81 @@ struct PipelineObjects {
     statefulset: StatefulSet,
 }
 
+/// Parses the `key=value` entries of a repeated command-line flag.
+///
+/// The error names the flag, not only the bad entry: an operator who typed
+/// several of these flags needs to know which one swallowed a malformed pair,
+/// and `--kubernetes-runner-pod-labels a=b,c` and
+/// `--kubernetes-runner-pod-node-selector a=b,c` fail identically otherwise.
+fn parse_pairs(entries: &[String], flag: &str) -> Result<BTreeMap<String, String>, RunnerError> {
+    let mut pairs = BTreeMap::new();
+    for entry in entries {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(RunnerError::RunnerConfigError {
+                error: format!("{flag}: '{entry}' is not a key=value pair"),
+            });
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(RunnerError::RunnerConfigError {
+                error: format!("{flag}: '{entry}' has an empty key"),
+            });
+        }
+        pairs.insert(key.to_string(), value.to_string());
+    }
+    Ok(pairs)
+}
+
+/// Rejects operator labels that would repeat one the runner sets itself.
+///
+/// The runner finds a pipeline's StatefulSet and Service by those labels, so an
+/// entry that repeats one is not a harmless extra: it would make the object
+/// match a selector written for something else.
+fn check_no_reserved_pod_labels(
+    pod_labels: &BTreeMap<String, String>,
+    reserved: &BTreeMap<String, String>,
+) -> Result<(), RunnerError> {
+    match pod_labels.keys().find(|key| reserved.contains_key(*key)) {
+        None => Ok(()),
+        Some(key) => Err(RunnerError::RunnerConfigError {
+            error: format!(
+                "--kubernetes-runner-pod-labels: '{key}' is a label the runner sets itself and \
+                 uses to find this pipeline's objects"
+            ),
+        }),
+    }
+}
+
+/// Parses the JSON array `--kubernetes-runner-pod-tolerations` carries.
+///
+/// An empty or unset value means "no tolerations", which is the common case: a
+/// cluster without tainted nodes needs none.
+fn parse_tolerations(json: Option<&str>) -> Result<Vec<Toleration>, RunnerError> {
+    match json.map(str::trim).filter(|json| !json.is_empty()) {
+        None => Ok(Vec::new()),
+        Some(json) => serde_json::from_str(json).map_err(|error| RunnerError::RunnerConfigError {
+            error: format!(
+                "--kubernetes-runner-pod-tolerations is not a JSON array of Kubernetes \
+                     tolerations: {error}"
+            ),
+        }),
+    }
+}
+
 impl RenderInput {
+    /// Labels of the pipeline pod: whatever the operator added, plus the
+    /// runner's own.
+    ///
+    /// The runner's labels are inserted last so that an operator entry cannot
+    /// shadow one; `KubernetesRunner::render` rejects such an entry before it
+    /// gets here, so this ordering is a second line of defence rather than the
+    /// check itself.
+    fn merged_pod_labels(&self) -> BTreeMap<String, String> {
+        let mut labels = self.pod_labels.clone();
+        labels.extend(object_labels(self.pipeline_id, self.deployment_id));
+        labels
+    }
+
     /// Renders all objects of the deployment.
     ///
     /// This is a pure function: it makes no API calls, which keeps the shape of
@@ -991,13 +1082,32 @@ impl RenderInput {
                 },
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta {
-                        labels: Some(object_labels(self.pipeline_id, self.deployment_id)),
+                        labels: Some(self.merged_pod_labels()),
+                        // Annotations are copied as given. An admission
+                        // policy that injects a sidecar, a scheduler hint, a
+                        // sysctl the platform reads from an annotation — all
+                        // of them live here and none of them can be derived
+                        // from the configuration.
+                        annotations: (!self.pod_annotations.is_empty())
+                            .then(|| self.pod_annotations.clone()),
                         ..Default::default()
                     }),
                     spec: Some(PodSpec {
                         containers: vec![container],
                         volumes: Some(volumes),
                         service_account_name: self.service_account.clone(),
+                        // Scheduling constraints. Unset rather than empty so a
+                        // cluster without them keeps the object it had before
+                        // this option existed.
+                        node_selector: (!self.node_selector.is_empty())
+                            .then(|| self.node_selector.clone()),
+                        tolerations: (!self.tolerations.is_empty())
+                            .then(|| self.tolerations.clone()),
+                        // Pull credentials. The manager's own are not inherited
+                        // by the pods it creates, so a private registry needs
+                        // them named on every pipeline pod as well.
+                        image_pull_secrets: (!self.image_pull_secrets.is_empty())
+                            .then(|| self.image_pull_secrets.clone()),
                         security_context: Some(PodSecurityContext {
                             run_as_user: Some(PIPELINE_RUN_AS_UID),
                             run_as_group: Some(PIPELINE_RUN_AS_UID),
@@ -1598,6 +1708,18 @@ impl KubernetesRunner {
                 size_mb: self.limits.storage_for(config),
                 storage_class: self.storage_class.clone(),
             });
+        let node_selector = parse_pairs(
+            &self.config.kubernetes_runner_pod_node_selector,
+            "--kubernetes-runner-pod-node-selector",
+        )?;
+        let pod_labels = parse_pairs(
+            &self.config.kubernetes_runner_pod_labels,
+            "--kubernetes-runner-pod-labels",
+        )?;
+        // The runner finds this pipeline's objects by these labels, so a label
+        // that repeats one of them would make the object findable by a
+        // selector meant for something else.
+        check_no_reserved_pod_labels(&pod_labels, &object_labels(self.pipeline_id, deployment_id))?;
         Ok(RenderInput {
             pipeline_id: self.pipeline_id,
             deployment_id,
@@ -1621,6 +1743,21 @@ impl KubernetesRunner {
                     .unwrap_or_else(|| namespace.to_string())
             }),
             secrets,
+            node_selector,
+            tolerations: parse_tolerations(
+                self.config.kubernetes_runner_pod_tolerations.as_deref(),
+            )?,
+            image_pull_secrets: self
+                .config
+                .kubernetes_runner_pod_image_pull_secrets
+                .iter()
+                .map(|name| LocalObjectReference { name: name.clone() })
+                .collect(),
+            pod_labels,
+            pod_annotations: parse_pairs(
+                &self.config.kubernetes_runner_pod_annotations,
+                "--kubernetes-runner-pod-annotations",
+            )?,
         })
     }
 
@@ -2553,6 +2690,11 @@ mod tests {
             manager_namespace: "feldera".to_string(),
             metrics_namespace: None,
             secrets: Vec::new(),
+            node_selector: BTreeMap::new(),
+            tolerations: Vec::new(),
+            image_pull_secrets: Vec::new(),
+            pod_labels: BTreeMap::new(),
+            pod_annotations: BTreeMap::new(),
         }
     }
 
@@ -2700,6 +2842,167 @@ mod tests {
         assert_eq!(
             spec.selector,
             Some(selector_labels(PipelineId(Uuid::nil())))
+        );
+    }
+
+    /// A cluster that keeps its streaming workloads on labelled and tainted
+    /// nodes needs both, on the pod the manager creates rather than on the pod
+    /// the manager runs as.
+    #[test]
+    fn the_pipeline_pod_takes_its_scheduling_from_the_configuration() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let input = RenderInput {
+            node_selector: BTreeMap::from([("workload".to_string(), "streaming".to_string())]),
+            tolerations: vec![Toleration {
+                key: Some("workload".to_string()),
+                operator: Some("Equal".to_string()),
+                value: Some("streaming".to_string()),
+                effect: Some("NoSchedule".to_string()),
+                ..Default::default()
+            }],
+            image_pull_secrets: vec![LocalObjectReference {
+                name: "hub-pull".to_string(),
+            }],
+            ..render_input(&config)
+        };
+
+        let statefulset = input.render_statefulset();
+        let pod = statefulset.spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            pod.node_selector,
+            Some(BTreeMap::from([(
+                "workload".to_string(),
+                "streaming".to_string()
+            )]))
+        );
+        let tolerations = pod.tolerations.expect("the pod tolerates the taint");
+        assert_eq!(tolerations.len(), 1);
+        assert_eq!(tolerations[0].key.as_deref(), Some("workload"));
+        assert_eq!(tolerations[0].value.as_deref(), Some("streaming"));
+        assert_eq!(
+            pod.image_pull_secrets,
+            Some(vec![LocalObjectReference {
+                name: "hub-pull".to_string()
+            }])
+        );
+    }
+
+    /// Unset stays unset: a cluster that configures none of this keeps the
+    /// object it had before the options existed.
+    #[test]
+    fn a_pipeline_pod_without_scheduling_constraints_has_none() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let statefulset = render_input(&config).render_statefulset();
+        let template = statefulset
+            .spec
+            .expect("the statefulset has a spec")
+            .template;
+        assert_eq!(
+            template
+                .metadata
+                .expect("the pod template has metadata")
+                .annotations,
+            None
+        );
+        let pod = template.spec.expect("the pod template has a spec");
+        assert_eq!(pod.node_selector, None);
+        assert_eq!(pod.tolerations, None);
+        assert_eq!(pod.image_pull_secrets, None);
+    }
+
+    /// Operator labels and annotations reach the pod, and the runner's own
+    /// labels stay on it: the platform's selector has to keep working.
+    #[test]
+    fn operator_labels_and_annotations_reach_the_pod() {
+        let config = pipeline_config(ResourceConfig::default(), &[]);
+        let input = RenderInput {
+            pod_labels: BTreeMap::from([("team".to_string(), "streaming".to_string())]),
+            pod_annotations: BTreeMap::from([(
+                "cloud.bilibili.co/sysctls-pids.max".to_string(),
+                "2000".to_string(),
+            )]),
+            ..render_input(&config)
+        };
+
+        let statefulset = input.render_statefulset();
+        let template = statefulset
+            .spec
+            .expect("the statefulset has a spec")
+            .template;
+        let metadata = template.metadata.expect("the pod template has metadata");
+        let labels = metadata.labels.expect("the pod carries labels");
+        assert_eq!(labels.get("team").map(String::as_str), Some("streaming"));
+        assert_eq!(
+            labels.get(LABEL_PIPELINE_ID).map(String::as_str),
+            Some(PipelineId(Uuid::nil()).to_string().as_str())
+        );
+        assert_eq!(
+            metadata
+                .annotations
+                .expect("the pod carries annotations")
+                .get("cloud.bilibili.co/sysctls-pids.max")
+                .map(String::as_str),
+            Some("2000")
+        );
+    }
+
+    /// A malformed entry names the flag that carried it: the operator typed
+    /// one of several, and only the flag tells them which.
+    #[test]
+    fn a_pair_without_an_equals_sign_names_its_flag() {
+        let error = parse_pairs(
+            &["workload".to_string()],
+            "--kubernetes-runner-pod-node-selector",
+        )
+        .expect_err("the entry has no key=value shape");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("--kubernetes-runner-pod-node-selector"),
+            "{message}"
+        );
+        assert!(message.contains("'workload'"), "{message}");
+    }
+
+    /// Tolerations have four fields, two of which cannot be defaulted, so they
+    /// arrive as JSON and a non-JSON value is a configuration error rather
+    /// than an empty list that silently schedules nothing.
+    #[test]
+    fn tolerations_that_are_not_json_are_rejected() {
+        let error = parse_tolerations(Some("{not json}")).expect_err("the value is not JSON");
+        assert!(
+            format!("{error:?}").contains("--kubernetes-runner-pod-tolerations"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn no_tolerations_is_not_an_error() {
+        assert!(parse_tolerations(None).unwrap().is_empty());
+        assert!(parse_tolerations(Some("  ")).unwrap().is_empty());
+        assert!(parse_tolerations(Some("[]")).unwrap().is_empty());
+    }
+
+    /// An operator label that repeats one the runner sets is refused: the
+    /// runner finds this pipeline's objects by them.
+    #[test]
+    fn an_operator_label_cannot_shadow_the_runners_own() {
+        let reserved = object_labels(PipelineId(Uuid::nil()), Uuid::max());
+        let error = check_no_reserved_pod_labels(
+            &BTreeMap::from([(LABEL_PIPELINE_ID.to_string(), "other".to_string())]),
+            &reserved,
+        )
+        .expect_err("the label belongs to the runner");
+        assert!(
+            format!("{error:?}").contains(LABEL_PIPELINE_ID),
+            "{error:?}"
+        );
+
+        assert!(
+            check_no_reserved_pod_labels(
+                &BTreeMap::from([("team".to_string(), "streaming".to_string())]),
+                &reserved
+            )
+            .is_ok()
         );
     }
 
@@ -4050,6 +4353,11 @@ mod tests {
             kubernetes_runner_enable_storage_classes: false,
             kubernetes_runner_storage_classes: Vec::new(),
             kubernetes_runner_storage_class: None,
+            kubernetes_runner_pod_node_selector: Vec::new(),
+            kubernetes_runner_pod_tolerations: None,
+            kubernetes_runner_pod_image_pull_secrets: Vec::new(),
+            kubernetes_runner_pod_labels: Vec::new(),
+            kubernetes_runner_pod_annotations: Vec::new(),
             kubernetes_runner_tenant_namespaces: Vec::new(),
             kubernetes_runner_tenant_quotas: Vec::new(),
             kubernetes_runner_tenant_namespace_automation: false,

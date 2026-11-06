@@ -168,6 +168,32 @@ kubernetesRunner:
     key: pipelineTemplate
     # Namespace of the ConfigMap; empty means the release namespace.
     namespace: ""
+  # Scheduling and pull credentials for the pipeline pods the manager creates.
+  #
+  # These are not the manager's own settings: each pipeline is a separate pod
+  # in a namespace the manager may not even run in, and Kubernetes does not
+  # inherit any of this from the pod that created it. A cluster that taints the
+  # nodes a workload may run on, or that serves images from a registry needing
+  # credentials, therefore has to say so here as well.
+  #
+  # Every list is a list of strings because the manager takes them as flags:
+  # `key=value` for the selector and the labels, `key=value` for an annotation,
+  # and a Secret name for a pull secret.
+  pod:
+    # Node selector for pipeline pods, e.g. `["workload=streaming"]`.
+    nodeSelector: []
+    # Tolerations for pipeline pods, as Kubernetes toleration maps, e.g.
+    # `- key: workload
+    #    operator: Equal
+    #    value: streaming
+    #    effect: NoSchedule`
+    tolerations: []
+    # Image pull secrets, e.g. `["hub-pull"]`.
+    imagePullSecrets: []
+    # Extra labels and annotations, e.g. `["team=streaming"]`. A label that
+    # repeats one the runner sets is refused: it uses those to find the objects.
+    labels: []
+    annotations: []
 
 compilerPvcStorageSize: 20Gi
 compilationProfile: optimized
@@ -239,18 +265,47 @@ resources:
       cpu: "500m"
       memory: "512Mi"
 
+# Scheduling and pull credentials. Each `controlPlane` entry applies to the
+# pods Helm renders — the API server and the database; the compiler subchart has
+# its own copy, because a subchart cannot read its sibling's values. Each
+# `pipeline` entry applies to the pods the manager renders, and reaches them as
+# the `--kubernetes-runner-pod-*` flags.
+#
+# These keys existed since the chart was written but no template read them, so
+# setting them changed nothing. Bilibili's clusters label and taint the nodes a
+# workload may land on, and their registry needs credentials, so a deployment
+# there cannot be a deployment without them.
+#
+# The pipeline pod is rendered by the manager, not by Helm, which is why its
+# settings have to travel as flags. `kubernetesRunner.pod` is the documented
+# place for them; the `pipeline` keys below are honoured only when it is empty,
+# and the two are never merged (two lists of `key=value` cannot be combined
+# without guessing which duplicate wins).
 nodeSelectors:
+  # `kubernetes.io/os: linux` or `["workload=control-plane"]`.
   controlPlane: []
+  # For pipeline pods: a list of `key=value` strings, because the manager takes
+  # them as a flag.
   pipeline: []
+# Kubernetes tolerations (a list of maps) for rendered pods; `[{key, operator,
+# value, effect}]` for pipeline pods, sent as JSON.
 tolerations:
   controlPlane: []
   pipeline: []
+# Extra labels and annotations on the control-plane pods; on the pipeline pods
+# they are added to the runner's own labels, and a key the runner owns is
+# refused rather than silently shadowed.
 labels:
   controlPlane: []
   pipeline: []
 annotations:
   controlPlane: []
   pipeline: []
+# Secrets the rendered pods pull with, as `[{name: hub-pull}]`. These do not
+# reach the pipeline pods: the manager does not pass its own pull secrets down,
+# so a private registry like Bilibili's needs the name repeated under
+# `kubernetesRunner.pod.imagePullSecrets`.
+imagePullSecrets: []
 
 ipFamilyPolicy: null
 enableIPv6: false

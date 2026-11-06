@@ -1,0 +1,119 @@
+# Bilibili variant of the pipeline StatefulSet template (P1-011).
+#
+# Only needed when the five scheduling flags in `values.yaml` are not enough —
+# for example when pipelines must mount the node's `/mnt` for scratch space, as
+# the Flink jobs on these clusters do. Once applied:
+#
+#   kubectl -n feldera apply -f deploy/bilibili/pipeline-template.yaml
+#   helm upgrade feldera charts/feldera -n feldera -f deploy/bilibili/values.yaml \
+#     --set controlplane.kubernetesRunner.template.configMap=feldera-pipeline-template \
+#     --set controlplane.kubernetesRunner.allowCustomPipelineTemplate=true
+#
+# A template replaces the rendered StatefulSet wholesale, so the flags under
+# `kubernetesRunner.pod` stop applying to pipelines that use it: the node
+# selector, the toleration and the pull secret below are the only ones those
+# pods get. Keep them in step with values.yaml by hand.
+#
+# Everything the manager still owns (name, namespace, `serviceName`, selector
+# labels) is corrected rather than rejected, and the placeholders below are the
+# ones the manager substitutes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feldera-pipeline-template
+  namespace: feldera
+data:
+  pipelineTemplate: |
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: "{id}"
+      namespace: "{namespace}"
+      labels:
+        app.kubernetes.io/name: feldera-pipeline
+        app.kubernetes.io/managed-by: feldera-pipeline-manager
+        app.kubernetes.io/part-of: feldera
+      annotations:
+        feldera.com/rendered-by: "template"
+        feldera.com/deployment: "{deployment_id}"
+        feldera.com/bootstrap-policy: "{bootstrap_policy}"
+    spec:
+      serviceName: "{id}"
+      replicas: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: feldera-pipeline
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: feldera-pipeline
+            app.kubernetes.io/managed-by: feldera-pipeline-manager
+            app.kubernetes.io/part-of: feldera
+          annotations:
+            cloud.bilibili.co/sysctls-pids.max: "2000"
+        spec:
+          # TODO: same label and taint as `kubernetesRunner.pod` in values.yaml.
+          nodeSelector:
+            workload: streaming
+          tolerations:
+            - key: workload
+              operator: Equal
+              value: streaming
+              effect: NoSchedule
+          imagePullSecrets:
+            - name: bilibili-hub
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+          terminationGracePeriodSeconds: 60
+          containers:
+            - name: pipeline
+              image: "{pipeline_executor_image}"
+              command: ["/usr/local/bin/pipeline-entrypoint"]
+              args:
+                - --config-file
+                - /var/feldera/config/config.yaml
+                - --bind-address
+                - 0.0.0.0
+                - --default-port
+                - "8080"
+                - --initial
+                - "{deployment_initial}"
+                - --deployment-id
+                - "{deployment_id}"
+              env:
+                - name: FELDERA_PROGRAM_BINARY_URL
+                  value: "{binary_ref}"
+                - name: FELDERA_WORK_DIR
+                  value: /var/feldera/work
+              ports:
+                - name: http
+                  containerPort: 8080
+              volumeMounts:
+                - name: config
+                  mountPath: /var/feldera/config
+                  readOnly: true
+                - name: work
+                  mountPath: /var/feldera/work
+                - name: storage
+                  mountPath: "{pipeline_storage_path}"
+                # The clusters keep bulk scratch on the node's /mnt. It is not
+                # where the pipeline's state belongs (that is the claim above,
+                # which survives an eviction); it is for spill files, which are
+                # rewritten after a restart.
+                - name: node-scratch
+                  mountPath: /mnt/scratch
+          volumes:
+            - name: config
+              secret:
+                secretName: "{id}-config"
+            - name: work
+              emptyDir: {}
+            - name: storage
+              persistentVolumeClaim:
+                claimName: "{id}-storage"
+            - name: node-scratch
+              hostPath:
+                path: /mnt
+                type: Directory

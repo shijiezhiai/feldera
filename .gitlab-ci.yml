@@ -1,0 +1,158 @@
+# GitLab CI for the Bilibili deployment.
+#
+# This is the counterpart of .github/workflows/build-rust.yml: GitHub Actions
+# builds and tests on pull requests, this file builds the three images the
+# clusters pull and publishes them to the two registries, from a tag.
+#
+# Shape borrowed from the Flink repository (flink-1.20/.gitlab-ci.yml):
+#
+#   * every job runs on the `datacenter-flink-01` runner, so nothing here
+#     assumes a SaaS runner with a Docker socket of its own;
+#   * the pipeline is tag-driven — `only: tags` there, `rules: if: $CI_COMMIT_TAG`
+#     here — because an image tag is a release, not a build;
+#   * the tag's prefix selects the environment, and the environment selects
+#     which BMR domain is told about the release;
+#   * images are pushed to `hub.bilibili.co` and mirrored to
+#     `tx-deepblue-hub.bilibili.co`, because the clusters pull from the first and
+#     the platform's catalogue reads the second.
+#
+# What this file deliberately does not copy: the credentials. The Flink file
+# carries the deepblue password inline; here they come from masked CI/CD
+# variables (HUB_USER, HUB_PASSWORD, DEEPBLUE_USER, DEEPBLUE_PASSWORD), so a
+# reader of the repository cannot push to the registry.
+#
+# Required runner capability: Docker (build-images.sh calls `docker build`) and
+# enough disk for three images plus the cargo build cache — the manager image
+# builds the whole workspace, so budget ~60 GiB, and `--features
+# feldera-enterprise` is already part of deploy/Dockerfile.manager.
+
+stages:
+  - verify
+  - image
+  - notify
+
+# Environment selection by tag prefix, mirroring the `.env_parser` anchor in the
+# Flink pipeline. `pre-`/`uat-`/`dev-` name the shared environments; any other
+# tag is a production release.
+.env_by_tag: &env_by_tag |-
+  case "${CI_COMMIT_TAG}" in
+    pre-*) ENV_NAME=pre  ;;
+    uat-*) ENV_NAME=uat  ;;
+    dev-*) ENV_NAME=dev  ;;
+    *)     ENV_NAME=prod ;;
+  esac
+  case "${ENV_NAME}" in
+    pre) DOMAIN="bmr-pre.bilibili.co" ;;
+    uat) DOMAIN="bmr-uat.bilibili.co" ;;
+    dev) DOMAIN="bmr-dev.bilibili.co" ;;
+    *)   DOMAIN="bmr.bilibili.co" ;;
+  esac
+  echo "tag ${CI_COMMIT_TAG} -> ${ENV_NAME} (${DOMAIN})"
+
+variables:
+  HUB_REGISTRY: "hub.bilibili.co/bigdata"
+  DEEPBLUE_REGISTRY: "tx-deepblue-hub.bilibili.co/bigdata"
+  # No shallow clone surprises: build-images.sh derives the version from
+  # `git describe`, which needs tags.
+  GIT_DEPTH: "0"
+  GIT_STRATEGY: fetch
+
+# The chart and the golden render, on every branch and merge request. Cheaper
+# than the image build and it catches the failure mode the image build would
+# only reveal at deploy time: a values file the chart cannot honour.
+chart:
+  stage: verify
+  tags: [datacenter-flink-01]
+  variables:
+    GIT_DEPTH: "50"
+    GIT_STRATEGY: fetch
+  before_script:
+    - command -v helm >/dev/null || { echo "helm is not installed on this runner"; exit 1; }
+  script:
+    - helm lint charts/feldera
+    - scripts/e2e-k8s-chart.sh
+    # The Bilibili overlay has to render too, and it has to render the four
+    # settings it exists for. A values typo would otherwise be a Pending pod.
+    - |
+      rendered="$(helm template feldera charts/feldera -n feldera \
+        -f deploy/bilibili/values.yaml --set controlplane.postgresPassword=ci)"
+      for needle in \
+        "cloud.bilibili.co/sysctls-pids.max" \
+        "FELDERA_KUBERNETES_RUNNER_POD_NODE_SELECTOR" \
+        "FELDERA_KUBERNETES_RUNNER_POD_TOLERATIONS" \
+        "imagePullSecrets"; do
+        printf '%s\n' "${rendered}" | grep -q "${needle}" \
+          || { echo "the bilibili overlay does not render ${needle}"; exit 1; }
+      done
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+# One job, not three: the compiler image is derived from the manager image
+# (same binary, different service selection), so the two have to be on the same
+# machine. Splitting them would mean either an artifact of 8 GiB or building
+# the manager twice.
+images:
+  stage: image
+  tags: [datacenter-flink-01]
+  timeout: 4h
+  resource_group: feldera-images
+  before_script:
+    - *env_by_tag
+    - echo "${HUB_PASSWORD}" | docker login -u "${HUB_USER}" --password-stdin hub.bilibili.co
+    - echo "${DEEPBLUE_PASSWORD}" | docker login -u "${DEEPBLUE_USER}" --password-stdin tx-deepblue-hub.bilibili.co
+  script:
+    # PUSH=0: build-images.sh pushes to ${REGISTRY}, which it also probes for a
+    # `_catalog` endpoint that the authenticated registry does not expose. This
+    # job pushes the result itself, to both registries, below.
+    - export VER="${CI_COMMIT_TAG}"
+    - PUSH=0 PRUNE=1 deploy/build-images.sh
+    - |
+      set -eu
+      for name in manager compiler runner; do
+        src="$(docker image ls --format '{{.Repository}}:{{.Tag}}' \
+          | grep -E "^feldera-${name}:${VER}-bili\\.[0-9]+$" \
+          | sort -t. -k5 -n | tail -1)"
+        [ -n "${src}" ] || { echo "no feldera-${name} image was built for ${VER}"; exit 1; }
+        echo "=== ${src}"
+        for registry in "${HUB_REGISTRY}" "${DEEPBLUE_REGISTRY}"; do
+          docker tag "${src}" "${registry}/feldera-${name}:${VER}"
+          docker push "${registry}/feldera-${name}:${VER}"
+        done
+      done
+    # The tags the chart reads. Bump them here rather than in the chart, so the
+    # released values stay a record of what was published.
+    - echo "published ${CI_COMMIT_TAG} to ${HUB_REGISTRY} and ${DEEPBLUE_REGISTRY}"
+  after_script:
+    - docker logout hub.bilibili.co || true
+    - docker logout tx-deepblue-hub.bilibili.co || true
+  rules:
+    - if: '$CI_COMMIT_TAG'
+
+# Tell BMR the release exists, the way the Flink pipeline notifies its manager.
+# Failure here does not fail the release: the images are already published, and
+# a notification retry is cheaper than a rebuild.
+notify:
+  stage: notify
+  tags: [datacenter-flink-01]
+  needs: [images]
+  before_script:
+    - *env_by_tag
+  script:
+    - |
+      payload="$(printf '{"system":"feldera","env":"%s","tag":"%s","images":{"manager":"%s/feldera-manager:%s","compiler":"%s/feldera-compiler:%s","runner":"%s/feldera-runner:%s"}}' \
+        "${ENV_NAME}" "${CI_COMMIT_TAG}" \
+        "${HUB_REGISTRY}" "${CI_COMMIT_TAG}" \
+        "${HUB_REGISTRY}" "${CI_COMMIT_TAG}" \
+        "${HUB_REGISTRY}" "${CI_COMMIT_TAG}")"
+      if curl -fsS -X POST "http://${DOMAIN}/bmr/feldera/manager/package/notify/ci/finish" \
+          -H "Content-Type: application/json" \
+          -H "BMR-SYSTEM-INVOKER-TOKEN: ${BMR_INVOKER_TOKEN}" \
+          -d "${payload}"; then
+        echo "BMR notified"
+      else
+        echo "BMR notification failed; the images are published regardless" >&2
+      fi
+  rules:
+    - if: '$CI_COMMIT_TAG'

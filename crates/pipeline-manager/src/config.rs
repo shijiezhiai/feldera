@@ -2493,6 +2493,78 @@ pub struct KubernetesRunnerConfig {
     #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_STORAGE_CLASS")]
     pub kubernetes_runner_storage_class: Option<String>,
 
+    /// Node selector put on every pipeline pod, as comma-separated
+    /// `key=value` pairs.
+    ///
+    /// A cluster that reserves nodes for one kind of workload labels them, and
+    /// often taints them as well. Without this the scheduler may place a
+    /// pipeline on a node that has neither the local disk nor the CPU the
+    /// pipeline was sized for. The runner renders the StatefulSet itself, so
+    /// this is the way to say it without maintaining a full template (P1-011)
+    /// for every cluster.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_POD_NODE_SELECTOR",
+        value_delimiter = ','
+    )]
+    pub kubernetes_runner_pod_node_selector: Vec<String>,
+
+    /// Tolerations put on every pipeline pod, as a JSON array of Kubernetes
+    /// `Toleration` objects.
+    ///
+    /// JSON rather than `key=value` because a toleration has four fields, two
+    /// of which (`operator`, `effect`) have no meaningful default. Example:
+    /// `[{"key":"workload","operator":"Equal","value":"streaming",
+    /// "effect":"NoSchedule"}]`.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_KUBERNETES_RUNNER_POD_TOLERATIONS")]
+    pub kubernetes_runner_pod_tolerations: Option<String>,
+
+    /// Image pull secrets attached to every pipeline pod, comma-separated.
+    ///
+    /// The manager's own pull secrets do not reach the pods it creates: each
+    /// pod is a separate object with its own `imagePullSecrets`, so a registry
+    /// that needs credentials requires naming them here too.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_POD_IMAGE_PULL_SECRETS",
+        value_delimiter = ','
+    )]
+    pub kubernetes_runner_pod_image_pull_secrets: Vec<String>,
+
+    /// Extra labels put on every pipeline pod, comma-separated `key=value`.
+    ///
+    /// The runner sets the labels it uses to find its own objects; these are
+    /// additional, for the cluster: a cost-centre or team label, the selector
+    /// of a monitoring stack, or whatever an admission policy requires. A pair
+    /// whose key collides with one of the runner's own is rejected rather than
+    /// silently ignored, because the object would then be findable in a way
+    /// the runner does not expect.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_POD_LABELS",
+        value_delimiter = ','
+    )]
+    pub kubernetes_runner_pod_labels: Vec<String>,
+
+    /// Extra annotations put on every pipeline pod, comma-separated
+    /// `key=value`.
+    ///
+    /// Annotations are where a cluster keeps the settings it applies outside
+    /// Kubernetes itself: a sysctl annotation read by an admission webhook, a
+    /// scheduler hint, an injection marker. A value cannot contain a comma,
+    /// because the comma separates pairs.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "FELDERA_KUBERNETES_RUNNER_POD_ANNOTATIONS",
+        value_delimiter = ','
+    )]
+    pub kubernetes_runner_pod_annotations: Vec<String>,
+
     /// Kubernetes namespace that a tenant's pipelines are provisioned in.
     ///
     /// Given once per tenant as `tenant=<uuid>:<namespace>`; repeat the flag

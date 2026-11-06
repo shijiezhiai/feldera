@@ -22,8 +22,27 @@ spec:
       labels:
         app.kubernetes.io/name: postgres
         app.kubernetes.io/instance: {{ .Release.Name }}
+        {{- with .Values.labels.controlPlane }}
+        {{- include "controlplane.pairsToMap" . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.annotations.controlPlane }}
+      annotations:
+        {{- include "controlplane.pairsToMap" . | nindent 8 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "controlplane.fullname" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelectors.controlPlane }}
+      nodeSelector:
+        {{- include "controlplane.pairsToMap" . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations.controlPlane }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: postgres
           image: "{{ .Values.postgresImageRepository }}:{{ .Values.postgresVersion }}"

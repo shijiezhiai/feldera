@@ -1,3 +1,21 @@
+{{- /*
+Scheduling for the pipeline pods the manager creates.
+
+Two places can name it: `kubernetesRunner.pod` (new, and what values.yaml
+documents) and the older `nodeSelectors.pipeline`/`tolerations.pipeline`/&c.
+that this chart has carried since P1-005 without any template reading them. The
+new keys win; the old ones are honoured when the new are empty, so an existing
+values file that set them finally takes effect instead of silently doing
+nothing.
+
+They are never merged: two lists of `key=value` cannot be combined without
+guessing which duplicate wins, and a silent guess is how the old keys became
+invisible in the first place.
+*/}}
+{{- $podNodeSelector := .Values.kubernetesRunner.pod.nodeSelector | default .Values.nodeSelectors.pipeline }}
+{{- $podTolerations := .Values.kubernetesRunner.pod.tolerations | default .Values.tolerations.pipeline }}
+{{- $podLabels := .Values.kubernetesRunner.pod.labels | default .Values.labels.pipeline }}
+{{- $podAnnotations := .Values.kubernetesRunner.pod.annotations | default .Values.annotations.pipeline }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,8 +41,29 @@ spec:
         app.kubernetes.io/name: {{ include "controlplane.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: api-server
+        {{- with .Values.labels.controlPlane }}
+        {{- include "controlplane.pairsToMap" . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.annotations.controlPlane }}
+      annotations:
+        {{- include "controlplane.pairsToMap" . | nindent 8 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "controlplane.fullname" . }}
+      {{- with .Values.imagePullSecrets }}
+      # The manager's own pull secrets do not reach the pipeline pods it
+      # creates; those are named separately under kubernetesRunner.pod.
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelectors.controlPlane }}
+      nodeSelector:
+        {{- include "controlplane.pairsToMap" . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations.controlPlane }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if and (gt (int .Values.replicaCount) 1) (ne .Values.apiServerAntiAffinity "none") }}
       # Spread the replicas over nodes: two replicas on one node fail together,
       # so co-locating them adds no availability and would cost the leader.
@@ -101,6 +140,32 @@ spec:
                    an operator to wonder which default applied. */}}
             - name: FELDERA_KUBERNETES_RUNNER_CONNECTOR_KUBERNETES_SECRETS_ALLOWLIST
               value: {{ join ";" .Values.kubernetesRunner.connectorKubernetesSecrets.allowlist | quote }}
+            {{- end }}
+            {{- with $podNodeSelector }}
+            # Scheduling of the pipeline pods this manager creates. Kubernetes
+            # inherits none of it from the pod the manager runs in, so a
+            # tainted node set needs it repeated here, as flags the runner
+            # applies to the StatefulSet it renders.
+            - name: FELDERA_KUBERNETES_RUNNER_POD_NODE_SELECTOR
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with $podTolerations }}
+            # JSON because a toleration has four fields, two of which have no
+            # meaningful default.
+            - name: FELDERA_KUBERNETES_RUNNER_POD_TOLERATIONS
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- with .Values.kubernetesRunner.pod.imagePullSecrets }}
+            - name: FELDERA_KUBERNETES_RUNNER_POD_IMAGE_PULL_SECRETS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with $podLabels }}
+            - name: FELDERA_KUBERNETES_RUNNER_POD_LABELS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with $podAnnotations }}
+            - name: FELDERA_KUBERNETES_RUNNER_POD_ANNOTATIONS
+              value: {{ join "," . | quote }}
             {{- end }}
             {{- if gt (int .Values.replicaCount) 1 }}
             # Above one replica, elect exactly one instance to reconcile

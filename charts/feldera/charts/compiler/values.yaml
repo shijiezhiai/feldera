@@ -32,6 +32,18 @@ postgresPort: 5431
 compilerPvcStorageSize: 20Gi
 compilationProfile: optimized
 
+# Scheduling and pull credentials for the compiler pod.
+#
+# The compiler is a separate workload from the API server: it is the pod that
+# runs `cargo`, so a cluster that keeps build jobs on dedicated nodes has to
+# say so here as well as for the control plane. Each entry is either a map or a
+# list of `key=value` strings.
+nodeSelector: []
+tolerations: []
+imagePullSecrets: []
+labels: []
+annotations: []
+
 compilerServer:
   cargo:
     config: null
