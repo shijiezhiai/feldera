@@ -224,6 +224,20 @@ lie if it is named, and each of these is one deployment away from the letter:
    the check (`"edition": "Enterprise"`), and the suite's error trap prints the
    command that failed; promoting that check into the suite's own preflight would
    close it properly.
+8. **A crash under a read-only storage volume does not heal by itself.** Found
+   while re-running the whole matrix on 2026-11-06: `drop-storage:L2` killed the
+   process while the volume was read-only, waited twenty minutes for `Running`,
+   and waited for something that cannot happen. The restarted process cannot
+   complete its start on a read-only volume and answers `500` on `/status`; the
+   manager treats "500, neither a status report nor a temporary unavailability" as
+   a fatal `RunnerCheckError` and stops the pipeline. The cell now restores the
+   volume at once and starts the pipeline if it stopped — what an operator would
+   do — and the data promise (resume at or after the last checkpoint) still holds
+   and is still asserted. The open question is a design one, not a test one: the
+   same read-only volume is tolerated once the pipeline is running, so the two
+   paths disagree about what the fault means, and a startup that fails only
+   because storage is read-only arguably deserves a wait-and-retry rather than a
+   terminal stop.
 
 ## 6. Verdict
 
@@ -315,3 +329,38 @@ and after a defect exists is not evidence that the defect is absent". Only runni
 it against a different build tells the two apart, and the build that exposes it is
 the one built from the tree that is actually going to ship.
 
+
+## 8. The whole matrix, re-run
+
+The single cell above settles the exit criterion; it does not settle whether the
+other nine were green for the same reason. So the whole matrix was run again on
+2026-11-06 against manager and compiler `p1-036-fix1` with runner
+`v0.357.0-52-gc13e46766-bili.1`: **10 passed, 0 failed, in 1439s**.
+
+| cell | what its own assertion said |
+| --- | --- |
+| kill-pod:L1 | 1000 records before and after, nothing lost |
+| kill-pod:L2 | answered 2s after the crash, resumed at exactly 1000 |
+| delete-pvc:L1 | bootstrapped from scratch, the loss visible as 0 records |
+| delete-pvc:L2 | recovered to a fresh bootstrap rather than to stale state |
+| drop-postgres:L1 | kept ingesting while PostgreSQL was down (1000 -> 1100), reattached to the same pod |
+| drop-postgres:L2 | settled into `Running`, restarted by the operator at exactly 1000 |
+| drop-storage:L1 | kept ingesting with storage read-only (1000 -> 1200), checkpoints resumed, nothing lost |
+| drop-storage:L2 | no checkpoint completed while read-only; resumed at 1000 after the volume came back — but only after a start, see below |
+| drop-kafka:L1 | stayed up with the broker down, resumed at exactly 1000 with no duplicates and no skips |
+| drop-kafka:L2 | replayed from the checkpoint to exactly 1000, no duplicates |
+
+One cell changed shape, which is what this run was worth doing for.
+`drop-storage:L2` no longer fits "recovers by itself" (gap 8): the restarted
+process cannot complete its start on the read-only volume and logs, before
+answering `500` on `/status`:
+
+> `Unable to read checkpoints; storage status details are not provided. Error:
+> storage error: /var/feldera/storage/<pipeline-id>/checkpoints.feldera: open
+> failed: permission denied`
+
+The manager reads that 500 as fatal (`RunnerCheckError`) and stops the pipeline.
+The cell now restores the volume and starts it again — what an operator would do —
+and the data promise still holds and is still asserted. The other nine cells were
+green for their own reasons: each note in the table is the assertion that fired,
+not a timeout that did not.

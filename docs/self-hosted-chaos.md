@@ -9,7 +9,7 @@ FAULT × TIER
 kill-pod      精确不丢                恢复到最后一个 checkpoint，且计时（P1 出口：<2min）
 delete-pvc    回到空库且可见          崩溃+丢盘也回到空库
 drop-postgres 数据面不中断            控制面能收敛且可重启
-drop-storage  继续摄入、事后补 checkpoint  恢复到不早于最后的 checkpoint
+drop-storage  继续摄入、事后补 checkpoint  卷恢复后重启，仍回到不早于最后的 checkpoint
 drop-kafka    输入断不致命、不重不漏   从 checkpoint 偏移重放、不重复
 ```
 
@@ -39,6 +39,14 @@ KEEP=1 CELLS=drop-storage:L1 TAG=... bash scripts/e2e-k8s-chaos.sh      # 留现
 `deployment_status` 变 `Running`（那只是 pod 起来了，进程还没应答）。判据是
 `RTO_LIMIT`（默认 120 秒），超了直接 fail，所以这条承诺由每夜的矩阵守着，而不是只在验收那天量一次。
 
+`drop-storage:L2` 的恢复路径和其它格子不同，值得单独说清：pipeline 在只读卷上
+**崩溃**之后，重启的那次启动写不进状态目录，`/status` 直接回 500；manager 把
+「500 既不是状态报告、也不是临时不可用」当作致命错误，把 pipeline 停掉，记成
+`RunnerCheckError`。这是可以接受的行为——只读卷上本来就启动不了——但它意味着这
+一格**不会自愈**：脚本在崩溃后立刻把卷改回可写，如果此时 pipeline 已经停在
+`Stopped`，就替运维把它启一次，然后断言恢复点不早于最后的 checkpoint。上一版
+在这里等 20 分钟的 `Running`，等的正是永远不会发生的事。
+
 答案到达后还有一条更严的断言：manager 必须**当场**把这个 pipeline 报成 `Running`。
 它依赖两件事——headless Service 发布未就绪的地址（否则容器重启的那一两秒里 DNS
 直接查不到这个名字），以及 manager 不把一次连接失败当成终局。两者都在
@@ -46,8 +54,11 @@ KEEP=1 CELLS=drop-storage:L1 TAG=... bash scripts/e2e-k8s-chaos.sh      # 留现
 §7），因此这条断言同时也是那两个修复的回归检查：任何一边退回去，`kill-pod:L2`
 都会在一秒内红。
 
-最后一次整跑（2026-11-02，kind `bili-p1005`，manager `p1-027` / compiler
-`p1-025` / runner `v0.357.0-52-gc13e46766-bili.1`）：**10 passed, 0 failed, in 785s**。
+最后一次整跑（2026-11-06，kind `bili-p1005`，manager / compiler `p1-036-fix1`，
+runner `v0.357.0-52-gc13e46766-bili.1`）：**10 passed, 0 failed, in 1439s**。
+上一版（2026-11-02，manager `p1-027` / compiler `p1-025`）是 **785s**；时间差主要在
+`drop-storage:L2`，它现在会真的重启一次 pipeline 并从 checkpoint 续上，而不是空等
+一个不会发生的 `Running`。
 
 ## 1. 为什么每格的断言不一样
 

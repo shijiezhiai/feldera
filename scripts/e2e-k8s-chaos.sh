@@ -1219,22 +1219,37 @@ run_cell() {
 
       crash_container_of_pod "${pod}"
       note "killed the pipeline while storage was read-only"
-      sleep 5
-      for _ in $(seq 1 240); do
-        [ "$(deployment_status "${name}")" = "Running" ] && break
-        sleep 5
-      done
-      # Storage is still read-only, so the restarted process cannot checkpoint;
-      # restore it and the pipeline continues from the checkpoint it had.
+      # The volume has to come back before the restarted process can use it. A
+      # start writes the checkpoint it resumes into, and a process that cannot
+      # write answers 500 on /status -- which the manager treats as fatal and
+      # stops the pipeline for. Restoring the volume is what an operator does
+      # once the disk is put right, so the cell does it here and then measures
+      # the recovery.
+      sleep 3
       storage_helper "${id}" 777
+      note "storage is writable again"
 
-      local after=""
-      for _ in $(seq 1 120); do
-        after="$(settled_count_in_pod "${pod}" 2>/dev/null || true)"
+      # The pipeline may come back by itself, or the manager may have stopped it
+      # when the start under the read-only volume failed. Starting it again is
+      # the operator's second move, and the data promise is the same either way.
+      local after="" restarted=no
+      local deadline=$(( $(date +%s) + 300 ))
+      while [ "$(date +%s)" -lt "${deadline}" ]; do
+        after="$(total_count_in_pod "${id}" 2>/dev/null || true)"
         [ -n "${after}" ] && break
+        case "$(deployment_status "${name}" || true)" in
+          Stopped|Unavailable)
+            if [ "${restarted}" = no ]; then
+              restarted=yes
+              note "the start under the read-only volume was fatal, so the pipeline is $(deployment_status "${name}") -- starting it again now that the volume is writable"
+              start_pipeline "${name}" >/dev/null
+            fi
+            ;;
+        esac
         sleep 5
       done
-      [ -n "${after}" ] || fail "the pipeline never answered after the crash"
+      [ -n "${after}" ] \
+        || fail "the pipeline never answered after the crash (last status: $(deployment_status "${name}" || true))"
       # The recovery must find at least what the checkpoint promised. Whether it
       # finds more is not this cell's business: the crash lands at an arbitrary
       # point between checkpoints, and records the circuit committed since the
